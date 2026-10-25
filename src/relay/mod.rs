@@ -49,7 +49,8 @@ pub async fn handle_connection(
     bufs: Buffers,
     guard: ActiveGuard,
 ) {
-    let Some(upstream_cfg) = ctx.selector.next().cloned() else {
+    // M1.4 接入健康状态后，这里的回调改为读取上游可用性。
+    let Some(upstream_cfg) = ctx.selector.next(&|_| true).cloned() else {
         // 启动时已保证非空；运行期若被清空则拒绝。
         ctx.stats.rejected.fetch_add(1, Ordering::Relaxed);
         debug!(%peer, "无可用上游，关闭连接");

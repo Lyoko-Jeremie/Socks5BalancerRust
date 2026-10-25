@@ -131,8 +131,17 @@ async fn run(cfg: config::Config, workers: usize) -> Result<(), Box<dyn std::err
         return Err("所有上游均解析失败，无法启动".into());
     }
 
-    let selector = Arc::new(upstream::UpstreamSelector::new(upstreams));
-    info!(count = selector.len(), "上游池就绪");
+    let selector = Arc::new(upstream::UpstreamSelector::new(
+        upstreams,
+        cfg.select_rule,
+        cfg.server_change_time,
+    ));
+    info!(
+        count = selector.len(),
+        rule = selector.rule().as_str(),
+        server_change_time_ms = cfg.server_change_time.as_millis() as u64,
+        "上游池就绪"
+    );
     let stats = stats::Stats::new();
     let cancel = CancellationToken::new();
     let ctx = app::AppCtx::new(

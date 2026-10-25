@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::upstream::SelectRule;
+
 /// 转发缓冲默认值（ADR-005：默认双向 8KB 预分配）。
 pub const DEFAULT_BUFFER_SIZE: usize = 8192;
 /// 允许的缓冲块大小（方案 B：2048/4096/8192）。
@@ -306,6 +308,10 @@ pub struct Config {
     pub first_packet_timeout: Duration,
     /// 协议握手超时。
     pub handshake_timeout: Duration,
+    /// 上游选择规则（M1.3）。
+    pub select_rule: SelectRule,
+    /// `change_by_time` 规则的切换周期。
+    pub server_change_time: Duration,
     pub tradition_tcp_relay: bool,
     pub disable_socks4: bool,
     /// 解析过程中发现的"被忽略/降级"的配置项说明，启动时以 warning 打印。
@@ -350,10 +356,7 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
         notes.push("healthCheck 已解析但尚未启用健康检查（M1.4 生效）".into());
     }
     if value.get("upstreamSelectRule").is_some() || value.get("serverChangeTime").is_some() {
-        notes.push(
-            "upstreamSelectRule/serverChangeTime 已解析但 M1.1 仅用 round-robin（M1.3 生效）"
-                .into(),
-        );
+        notes.push("upstreamSelectRule/serverChangeTime 已启用（M1.3）".into());
     }
     if value.get("testRemoteHost").is_some() || value.get("disableConnectTest").is_some() {
         notes.push("健康探测相关字段已解析但尚未使用（M1.4 生效）".into());
@@ -474,6 +477,18 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
         return Err(err("handshakeTimeout 过大（>600000ms）"));
     }
 
+    // ===== 上游选择规则（M1.3）=====
+    let select_rule = match raw.upstream_select_rule.as_deref() {
+        None => SelectRule::Random,
+        Some(s) => SelectRule::parse(s).ok_or_else(|| {
+            err(format!(
+                "upstreamSelectRule={s:?} 非法，允许值: loop/random/one_by_one/change_by_time/force_only_one"
+            ))
+        })?,
+    };
+    let server_change_time =
+        Duration::from_millis(raw.server_change_time.filter(|v| *v > 0).unwrap_or(60_000));
+
     // ===== 客户端认证（ADR-004）=====
     let mut auth: Vec<AuthUser> = Vec::new();
     for (idx, u) in raw.auth_client_info.iter().enumerate() {
@@ -534,6 +549,8 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
         connect_timeout: Duration::from_millis(connect_timeout_ms),
         first_packet_timeout: Duration::from_millis(first_packet_timeout_ms),
         handshake_timeout: Duration::from_millis(handshake_timeout_ms),
+        select_rule,
+        server_change_time,
         auth,
         buffer_size,
         max_connections,
@@ -773,5 +790,29 @@ mod tests {
             "upstream": [ { "host": "127.0.0.1", "port": 6100 } ]
         }"#;
         assert!(load_str(text).is_err());
+    }
+
+    #[test]
+    fn 选路规则解析与校验() {
+        let text = r#"{
+            "listenPort": 5000,
+            "upstreamSelectRule": "one_by_one",
+            "serverChangeTime": 5000,
+            "upstream": [ { "host": "127.0.0.1", "port": 6100 } ]
+        }"#;
+        let c = load_str(text).unwrap();
+        assert_eq!(c.select_rule, SelectRule::OneByOne);
+        assert_eq!(c.server_change_time, Duration::from_millis(5_000));
+
+        let text = r#"{
+            "listenPort": 5000,
+            "upstreamSelectRule": "no_such_rule",
+            "upstream": [ { "host": "127.0.0.1", "port": 6100 } ]
+        }"#;
+        let e = load_str(text).unwrap_err().to_string();
+        assert!(
+            e.contains("upstreamSelectRule"),
+            "错误信息应提示字段名: {e}"
+        );
     }
 }
