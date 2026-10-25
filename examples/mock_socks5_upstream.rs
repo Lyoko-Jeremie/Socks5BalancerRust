@@ -124,14 +124,24 @@ async fn handle(mut stream: TcpStream, creds: Option<String>) -> io::Result<()> 
     // 4) 真实连接目标
     let connected = match &target {
         Target::Ip(addr) => TcpStream::connect(*addr).await,
-        Target::Domain(host, port) => TcpStream::connect((host.as_str(), *port)).await,
+        Target::Domain(host, port) => connect_domain(host, *port).await,
     };
     match connected {
-        Ok(mut upstream) => {
+        Ok(upstream) => {
+            let peer = upstream.peer_addr().ok();
+            eprintln!("mock upstream: CONNECT {target:?} -> {peer:?} 已建立");
             stream
                 .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                 .await?;
-            let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+            // 手写双向转发（不用 copy_bidirectional），便于按方向定位 RST，并打印首块做协议诊断。
+            let (mut cr, mut cw) = tokio::io::split(stream);
+            let (mut ur, mut uw) = tokio::io::split(upstream);
+            let to_up = pipe(&mut cr, &mut uw, "client->target");
+            let to_client = pipe(&mut ur, &mut cw, "target->client");
+            tokio::select! {
+                a = to_up => { eprintln!("mock upstream: client->target 结束: {a:?}"); }
+                b = to_client => { eprintln!("mock upstream: target->client 结束: {b:?}"); }
+            }
         }
         Err(e) => {
             let rep = if e.kind() == io::ErrorKind::ConnectionRefused {
@@ -148,10 +158,63 @@ async fn handle(mut stream: TcpStream, creds: Option<String>) -> io::Result<()> 
     Ok(())
 }
 
+/// 单向转发，打印首块（十六进制）用于诊断，返回总字节数。
+async fn pipe<R, W>(reader: &mut R, writer: &mut W, label: &str) -> io::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 8192];
+    let mut total = 0u64;
+    let mut first = true;
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            let _ = writer.shutdown().await;
+            return Ok(total);
+        }
+        if first {
+            first = false;
+            let hex: Vec<String> = buf[..n.min(16)]
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect();
+            eprintln!("mock upstream: [{label}] 首块 {n}B: {}", hex.join(" "));
+        }
+        writer.write_all(&buf[..n]).await?;
+        total += n as u64;
+    }
+}
+
 #[derive(Debug)]
 enum Target {
     Ip(SocketAddr),
     Domain(String, u16),
+}
+
+/// 连接域名目标：**优先 IPv4**。
+///
+/// 本机可能分配了不可路由的 IPv6（连接能建立但数据被 RST），因此测试工具
+/// 显式优先 IPv4，避免把环境问题误判为代理实现问题。
+async fn connect_domain(host: &str, port: u16) -> io::Result<TcpStream> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
+    if addrs.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "DNS 无结果"));
+    }
+    let ordered: Vec<SocketAddr> = addrs
+        .iter()
+        .copied()
+        .filter(|a| a.is_ipv4())
+        .chain(addrs.iter().copied().filter(|a| !a.is_ipv4()))
+        .collect();
+    let mut last_err = None;
+    for addr in ordered {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "连接失败")))
 }
 
 async fn read_port(stream: &mut TcpStream) -> io::Result<u16> {

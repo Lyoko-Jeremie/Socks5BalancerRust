@@ -222,13 +222,20 @@ async fn resolve_one(host: &str, port: u16) -> io::Result<SocketAddr> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
     }
-    let mut addrs = tokio::net::lookup_host((host, port)).await?;
-    addrs.next().ok_or_else(|| {
-        io::Error::new(
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
+    if addrs.is_empty() {
+        return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("DNS 未返回任何地址: {host}:{port}"),
-        )
-    })
+        ));
+    }
+    // 优先 IPv4：双栈机器上常见"IPv6 能建连但数据被 RST"的环境问题，
+    // 而 C++ 版直接取 resolver 首项同样会踩坑（见 docs/03 端口陷阱）。
+    Ok(addrs
+        .iter()
+        .find(|a| a.is_ipv4())
+        .copied()
+        .unwrap_or(addrs[0]))
 }
 
 #[cfg(test)]

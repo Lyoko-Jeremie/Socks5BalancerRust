@@ -155,6 +155,19 @@ async fn run(cfg: config::Config, workers: usize) -> Result<(), Box<dyn std::err
         probe_jitter = health.cfg().probe_jitter,
         "健康检查已启用：TCP 探活 + fail-fast + DOWN 指数退避"
     );
+    match &cfg.health.tls {
+        Some(tls) => info!(
+            host = %tls.host,
+            port = tls.port,
+            sni = %tls.sni,
+            http_path = %tls.http_path,
+            period_ms = tls.period.as_millis() as u64,
+            timeout_ms = tls.timeout.as_millis() as u64,
+            max_concurrency = tls.max_concurrency,
+            "TLS/HTTP readiness 探测已启用（ADR-006）"
+        ),
+        None => info!("未配置 healthCheck.target：仅做 TCP liveness 探测"),
+    }
     let stats = stats::Stats::new();
     let cancel = CancellationToken::new();
     health.spawn_probes(cancel.clone());
@@ -233,8 +246,14 @@ fn spawn_stats_logger(
                         .filter(|s| !s.available)
                         .map(|s| {
                             format!(
-                                "{}({},fail={},backoff={}ms)",
-                                s.name, s.addr, s.failures, s.backoff_ms
+                                "{}({},tcp={},tls={},fail={},tls_fail={},backoff={}ms)",
+                                s.name,
+                                s.addr,
+                                s.liveness,
+                                s.readiness,
+                                s.failures,
+                                s.tls_failures,
+                                s.backoff_ms
                             )
                         })
                         .collect();

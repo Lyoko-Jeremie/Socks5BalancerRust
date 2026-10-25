@@ -1,0 +1,32 @@
+{
+  "listenHost": "127.0.0.1",
+  "listenPort": 5401,
+  "traditionTcpRelay": false,
+  "bufferSize": 2048,
+  "connectTimeout": 2000,
+  "firstPacketTimeout": 5000,
+  "handshakeTimeout": 5000,
+  "logLevel": "debug",
+  "upstream": [
+    {
+      "name": "mockAuth",
+      "host": "127.0.0.1",
+      "port": 6200,
+      "authUser": "alice",
+      "authPwd": "secret"
+    }
+  ],
+  "healthCheck": {
+    "tcp": { "period": 500, "timeout": 300, "startDelay": 100 },
+    "connect": { "period": 3000, "timeout": 4000, "startDelay": 300 },
+    "target": {
+      "host": "no-such-host.invalid",
+      "port": 443,
+      "httpPath": "/",
+      "expectStatus": []
+    },
+    "maxProbeConcurrency": 2,
+    "downBackoff": { "initial": 1000, "multiplier": 2.0, "max": 5000, "jitter": 0.1 },
+    "probeJitter": 0.1
+  }
+}

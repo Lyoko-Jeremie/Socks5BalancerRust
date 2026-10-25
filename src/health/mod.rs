@@ -1,14 +1,16 @@
-//! 上游健康检查（M1.4）。
+//! 上游健康检查（M1.4 TCP liveness + M1.5 TLS/HTTP readiness）。
 //!
-//! 设计严格对齐 docs/07 ADR-002：
+//! 设计严格对齐 docs/07 ADR-002 与 ADR-006：
 //! - **fail-fast**：一次探测失败即判 DOWN，不做失败计数/重试/防抖；
-//! - **快速切换**：DOWN 的上游立即从选择池中排除（由 `is_available` 回调提供）；
+//! - **快速切换**：不可用的上游立即从选择池中排除；
 //! - **避免频繁打扰**：DOWN 后按指数退避安排重探（initial→×multiplier→cap max，带抖动），
 //!   给后端留出自恢复时间；
-//! - **数据面失败立即降级**：连接/握手失败调用 [`HealthRegistry::mark_degraded`]，
-//!   1 秒后快速重探确认，探测成功即恢复。
-//!
-//! 每个上游一个探测任务，互不阻塞；探测只做 TCP connect（M1.5 再加 TLS + HTTP readiness）。
+//! - **数据面失败立即降级**：连接/握手 I/O 失败调用 [`HealthRegistry::mark_degraded`]，
+//!   1 秒后快速重探确认；
+//! - **liveness 与 readiness 同时满足才可用**：TCP 探活 + （可选）TLS/HTTP 探测都通过；
+//! - 探测并发受 `maxProbeConcurrency` 限制（信号量）。
+
+pub mod tls_probe;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -30,14 +33,24 @@ const QUICK_RECHECK_MS: u64 = 1_000;
 struct Entry {
     name: String,
     addr: SocketAddr,
-    /// 是否可用；启动时乐观为 true，首个探测校正。
-    available: AtomicBool,
-    /// 下次探测时间（相对 registry 启动的毫秒）。
-    next_probe_ms: AtomicU64,
-    /// 当前退避时长（毫秒）。
-    backoff_ms: AtomicU64,
-    /// 连续失败次数（仅用于日志/快照）。
-    failures: AtomicU64,
+    auth_user: Option<String>,
+    auth_pwd: Option<String>,
+    /// TCP liveness。
+    liveness: AtomicBool,
+    /// TLS/HTTP readiness；未启用 readiness 探测时恒 true。
+    readiness: AtomicBool,
+    /// TCP 下次探测时间（相对 registry 启动的毫秒）。
+    tcp_next_probe_ms: AtomicU64,
+    /// TCP 当前退避时长（毫秒）。
+    tcp_backoff_ms: AtomicU64,
+    /// TCP 连续失败次数。
+    tcp_failures: AtomicU64,
+    /// readiness 下次探测时间。
+    tls_next_probe_ms: AtomicU64,
+    /// readiness 当前退避时长。
+    tls_backoff_ms: AtomicU64,
+    /// readiness 连续失败次数。
+    tls_failures: AtomicU64,
 }
 
 /// 健康快照（控制面/日志用；M3 会序列化为 JSON）。
@@ -45,8 +58,15 @@ struct Entry {
 pub struct HealthSnapshot {
     pub name: String,
     pub addr: SocketAddr,
+    /// liveness && readiness。
     pub available: bool,
+    pub liveness: bool,
+    pub readiness: bool,
+    /// TCP 连续失败次数。
     pub failures: u64,
+    /// readiness 连续失败次数。
+    pub tls_failures: u64,
+    /// TCP 当前退避。
     pub backoff_ms: u64,
 }
 
@@ -56,6 +76,8 @@ pub struct HealthRegistry {
     cfg: HealthConfig,
     started: Instant,
     entries: Vec<Entry>,
+    /// readiness 探测并发上限。
+    probe_permits: Arc<Semaphore>,
 }
 
 impl HealthRegistry {
@@ -66,16 +88,28 @@ impl HealthRegistry {
             .map(|u| Entry {
                 name: u.name.clone(),
                 addr: u.addr,
-                available: AtomicBool::new(true),
-                next_probe_ms: AtomicU64::new(0),
-                backoff_ms: AtomicU64::new(initial_backoff.max(1)),
-                failures: AtomicU64::new(0),
+                auth_user: u.auth_user.clone(),
+                auth_pwd: u.auth_pwd.clone(),
+                liveness: AtomicBool::new(true),
+                readiness: AtomicBool::new(true),
+                tcp_next_probe_ms: AtomicU64::new(0),
+                tcp_backoff_ms: AtomicU64::new(initial_backoff.max(1)),
+                tcp_failures: AtomicU64::new(0),
+                tls_next_probe_ms: AtomicU64::new(0),
+                tls_backoff_ms: AtomicU64::new(initial_backoff.max(1)),
+                tls_failures: AtomicU64::new(0),
             })
             .collect();
+        let permits = cfg
+            .tls
+            .as_ref()
+            .map(|t| t.max_concurrency.max(1))
+            .unwrap_or(1);
         Arc::new(Self {
             cfg,
             started: Instant::now(),
             entries,
+            probe_permits: Arc::new(Semaphore::new(permits)),
         })
     }
 
@@ -93,31 +127,37 @@ impl HealthRegistry {
         &self.cfg
     }
 
-    /// 上游当前是否可用（供选择器回调使用）。
+    /// 上游当前是否可用 = liveness && readiness（供选择器回调使用）。
     pub fn is_available(&self, idx: usize) -> bool {
         self.entries
             .get(idx)
-            .map(|e| e.available.load(Ordering::Relaxed))
+            .map(|e| e.liveness.load(Ordering::Relaxed) && e.readiness.load(Ordering::Relaxed))
             .unwrap_or(false)
     }
 
     /// 当前可用上游数量。
     pub fn available_count(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|e| e.available.load(Ordering::Relaxed))
+        (0..self.entries.len())
+            .filter(|i| self.is_available(*i))
             .count()
     }
 
     pub fn snapshot(&self) -> Vec<HealthSnapshot> {
         self.entries
             .iter()
-            .map(|e| HealthSnapshot {
-                name: e.name.clone(),
-                addr: e.addr,
-                available: e.available.load(Ordering::Relaxed),
-                failures: e.failures.load(Ordering::Relaxed),
-                backoff_ms: e.backoff_ms.load(Ordering::Relaxed),
+            .map(|e| {
+                let liveness = e.liveness.load(Ordering::Relaxed);
+                let readiness = e.readiness.load(Ordering::Relaxed);
+                HealthSnapshot {
+                    name: e.name.clone(),
+                    addr: e.addr,
+                    available: liveness && readiness,
+                    liveness,
+                    readiness,
+                    failures: e.tcp_failures.load(Ordering::Relaxed),
+                    tls_failures: e.tls_failures.load(Ordering::Relaxed),
+                    backoff_ms: e.tcp_backoff_ms.load(Ordering::Relaxed),
+                }
             })
             .collect()
     }
@@ -127,18 +167,17 @@ impl HealthRegistry {
     }
 
     /// 数据面失败：立即标记不可用并安排 1s 后快速重探。
-    ///
-    /// 这是"快速切换"的关键：失败连接的下一个请求不会再被分配到该上游。
     pub fn mark_degraded(&self, idx: usize, reason: &str) {
         let Some(entry) = self.entries.get(idx) else {
             return;
         };
-        let was_available = entry.available.swap(false, Ordering::AcqRel);
-        entry.failures.fetch_add(1, Ordering::Relaxed);
-        entry.next_probe_ms.store(
-            self.now_ms().saturating_add(QUICK_RECHECK_MS),
-            Ordering::Release,
-        );
+        let was_available = self.is_available(idx);
+        entry.liveness.store(false, Ordering::Release);
+        entry.readiness.store(false, Ordering::Release);
+        entry.tcp_failures.fetch_add(1, Ordering::Relaxed);
+        let quick = self.now_ms().saturating_add(QUICK_RECHECK_MS);
+        entry.tcp_next_probe_ms.store(quick, Ordering::Release);
+        entry.tls_next_probe_ms.store(quick, Ordering::Release);
         if was_available {
             warn!(
                 upstream = %entry.name,
@@ -156,15 +195,20 @@ impl HealthRegistry {
         }
     }
 
-    /// 记录一次探测结果。
-    fn record_probe(&self, idx: usize, ok: bool) {
+    /// 记录一次 TCP liveness 探测结果。
+    fn record_tcp(&self, idx: usize, ok: bool) {
         let Some(entry) = self.entries.get(idx) else {
             return;
         };
         if ok {
-            let was_available = entry.available.swap(true, Ordering::AcqRel);
-            entry.failures.store(0, Ordering::Relaxed);
-            entry.backoff_ms.store(
+            let was_available = self.is_available(idx);
+            entry.liveness.store(true, Ordering::Release);
+            // 未启用 readiness 探测时，readiness 不适用，视为通过
+            if self.cfg.tls.is_none() {
+                entry.readiness.store(true, Ordering::Release);
+            }
+            entry.tcp_failures.store(0, Ordering::Relaxed);
+            entry.tcp_backoff_ms.store(
                 self.cfg.backoff_initial.as_millis() as u64,
                 Ordering::Relaxed,
             );
@@ -172,27 +216,28 @@ impl HealthRegistry {
                 self.cfg.period.as_millis() as u64,
                 self.cfg.probe_jitter,
             ));
-            entry.next_probe_ms.store(next, Ordering::Release);
+            entry.tcp_next_probe_ms.store(next, Ordering::Release);
             if !was_available {
-                info!(upstream = %entry.name, addr = %entry.addr, "上游恢复可用");
+                info!(upstream = %entry.name, addr = %entry.addr, "上游 liveness 恢复");
             } else {
-                debug!(upstream = %entry.name, "上游探活成功");
+                debug!(upstream = %entry.name, "TCP 探活成功");
             }
             return;
         }
 
-        // fail-fast：一次失败立即 DOWN
-        let was_available = entry.available.swap(false, Ordering::AcqRel);
-        let failures = entry.failures.fetch_add(1, Ordering::Relaxed) + 1;
-        let current_backoff = entry.backoff_ms.load(Ordering::Relaxed).max(1);
-        // 按"当前退避"等待，然后增长（cap 到 max）
+        // fail-fast：一次失败立即 DOWN（readiness 自然也不满足）
+        let was_available = self.is_available(idx);
+        entry.liveness.store(false, Ordering::Release);
+        entry.readiness.store(false, Ordering::Release);
+        let failures = entry.tcp_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        let current_backoff = entry.tcp_backoff_ms.load(Ordering::Relaxed).max(1);
         let wait_ms = jittered(current_backoff, self.cfg.backoff_jitter);
         let next_backoff = ((current_backoff as f64) * self.cfg.backoff_multiplier)
             .min(self.cfg.backoff_max.as_millis() as f64)
             .max(1.0) as u64;
-        entry.backoff_ms.store(next_backoff, Ordering::Relaxed);
+        entry.tcp_backoff_ms.store(next_backoff, Ordering::Relaxed);
         entry
-            .next_probe_ms
+            .tcp_next_probe_ms
             .store(self.now_ms().saturating_add(wait_ms), Ordering::Release);
 
         if was_available {
@@ -201,7 +246,7 @@ impl HealthRegistry {
                 addr = %entry.addr,
                 wait_ms,
                 next_backoff_ms = next_backoff,
-                "上游探活失败：标记 DOWN（fail-fast），按退避延迟重探"
+                "TCP 探活失败：标记 DOWN（fail-fast），按退避延迟重探"
             );
         } else {
             debug!(
@@ -214,50 +259,188 @@ impl HealthRegistry {
         }
     }
 
-    /// 为每个上游启动独立探测任务（随 `cancel` 退出）。
+    /// 记录一次 readiness（TLS + HTTP）探测结果。
+    fn record_readiness(&self, idx: usize, ok: bool) {
+        let Some(entry) = self.entries.get(idx) else {
+            return;
+        };
+        if ok {
+            let was_available = self.is_available(idx);
+            entry.readiness.store(true, Ordering::Release);
+            entry.tls_failures.store(0, Ordering::Relaxed);
+            entry.tls_backoff_ms.store(
+                self.cfg.backoff_initial.as_millis() as u64,
+                Ordering::Relaxed,
+            );
+            let period = self
+                .cfg
+                .tls
+                .as_ref()
+                .map(|t| t.period.as_millis() as u64)
+                .unwrap_or(60_000);
+            let next = self
+                .now_ms()
+                .saturating_add(jittered(period, self.cfg.probe_jitter));
+            entry.tls_next_probe_ms.store(next, Ordering::Release);
+            if !was_available {
+                info!(upstream = %entry.name, addr = %entry.addr, "上游 readiness 恢复");
+            } else {
+                debug!(upstream = %entry.name, "TLS/HTTP 探测成功");
+            }
+            return;
+        }
+
+        let was_available = self.is_available(idx);
+        entry.readiness.store(false, Ordering::Release);
+        let failures = entry.tls_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        let current_backoff = entry.tls_backoff_ms.load(Ordering::Relaxed).max(1);
+        let wait_ms = jittered(current_backoff, self.cfg.backoff_jitter);
+        let next_backoff = ((current_backoff as f64) * self.cfg.backoff_multiplier)
+            .min(self.cfg.backoff_max.as_millis() as f64)
+            .max(1.0) as u64;
+        entry.tls_backoff_ms.store(next_backoff, Ordering::Relaxed);
+        entry
+            .tls_next_probe_ms
+            .store(self.now_ms().saturating_add(wait_ms), Ordering::Release);
+
+        if was_available {
+            warn!(
+                upstream = %entry.name,
+                addr = %entry.addr,
+                wait_ms,
+                next_backoff_ms = next_backoff,
+                "readiness 探测失败（TLS/HTTP）：标记不可用，按退避延迟重探"
+            );
+        } else {
+            debug!(
+                upstream = %entry.name,
+                failures,
+                wait_ms,
+                "上游 readiness 仍不满足"
+            );
+        }
+    }
+
+    /// 为每个上游启动探测任务（随 `cancel` 退出）。
     pub fn spawn_probes(self: &Arc<Self>, cancel: CancellationToken) {
         for idx in 0..self.entries.len() {
-            let reg = Arc::clone(self);
-            let cancel = cancel.clone();
-            tokio::spawn(async move {
-                let start_delay =
-                    reg.cfg
-                        .start_delay
-                        .saturating_add(Duration::from_millis(jittered(
-                            reg.cfg.period.as_millis() as u64 / 4,
-                            reg.cfg.probe_jitter,
-                        )));
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    _ = tokio::time::sleep(start_delay) => {}
-                }
+            self.spawn_tcp_probe(idx, cancel.clone());
+            if self.cfg.tls.is_some() {
+                self.spawn_readiness_probe(idx, cancel.clone());
+            }
+        }
+    }
 
-                loop {
-                    // 等到下次探测时间（DOWN 期间可能是很长的退避）
-                    loop {
-                        if cancel.is_cancelled() {
-                            return;
+    fn spawn_tcp_probe(self: &Arc<Self>, idx: usize, cancel: CancellationToken) {
+        let reg = Arc::clone(self);
+        tokio::spawn(async move {
+            let start_delay = reg
+                .cfg
+                .start_delay
+                .saturating_add(Duration::from_millis(jittered(
+                    reg.cfg.period.as_millis() as u64 / 4,
+                    reg.cfg.probe_jitter,
+                )));
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(start_delay) => {}
+            }
+            loop {
+                if !wait_until(&reg, idx, true, &cancel).await {
+                    return;
+                }
+                let addr = reg.entries[idx].addr;
+                let ok = matches!(
+                    tokio::time::timeout(reg.cfg.timeout, TcpStream::connect(addr)).await,
+                    Ok(Ok(_))
+                );
+                reg.record_tcp(idx, ok);
+            }
+        });
+    }
+
+    fn spawn_readiness_probe(self: &Arc<Self>, idx: usize, cancel: CancellationToken) {
+        let Some(tls_cfg) = self.cfg.tls.clone() else {
+            return;
+        };
+        let reg = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(tls_cfg.start_delay) => {}
+            }
+            loop {
+                if !wait_until(&reg, idx, false, &cancel).await {
+                    return;
+                }
+                if !reg.entries[idx].liveness.load(Ordering::Relaxed) {
+                    // TCP 都不通，无需做 readiness 探测
+                    reg.record_readiness(idx, false);
+                    continue;
+                }
+                let upstream = Upstream {
+                    name: reg.entries[idx].name.clone(),
+                    addr: reg.entries[idx].addr,
+                    auth_user: reg.entries[idx].auth_user.clone(),
+                    auth_pwd: reg.entries[idx].auth_pwd.clone(),
+                    health_index: idx,
+                };
+                let ok = {
+                    let _permit = reg.probe_permits.acquire().await;
+                    match tokio::time::timeout(
+                        tls_cfg.timeout,
+                        tls_probe::probe(&upstream, &tls_cfg),
+                    )
+                    .await
+                    {
+                        Ok(Ok(status)) => {
+                            tls_probe::status_acceptable(status, &tls_cfg.expect_status)
                         }
-                        let now = reg.now_ms();
-                        let next = reg.entries[idx].next_probe_ms.load(Ordering::Acquire);
-                        if now >= next {
-                            break;
+                        Ok(Err(e)) => {
+                            debug!(upstream = %upstream.name, error = %e, "readiness 探测失败");
+                            false
                         }
-                        let wait = Duration::from_millis(next - now);
-                        tokio::select! {
-                            _ = cancel.cancelled() => return,
-                            _ = tokio::time::sleep(wait) => {}
+                        Err(_) => {
+                            debug!(
+                                upstream = %upstream.name,
+                                timeout_ms = tls_cfg.timeout.as_millis() as u64,
+                                "readiness 探测超时"
+                            );
+                            false
                         }
                     }
+                };
+                reg.record_readiness(idx, ok);
+            }
+        });
+    }
+}
 
-                    let addr = reg.entries[idx].addr;
-                    let ok = matches!(
-                        tokio::time::timeout(reg.cfg.timeout, TcpStream::connect(addr)).await,
-                        Ok(Ok(_))
-                    );
-                    reg.record_probe(idx, ok);
-                }
-            });
+/// 等待某个上游的下次探测时间；返回 false 表示已取消。
+async fn wait_until(
+    reg: &Arc<HealthRegistry>,
+    idx: usize,
+    tcp: bool,
+    cancel: &CancellationToken,
+) -> bool {
+    loop {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        let now = reg.now_ms();
+        let entry = &reg.entries[idx];
+        let next = if tcp {
+            entry.tcp_next_probe_ms.load(Ordering::Acquire)
+        } else {
+            entry.tls_next_probe_ms.load(Ordering::Acquire)
+        };
+        if now >= next {
+            return true;
+        }
+        let wait = Duration::from_millis(next - now);
+        tokio::select! {
+            _ = cancel.cancelled() => return false,
+            _ = tokio::time::sleep(wait) => {}
         }
     }
 }
@@ -286,6 +469,7 @@ mod tests {
             backoff_max: Duration::from_millis(500),
             probe_jitter: 0.0,
             backoff_jitter: 0.0,
+            tls: None,
         }
     }
 
@@ -309,37 +493,51 @@ mod tests {
     #[test]
     fn fail_fast_一次失败立即_down() {
         let reg = HealthRegistry::new(&[upstream("a", 1)], cfg());
-        reg.record_probe(0, false);
+        reg.record_tcp(0, false);
         assert!(!reg.is_available(0));
         assert_eq!(reg.available_count(), 0);
         assert_eq!(reg.snapshot()[0].failures, 1);
+        assert!(!reg.snapshot()[0].liveness);
     }
 
     #[test]
     fn 失败后指数退避并封顶() {
         let reg = HealthRegistry::new(&[upstream("a", 1)], cfg());
-        // 第一次失败：等待 100ms，退避 → 200ms
-        reg.record_probe(0, false);
+        reg.record_tcp(0, false);
         assert_eq!(reg.snapshot()[0].backoff_ms, 200);
-        // 连续失败：200 → 400 → 500(cap)
-        reg.record_probe(0, false);
+        reg.record_tcp(0, false);
         assert_eq!(reg.snapshot()[0].backoff_ms, 400);
-        reg.record_probe(0, false);
+        reg.record_tcp(0, false);
         assert_eq!(reg.snapshot()[0].backoff_ms, 500);
-        reg.record_probe(0, false);
+        reg.record_tcp(0, false);
         assert_eq!(reg.snapshot()[0].backoff_ms, 500);
     }
 
     #[test]
-    fn 探测成功恢复并重置退避() {
+    fn tcp_探测成功恢复并重置退避() {
         let reg = HealthRegistry::new(&[upstream("a", 1)], cfg());
-        reg.record_probe(0, false);
-        reg.record_probe(0, false);
+        reg.record_tcp(0, false);
+        reg.record_tcp(0, false);
         assert!(!reg.is_available(0));
-        reg.record_probe(0, true);
+        reg.record_tcp(0, true);
         assert!(reg.is_available(0));
         assert_eq!(reg.snapshot()[0].failures, 0);
         assert_eq!(reg.snapshot()[0].backoff_ms, 100);
+    }
+
+    #[test]
+    fn readiness_失败导致不可用_liveness_仍为真() {
+        let reg = HealthRegistry::new(&[upstream("a", 1)], cfg());
+        reg.record_readiness(0, false);
+        let s = reg.snapshot().into_iter().next().unwrap();
+        assert!(!s.available);
+        assert!(s.liveness);
+        assert!(!s.readiness);
+        assert_eq!(s.tls_failures, 1);
+        // readiness 恢复 → 整体恢复
+        reg.record_readiness(0, true);
+        assert!(reg.is_available(0));
+        assert_eq!(reg.snapshot()[0].tls_failures, 0);
     }
 
     #[test]
@@ -348,12 +546,11 @@ mod tests {
         let before = reg.now_ms();
         reg.mark_degraded(0, "connect failed");
         assert!(!reg.is_available(0));
-        let next = reg.entries[0].next_probe_ms.load(Ordering::Relaxed);
+        let next = reg.entries[0].tcp_next_probe_ms.load(Ordering::Relaxed);
         assert!(
             next >= before + QUICK_RECHECK_MS,
             "next={next} before={before}"
         );
-        // 退避不变（保持 initial），快速重探失败后再进入退避
         assert_eq!(reg.snapshot()[0].backoff_ms, 100);
     }
 
@@ -365,7 +562,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 探测任务能感知上游起落() {
+    async fn tcp_探测任务能感知上游起落() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let up = Upstream {
@@ -379,16 +576,13 @@ mod tests {
         let cancel = CancellationToken::new();
         reg.spawn_probes(cancel.clone());
 
-        // 首个探测成功后应保持可用
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(reg.is_available(0), "监听中应可用");
 
-        // 关闭监听 → 探测失败 → DOWN
         drop(listener);
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(!reg.is_available(0), "监听关闭后应 DOWN");
 
-        // 重新监听同一地址 → 退避后恢复（test cfg 退避 100ms 起）
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(reg.is_available(0), "重新监听后应恢复可用");

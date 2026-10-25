@@ -201,6 +201,9 @@ pub struct RawProbeTarget {
     pub user_agent: Option<String>,
     #[serde(default)]
     pub expect_status: Vec<u16>,
+    /// 自定义信任根 PEM（企业自签 CA / 测试用）。
+    #[serde(default)]
+    pub ca_file: Option<String>,
 }
 
 /// DOWN 后的指数退避原始配置。
@@ -217,7 +220,34 @@ pub struct RawBackoff {
     pub jitter: Option<f64>,
 }
 
-/// 健康检查有效配置（M1.4：TCP 探活 + fail-fast + DOWN 退避）。
+/// TLS + HTTP readiness 探测有效配置（M1.5，ADR-006：对齐 C++ `ConnectTestHttps`）。
+#[derive(Debug, Clone)]
+pub struct TlsProbeConfig {
+    /// 探测周期。
+    pub period: Duration,
+    /// 单次探测超时（含 SOCKS5 CONNECT + TLS 握手 + HTTP 响应）。
+    pub timeout: Duration,
+    /// 启动后首次探测延迟。
+    pub start_delay: Duration,
+    /// 探测目标 host（交给上游解析，socks5h）。
+    pub host: String,
+    /// 探测目标端口（默认 443）。
+    pub port: u16,
+    /// TLS SNI（默认同 host）。
+    pub sni: String,
+    /// HTTP 请求路径（默认 `/`）。
+    pub http_path: String,
+    /// User-Agent。
+    pub user_agent: String,
+    /// 期望状态码；为空表示接受 2xx/3xx。
+    pub expect_status: Vec<u16>,
+    /// 自定义信任根（PEM 文件）；None 表示使用操作系统根证书。
+    pub ca_file: Option<std::path::PathBuf>,
+    /// 探测并发上限（上游很多时避免同时打满）。
+    pub max_concurrency: usize,
+}
+
+/// 健康检查有效配置（M1.4：TCP 探活；M1.5：+ TLS/HTTP readiness）。
 #[derive(Debug, Clone)]
 pub struct HealthConfig {
     /// 探活周期。
@@ -236,6 +266,8 @@ pub struct HealthConfig {
     pub probe_jitter: f64,
     /// 退避时长的随机抖动比例（0..=1）。
     pub backoff_jitter: f64,
+    /// TLS + HTTP readiness 探测；None 表示只做 TCP liveness。
+    pub tls: Option<TlsProbeConfig>,
 }
 
 /// 原始配置：字段名与 C++ `config.json` 对齐。
@@ -588,12 +620,9 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
     // ===== 健康检查（ADR-002：fail-fast，不重试/不防抖）=====
     let health_raw = raw.health_check.clone().unwrap_or_default();
     if health_raw.connect.is_some() || health_raw.target.is_some() {
-        notes.push(
-            "healthCheck.connect/target（TLS + HTTP readiness）将在 M1.5 启用；M1.4 先做 TCP 探活"
-                .into(),
-        );
+        notes.push("healthCheck.connect/target 已启用：TLS + HTTP readiness 探测（M1.5）".into());
     }
-    let health = build_health_config(&health_raw)?;
+    let health = build_health_config(&health_raw, raw.disable_connect_test)?;
 
     // ===== 客户端认证（ADR-004）=====
     let mut auth: Vec<AuthUser> = Vec::new();
@@ -695,8 +724,11 @@ pub fn effective_worker_threads(thread: &ThreadConfig) -> usize {
     n.clamp(1, MAX_WORKER_THREADS)
 }
 
-/// 构建健康检查有效配置（M1.4：TCP 探活 + fail-fast + DOWN 指数退避）。
-fn build_health_config(raw: &RawHealthConfig) -> Result<HealthConfig, ConfigError> {
+/// 构建健康检查有效配置（M1.4：TCP 探活；M1.5：+ TLS/HTTP readiness）。
+fn build_health_config(
+    raw: &RawHealthConfig,
+    disable_connect_test: bool,
+) -> Result<HealthConfig, ConfigError> {
     const DEFAULT_PERIOD_MS: u64 = 5_000;
     const DEFAULT_TIMEOUT_MS: u64 = 2_000;
     const DEFAULT_START_DELAY_MS: u64 = 1_000;
@@ -704,6 +736,9 @@ fn build_health_config(raw: &RawHealthConfig) -> Result<HealthConfig, ConfigErro
     const DEFAULT_BACKOFF_MAX_MS: u64 = 600_000;
     const DEFAULT_MULTIPLIER: f64 = 2.0;
     const DEFAULT_JITTER: f64 = 0.2;
+    // C++ 默认 ConnectTest 周期 300000ms、超时 11000ms
+    const DEFAULT_TLS_PERIOD_MS: u64 = 300_000;
+    const DEFAULT_TLS_TIMEOUT_MS: u64 = 11_000;
 
     // fail-fast 是 ADR-002 的既定策略，不接受关闭
     if raw.fail_fast == Some(false) {
@@ -751,6 +786,70 @@ fn build_health_config(raw: &RawHealthConfig) -> Result<HealthConfig, ConfigErro
         return Err(err("healthCheck.downBackoff.jitter 必须在 [0, 1]"));
     }
 
+    // ===== TLS + HTTP readiness（M1.5，ADR-006）=====
+    let tls = if disable_connect_test {
+        None
+    } else if raw.connect.is_some() || raw.target.is_some() {
+        let connect = raw.connect.clone().unwrap_or_default();
+        let target = raw.target.clone().unwrap_or_default();
+        let host = target
+            .host
+            .clone()
+            .filter(|h| !h.trim().is_empty())
+            .ok_or_else(|| {
+                err("healthCheck.connect 需要同时配置 healthCheck.target.host（ADR-006）")
+            })?;
+        let port = target.port.unwrap_or(443);
+        if port == 0 {
+            return Err(err("healthCheck.target.port 不能为 0"));
+        }
+        let http_period_ms = connect
+            .period
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_TLS_PERIOD_MS);
+        let http_timeout_ms = connect
+            .timeout
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_TLS_TIMEOUT_MS);
+        if http_period_ms < 1_000 {
+            return Err(err("healthCheck.connect.period 不能小于 1000ms"));
+        }
+        if http_timeout_ms > 120_000 {
+            return Err(err("healthCheck.connect.timeout 过大（>120000ms）"));
+        }
+        let max_concurrency = raw.max_probe_concurrency.filter(|v| *v > 0).unwrap_or(4);
+        Some(TlsProbeConfig {
+            period: Duration::from_millis(http_period_ms),
+            timeout: Duration::from_millis(http_timeout_ms),
+            start_delay: Duration::from_millis(connect.start_delay.unwrap_or(1_000)),
+            host,
+            port,
+            sni: target
+                .sni
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| target.host.clone().unwrap_or_default()),
+            http_path: target
+                .http_path
+                .clone()
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| "/".to_string()),
+            user_agent: target
+                .user_agent
+                .clone()
+                .unwrap_or_else(|| format!("Socks5BalancerRust/{}", env!("CARGO_PKG_VERSION"))),
+            expect_status: target.expect_status.clone(),
+            ca_file: target
+                .ca_file
+                .clone()
+                .filter(|p| !p.trim().is_empty())
+                .map(std::path::PathBuf::from),
+            max_concurrency,
+        })
+    } else {
+        None
+    };
+
     Ok(HealthConfig {
         period: Duration::from_millis(period_ms),
         timeout: Duration::from_millis(timeout_ms),
@@ -760,6 +859,7 @@ fn build_health_config(raw: &RawHealthConfig) -> Result<HealthConfig, ConfigErro
         backoff_max: Duration::from_millis(max_ms),
         probe_jitter: jitter,
         backoff_jitter,
+        tls,
     })
 }
 
@@ -989,5 +1089,58 @@ mod tests {
             e.contains("upstreamSelectRule"),
             "错误信息应提示字段名: {e}"
         );
+    }
+
+    #[test]
+    fn tls_探测配置解析与校验() {
+        let text = r#"{
+            "listenPort": 5000,
+            "upstream": [ { "host": "127.0.0.1", "port": 6100 } ],
+            "healthCheck": {
+                "connect": { "period": 60000, "timeout": 5000 },
+                "target": {
+                    "host": "www.example.com",
+                    "port": 443,
+                    "sni": "www.example.com",
+                    "httpPath": "/health",
+                    "userAgent": "probe/1.0",
+                    "expectStatus": [204]
+                }
+            }
+        }"#;
+        let c = load_str(text).unwrap();
+        let tls = c.health.tls.expect("应启用 TLS 探测");
+        assert_eq!(tls.host, "www.example.com");
+        assert_eq!(tls.port, 443);
+        assert_eq!(tls.sni, "www.example.com");
+        assert_eq!(tls.http_path, "/health");
+        assert_eq!(tls.user_agent, "probe/1.0");
+        assert_eq!(tls.expect_status, vec![204]);
+        assert_eq!(tls.period, Duration::from_millis(60_000));
+        assert_eq!(tls.timeout, Duration::from_millis(5_000));
+
+        // 只配 connect 不配 target → 报错
+        let text = r#"{
+            "listenPort": 5000,
+            "upstream": [ { "host": "a", "port": 1 } ],
+            "healthCheck": { "connect": { "period": 60000 } }
+        }"#;
+        let e = load_str(text).unwrap_err().to_string();
+        assert!(e.contains("healthCheck.target.host"), "实际: {e}");
+
+        // disableConnectTest=true → 不启用 readiness 探测
+        let text = r#"{
+            "listenPort": 5000,
+            "disableConnectTest": true,
+            "upstream": [ { "host": "a", "port": 1 } ],
+            "healthCheck": { "target": { "host": "www.example.com" } }
+        }"#;
+        let c = load_str(text).unwrap();
+        assert!(c.health.tls.is_none());
+
+        // 未配置 healthCheck → 只做 TCP
+        let c = load_str(minimal()).unwrap();
+        assert!(c.health.tls.is_none());
+        assert_eq!(c.health.period, Duration::from_millis(5_000));
     }
 }

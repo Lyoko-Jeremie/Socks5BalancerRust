@@ -1,0 +1,34 @@
+{
+  "listenHost": "127.0.0.1",
+  "listenPort": 5400,
+  "traditionTcpRelay": false,
+  "bufferSize": 4096,
+  "connectTimeout": 2000,
+  "firstPacketTimeout": 5000,
+  "handshakeTimeout": 5000,
+  "logLevel": "debug",
+  "upstream": [
+    {
+      "name": "mockAuth",
+      "host": "127.0.0.1",
+      "port": 6200,
+      "authUser": "alice",
+      "authPwd": "secret"
+    }
+  ],
+  "healthCheck": {
+    "tcp": { "period": 500, "timeout": 300, "startDelay": 100 },
+    "connect": { "period": 5000, "timeout": 8000, "startDelay": 500 },
+    "target": {
+      "host": "www.baidu.com",
+      "port": 443,
+      "sni": "",
+      "httpPath": "/",
+      "userAgent": "Socks5BalancerRust-probe/0.1",
+      "expectStatus": []
+    },
+    "maxProbeConcurrency": 2,
+    "downBackoff": { "initial": 1000, "multiplier": 2.0, "max": 5000, "jitter": 0.1 },
+    "probeJitter": 0.1
+  }
+}
