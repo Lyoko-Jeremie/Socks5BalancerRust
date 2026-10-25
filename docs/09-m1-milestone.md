@@ -22,27 +22,30 @@
 | 健康检查：DOWN 后指数退避（避免打扰自恢复） | ✅ | initial→×2→cap max，带抖动；单测覆盖封顶 |
 | 健康检查：数据面失败立即降级 + 快速重探 | ✅ | 建连/上游 I/O 故障 → `mark_degraded`，1s 后重探 |
 | 全部上游不可用 → 快速拒绝（不黑洞） | ✅ | CONNECT 回 REP 0x01，不挂起 |
-| TLS + HTTP readiness 探测（M1.5） | ⏳ 未开始 | 配置字段已解析（`healthCheck.connect/target`），实现留待 M1.5 |
+| TLS + HTTP readiness 探测（M1.5 / ADR-006） | ✅ | 本地自签 HTTPS 目标 9/9 通过；系统根证书或 `caFile` 自定义信任根；状态码可配 |
+| liveness + readiness 同时满足才可用（ADR-002） | ✅ | readiness 失败（坏目标）时上游不可用；TCP 恢复后 readiness 探测恢复 |
 | 每客户端 hint 粘性（C++ `hintUpstreamIndex`） | ⏳ M3 | 依赖控制面/连接表，M1 用全局规则 |
 
-**M1 结论：M1.1–M1.4 完成并全部通过端到端验收；M1.5（TLS 探测）与 C10K 压测为下一步。**
+**M1 结论：M1.1–M1.5 全部完成并通过端到端验收；C10K/1K 压测与 M2 为下一步。**
 
 ---
 
 ## 2. 交付物
 
-### 2.1 代码（Rust 合计 3,347 行，M0 为 1,534 行）
+### 2.1 代码（Rust 合计 3,963 行，M0 为 1,534 行）
 
 | 模块 | 行数 | 职责 |
 |---|---|---|
 | `src/handshake/socks5.rs` | 411 | 服务端协商：方法选择、RFC1929、CONNECT 解析、REP 错误码 |
-| `src/health/mod.rs` | 338 | 健康注册表：探测任务、fail-fast、指数退避、数据面降级 |
+| `src/health/mod.rs` | 516 | 健康注册表：TCP liveness + TLS/HTTP readiness、fail-fast、指数退避、数据面降级 |
+| `src/health/tls_probe.rs` | 143 | 上游 SOCKS5 → TLS（系统根/caFile）→ hyper HTTP GET → 状态码判定 |
 | `src/relay/mod.rs` | 461 | tradition 透传 / SOCKS5 终结双路径、超时、错误应答、双向转发 |
-| `src/upstream/mod.rs` | 292 | 5 条选路规则、启动期解析、`is_available` 回调 |
-| `src/config.rs` | 845 | 旧配置兼容、认证、超时、选路规则、healthCheck 结构化校验 |
-| `src/main.rs` | 257 | 装配、探测任务启动、周期日志、优雅关闭 |
-| `src/app.rs`/`stats.rs`/`net`/`logging` | ~416 | 上下文、统计、监听、日志（M0 基础） |
-| `examples/mock_socks5_upstream.rs` | 149 | 测试用 SOCKS5 代理（0x00 / 0x02，真实连接目标） |
+| `src/upstream/mod.rs` | 298 | 5 条选路规则、启动期解析（IPv4 优先）、`is_available` 回调 |
+| `src/config.rs` | 978 | 旧配置兼容、认证、超时、选路规则、healthCheck（含 TLS 探测）结构化校验 |
+| `src/main.rs` | 276 | 装配、探测任务启动、周期日志、优雅关闭 |
+| `src/app.rs`/`stats.rs`/`net`/`logging` | ~391 | 上下文、统计、监听、日志（M0 基础） |
+| `examples/mock_socks5_upstream.rs` | 206 | 测试用 SOCKS5 代理（0x00 / 0x02、IPv4 优先、首块诊断日志） |
+| `examples/tls_echo_server.rs` | 80 | 本地自签 HTTPS 目标（rcgen + rustls），供可复现 readiness 验收 |
 | `examples/socks5_client.rs` | 78 | 测试客户端（复用 tokio-socks，`--auth`） |
 | `examples/echo_upstream.rs`/`flood.rs` | 92 | echo 目标 / 并发压测（M0 已有） |
 
@@ -83,11 +86,28 @@
 | 5 | 重启上游 4.5s → 转发恢复 | ✅ |
 | 6 | 日志记录"上游恢复可用" | ✅ |
 
-### 3.3 质量门禁
+### 3.3 TLS + HTTP readiness 探测（`scripts/m1-tls.ps1`，9/9 PASS）
+
+> 使用本地自签 HTTPS 目标（`examples/tls_echo_server`，127.0.0.1:18443），不依赖外网、可复现；
+> balancer 通过 `healthCheck.target.caFile` 信任自签证书（对齐 C++ 的证书校验语义，不关闭校验）。
+
+| # | 检查 | 结果 |
+|---|---|---|
+| 1 | TLS+HTTP 探测通过后经该上游转发成功 | ✅ |
+| 2 | 日志记录 readiness 探测启用 | ✅ |
+| 3 | 日志记录 TLS/HTTP 探测成功 | ✅ |
+| 4 | 本地 TLS 服务收到 `GET / HTTP/1.1` 探测请求 | ✅ |
+| 5 | 坏目标（不可解析）→ readiness 失败日志 | ✅ |
+| 6 | 坏目标时上游不可用（CONNECT 被拒） | ✅ |
+| 7 | 停上游 → TCP 探活失败 → 快速失败 | ✅ |
+| 8 | 日志记录 TCP 探活失败 | ✅ |
+| 9 | 重启上游 → 自动恢复 | ✅ |
+
+### 3.4 质量门禁
 
 | 项 | 结果 |
 |---|---|
-| `cargo test` | ✅ 48 passed / 0 failed |
+| `cargo test` | ✅ 53 passed / 0 failed |
 | `cargo clippy --all-targets -- -D warnings` | ✅ |
 | `cargo fmt --check` | ✅ |
 | 源码编码 | ✅ 全部 UTF-8 无 BOM（脚本除外，需 BOM） |
@@ -117,16 +137,26 @@
 - 重探失败 → 进入正常退避（initial→×2→cap）；
 - 重探成功 → 恢复、退避重置、日志 "上游恢复可用"。
 
+### 4.3 readiness 探测（M1.5）
+
+- **liveness 通过后才做 readiness**：TCP 都不通时跳过 TLS/HTTP，节省资源；
+- readiness 有独立周期、超时与退避（`healthCheck.connect`），失败不影响 liveness 的探测节奏；
+- 只有 `liveness && readiness` 才被选择器选用（ADR-002）；
+- 证书校验**不关闭**：默认 `rustls-platform-verifier`（系统根），配置 `caFile` 时改用自定义 PEM 信任根（企业自签 CA / 测试），对齐 C++ 的 `ssl::verify_peer`；
+- HTTP 请求行使用 origin-form（`GET /path HTTP/1.1`），`Host` 头按端口规则生成；
+- 探测并发由 `maxProbeConcurrency` 的信号量限制。
+
 ---
 
 ## 5. 已知限制
 
-1. **TLS + HTTP readiness 探测（M1.5）未实现**：`healthCheck.connect/target` 已解析但未使用；目前只有 TCP liveness。按 ADR-002，最终需要"liveness + readiness 同时满足"。
+1. **外网 TLS 目标可达性取决于部署环境**：本机对部分外网 IPv4/IPv6 的 TLS 数据会被 RST（curl 直连亦不一致），因此验收改用**本地自签 HTTPS 目标**（`examples/tls_echo_server` + `caFile`），保证可复现。生产部署时 `healthCheck.target` 应配置为**从本机可达**的目标。
 2. **无每客户端 hint 粘性**：C++ 的 `hintUpstreamIndex` 依赖连接表/控制面，计划 M3 随控制面实现。
 3. **`sleepTime`（长时间无请求暂停探测）未实现**：M1.4 恒探测；按 ADR 可在 M3 控制面做。
 4. **C10K/1K 建连压测未做**：Windows 单机动态端口 16,384 的限制仍在（M0 已记录），需 Linux 或多机验证；M1 的 SOCKS5 握手会额外消耗端口与时间。
 5. **Linux 未实测**：平台差异已用 `cfg` 分隔，CI 待补。
 6. **`slowImpl` 握手兼容未实现**：C++ 的兼容模式（部分上游不标准）计划 M2。
+7. **`rustls-platform-verifier` 首次调用会加载系统根证书**：冷启动探测可能略慢，属预期。
 
 ---
 
@@ -141,21 +171,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/m1-smoke.ps1
 # 健康检查端到端（6 项）
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/m1-health.ps1
 
+# TLS + HTTP readiness 端到端（9 项，本地自签 HTTPS，不依赖外网）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/m1-tls.ps1
+
 # 手工：起 mock 上游与 balancer，再用客户端验证
 .\target\release\examples\mock_socks5_upstream.exe 127.0.0.1:6200 alice:secret
 .\target\release\Socks5BalancerRust.exe -c configs\m1-inbound-noauth.json
-.\target\release\examples\socks5_client.exe 127.0.0.1:5100 127.0.0.1:6100 "hello" 
+.\target\release\examples\socks5_client.exe 127.0.0.1:5100 127.0.0.1:6100 "hello"
 ```
+
+> `configs/m1-tls-local.json` 里 `caFile` 指向 `target/m1-tls-logs/cert.pem`，
+> 该证书由 `tls_echo_server` 启动时生成；单独手工运行时先启动 TLS 服务再启动 balancer。
 
 ---
 
 ## 7. 下一步
 
-1. **M1.5：TLS + HTTP readiness 探测**（ADR-006）
-   - 上游 SOCKS5 CONNECT 到 `healthCheck.target`（默认 `www.google.com:443`）；
-   - `rustls` + `rustls-platform-verifier` 做证书校验（对齐 C++ 的 `ssl::verify_peer`）；
-   - `hyper` 发 `GET httpPath`（带 `userAgent`/`Host`/`SNI`），校验状态码；
-   - liveness + readiness 同时满足才可用；探测并发受 `maxProbeConcurrency` 限制。
-2. **C10K / 1K 建连压测**（Linux 优先）：连接数上限、RSS、握手 CPU 占用、`bufferSize` 对比。
-3. **M2：SOCKS4/4a、HTTP CONNECT/forward、首包嗅探与回放、`slowImpl`**。
-4. **M3：控制面最小集**（`/healthz`、`/api/v1/status`、`/api/v1/upstreams`、`/api/v1/control`）。
+1. **C10K / 1K 建连压测**（Linux 优先）：连接数上限、RSS、握手 CPU 占用、`bufferSize` 对比。
+2. **M2：SOCKS4/4a、HTTP CONNECT/forward、首包嗅探与回放、`slowImpl`**。
+3. **M3：控制面最小集**（`/healthz`、`/api/v1/status`、`/api/v1/upstreams`、`/api/v1/control`）。
+4. **Linux CI**：双平台构建/单测/冒烟脚本（bash 版）。
