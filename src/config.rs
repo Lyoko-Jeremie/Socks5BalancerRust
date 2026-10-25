@@ -22,6 +22,10 @@ pub const ALLOWED_BUFFER_SIZES: [usize; 3] = [2048, 4096, 8192];
 pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 2000;
 /// 默认连接数上限（C10K 目标）。
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
+/// 首包默认超时：下游连上后 15s 不发数据即关闭。
+pub const DEFAULT_FIRST_PACKET_TIMEOUT_MS: u64 = 15_000;
+/// 握手默认超时（方法/认证协商、上游 SOCKS5 握手）。
+pub const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
 /// `spawn_blocking` 线程默认上限。
 pub const DEFAULT_MAX_BLOCKING_THREADS: usize = 2;
 /// 线程栈默认 512KB（ADR-003）。
@@ -132,6 +136,15 @@ pub struct InternalBehavior {
     pub statistical_timer_period: Option<u64>,
 }
 
+/// 客户端认证用户（SOCKS5 0x02 / M2 的 HTTP Basic）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct AuthUser {
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub pwd: String,
+}
+
 /// 原始配置：字段名与 C++ `config.json` 对齐。
 ///
 /// 标注 `allow(dead_code)` 的原因：其中一部分字段（探测周期、控制面等）在 M0 只做兼容解析，
@@ -155,6 +168,12 @@ pub struct RawConfig {
     /// 毫秒；缺省时回落到 `internalBehavior.connectTimeout`，再缺省 2000ms。
     #[serde(default)]
     pub connect_timeout: Option<u64>,
+    /// 首包超时（毫秒）：下游连上后迟迟不发数据则关闭，防止"哑连接"泄漏。
+    #[serde(default)]
+    pub first_packet_timeout: Option<u64>,
+    /// 协议握手超时（毫秒）：方法协商/认证/上游 SOCKS5 握手共用。
+    #[serde(default)]
+    pub handshake_timeout: Option<u64>,
 
     // ===== 线程（ADR-003）=====
     /// 最大 worker 线程数上限；0 = 自动（= 可用核数）。
@@ -197,11 +216,13 @@ pub struct RawConfig {
     #[serde(default)]
     pub state_max_response_bytes: Option<usize>,
 
-    // ===== 兼容性字段：解析但不使用（M0/M1 阶段）=====
+    // ===== 认证（ADR-004：SOCKS5 0x00/0x02）=====
+    #[serde(default, alias = "AuthClientInfo")]
+    pub auth_client_info: Vec<AuthUser>,
+
+    // ===== 兼容性字段：解析但暂未使用（M2/M3 阶段）=====
     #[serde(default)]
     pub internal_behavior: Option<InternalBehavior>,
-    #[serde(default, alias = "AuthClientInfo")]
-    pub auth_client_info: Vec<serde_json::Value>,
     #[serde(default, alias = "EmbedWebServerConfig")]
     pub embed_web_server_config: Option<serde_json::Value>,
     #[serde(default)]
@@ -279,6 +300,12 @@ pub struct Config {
     pub thread: ThreadConfig,
     pub socket_recv_buffer: usize,
     pub socket_send_buffer: usize,
+    /// 客户端认证用户；为空表示不需要认证（SOCKS5 选 0x00）。
+    pub auth: Vec<AuthUser>,
+    /// 下游首包超时（防"哑连接"占用内存）。
+    pub first_packet_timeout: Duration,
+    /// 协议握手超时。
+    pub handshake_timeout: Duration,
     pub tradition_tcp_relay: bool,
     pub disable_socks4: bool,
     /// 解析过程中发现的"被忽略/降级"的配置项说明，启动时以 warning 打印。
@@ -313,21 +340,23 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
         );
     }
     if value.get("AuthClientInfo").is_some() || value.get("authClientInfo").is_some() {
-        notes.push("AuthClientInfo 已解析但 M0 不启用认证（M2 生效）".into());
+        notes
+            .push("AuthClientInfo 已读取（非空时启用 SOCKS5 0x02 用户名密码认证，ADR-004）".into());
     }
     if value.get("EmbedWebServerConfig").is_some() || value.get("embedWebServerConfig").is_some() {
         notes.push("EmbedWebServerConfig 已解析但 Rust 版不实现内嵌 Web 服务器（ADR-001）".into());
     }
     if value.get("healthCheck").is_some() {
-        notes.push("healthCheck 已解析但 M0 不启用健康检查（M1 生效）".into());
+        notes.push("healthCheck 已解析但尚未启用健康检查（M1.4 生效）".into());
     }
     if value.get("upstreamSelectRule").is_some() || value.get("serverChangeTime").is_some() {
         notes.push(
-            "upstreamSelectRule/serverChangeTime 已解析但 M0 仅用 round-robin（M1 生效）".into(),
+            "upstreamSelectRule/serverChangeTime 已解析但 M1.1 仅用 round-robin（M1.3 生效）"
+                .into(),
         );
     }
     if value.get("testRemoteHost").is_some() || value.get("disableConnectTest").is_some() {
-        notes.push("健康探测相关字段已解析但 M0 未使用（M1 生效）".into());
+        notes.push("健康探测相关字段已解析但尚未使用（M1.4 生效）".into());
     }
 
     let raw: RawConfig = serde_json::from_value(value)?;
@@ -430,6 +459,43 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
     if connect_timeout_ms > 300_000 {
         return Err(err("connectTimeout 过大（>300000ms）"));
     }
+    let first_packet_timeout_ms = raw
+        .first_packet_timeout
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_FIRST_PACKET_TIMEOUT_MS);
+    if first_packet_timeout_ms > 600_000 {
+        return Err(err("firstPacketTimeout 过大（>600000ms）"));
+    }
+    let handshake_timeout_ms = raw
+        .handshake_timeout
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT_MS);
+    if handshake_timeout_ms > 600_000 {
+        return Err(err("handshakeTimeout 过大（>600000ms）"));
+    }
+
+    // ===== 客户端认证（ADR-004）=====
+    let mut auth: Vec<AuthUser> = Vec::new();
+    for (idx, u) in raw.auth_client_info.iter().enumerate() {
+        if u.user.is_empty() {
+            // 与 C++ 一致：跳过空用户名条目
+            notes.push(format!("AuthClientInfo[{idx}] 用户名为空，已忽略"));
+            continue;
+        }
+        if u.pwd.is_empty() {
+            notes.push(format!(
+                "AuthClientInfo[{}] 密码为空（等价于只校验用户名）",
+                u.user
+            ));
+        }
+        auth.push(u.clone());
+    }
+    if !auth.is_empty() {
+        notes.push(format!(
+            "已启用 SOCKS5 用户名密码认证（0x02），用户数 {}",
+            auth.len()
+        ));
+    }
 
     // ===== 线程（ADR-003）=====
     if raw.worker_threads > MAX_WORKER_THREADS {
@@ -466,6 +532,9 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
         upstreams,
         retry_times: raw.retry_times.max(1),
         connect_timeout: Duration::from_millis(connect_timeout_ms),
+        first_packet_timeout: Duration::from_millis(first_packet_timeout_ms),
+        handshake_timeout: Duration::from_millis(handshake_timeout_ms),
+        auth,
         buffer_size,
         max_connections,
         log_level: raw.log_level.unwrap_or_else(default_log_level),
@@ -656,5 +725,53 @@ mod tests {
     fn 带_bom_的配置可加载() {
         let text = "\u{feff}{\"listenPort\":5000,\"upstream\":[{\"host\":\"a\",\"port\":1}]}";
         assert!(load_str(text).is_ok());
+    }
+
+    #[test]
+    fn 客户端认证解析_跳过空用户名() {
+        let text = r#"{
+            "listenPort": 5000,
+            "upstream": [ { "host": "127.0.0.1", "port": 6100 } ],
+            "AuthClientInfo": [
+                { "user": "alice", "pwd": "secret" },
+                { "user": "", "pwd": "ignored" },
+                { "user": "bob" }
+            ]
+        }"#;
+        let c = load_str(text).unwrap();
+        assert_eq!(c.auth.len(), 2);
+        assert_eq!(c.auth[0].user, "alice");
+        assert_eq!(c.auth[0].pwd, "secret");
+        assert_eq!(c.auth[1].user, "bob");
+        assert!(c.auth[1].pwd.is_empty());
+        assert!(c.notes.iter().any(|n| n.contains("已忽略")));
+        assert!(c.notes.iter().any(|n| n.contains("密码为空")));
+        assert!(c.notes.iter().any(|n| n.contains("已启用 SOCKS5")));
+    }
+
+    #[test]
+    fn 无认证用户时_auth_为空() {
+        let c = load_str(minimal()).unwrap();
+        assert!(c.auth.is_empty());
+    }
+
+    #[test]
+    fn 首包与握手超时可配置且校验() {
+        let text = r#"{
+            "listenPort": 5000,
+            "firstPacketTimeout": 30000,
+            "handshakeTimeout": 5000,
+            "upstream": [ { "host": "127.0.0.1", "port": 6100 } ]
+        }"#;
+        let c = load_str(text).unwrap();
+        assert_eq!(c.first_packet_timeout, Duration::from_millis(30_000));
+        assert_eq!(c.handshake_timeout, Duration::from_millis(5_000));
+
+        let text = r#"{
+            "listenPort": 5000,
+            "firstPacketTimeout": 999999999,
+            "upstream": [ { "host": "127.0.0.1", "port": 6100 } ]
+        }"#;
+        assert!(load_str(text).is_err());
     }
 }

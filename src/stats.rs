@@ -1,4 +1,4 @@
-//! 极简运行统计（M0 版）。
+//! 运行统计。
 //!
 //! 设计遵循 ADR-003 / 02-relay-core §8.3：热路径只用原子操作，不做全局锁；
 //! 1 秒级聚合与 JSON 快照留给 M3（控制面）实现，这里先提供累计值与连接数。
@@ -11,7 +11,7 @@ use std::time::Instant;
 #[derive(Debug)]
 pub struct Stats {
     pub started_at: Instant,
-    /// 成功 accept 并进入处理的连接总数（含后续建上游失败的）。
+    /// 成功 accept 并进入处理的连接总数（含后续握手/建上游失败的）。
     pub accepted: AtomicU64,
     /// 因达到连接上限 / 无可用上游而被拒绝的连接数。
     pub rejected: AtomicU64,
@@ -21,10 +21,18 @@ pub struct Stats {
     pub bytes_down_to_up: AtomicU64,
     /// 上游 → 下游的字节数。
     pub bytes_up_to_down: AtomicU64,
-    /// 连接上游失败次数。
+    /// 连接上游 TCP 失败次数。
     pub connect_failed: AtomicU64,
     /// relay 过程中的 I/O 错误次数。
     pub relay_errors: AtomicU64,
+    /// 入站协议不支持（首字节非 SOCKS5 等）次数。
+    pub protocol_errors: AtomicU64,
+    /// 入站 SOCKS5 协商失败（方法/认证/请求非法）次数。
+    pub handshake_failed: AtomicU64,
+    /// 上游 SOCKS5 握手失败次数。
+    pub upstream_handshake_failed: AtomicU64,
+    /// 首包超时次数（防"哑连接"泄漏）。
+    pub first_packet_timeout: AtomicU64,
 }
 
 impl Stats {
@@ -38,6 +46,10 @@ impl Stats {
             bytes_up_to_down: AtomicU64::new(0),
             connect_failed: AtomicU64::new(0),
             relay_errors: AtomicU64::new(0),
+            protocol_errors: AtomicU64::new(0),
+            handshake_failed: AtomicU64::new(0),
+            upstream_handshake_failed: AtomicU64::new(0),
+            first_packet_timeout: AtomicU64::new(0),
         })
     }
 
@@ -51,6 +63,10 @@ impl Stats {
             bytes_up_to_down: self.bytes_up_to_down.load(Ordering::Relaxed),
             connect_failed: self.connect_failed.load(Ordering::Relaxed),
             relay_errors: self.relay_errors.load(Ordering::Relaxed),
+            protocol_errors: self.protocol_errors.load(Ordering::Relaxed),
+            handshake_failed: self.handshake_failed.load(Ordering::Relaxed),
+            upstream_handshake_failed: self.upstream_handshake_failed.load(Ordering::Relaxed),
+            first_packet_timeout: self.first_packet_timeout.load(Ordering::Relaxed),
         }
     }
 }
@@ -66,13 +82,18 @@ pub struct StatsSnapshot {
     pub bytes_up_to_down: u64,
     pub connect_failed: u64,
     pub relay_errors: u64,
+    pub protocol_errors: u64,
+    pub handshake_failed: u64,
+    pub upstream_handshake_failed: u64,
+    pub first_packet_timeout: u64,
 }
 
 impl StatsSnapshot {
     /// 人类可读的单行摘要（日志用）。
     pub fn summary(&self) -> String {
         format!(
-            "uptime={}s accepted={} active={} rejected={} connect_failed={} up={}B down={}B relay_err={}",
+            "uptime={}s accepted={} active={} rejected={} connect_failed={} up={}B down={}B \
+             relay_err={} proto_err={} hs_fail={} up_hs_fail={} first_pkt_timeout={}",
             self.uptime_secs,
             self.accepted,
             self.active,
@@ -80,7 +101,11 @@ impl StatsSnapshot {
             self.connect_failed,
             self.bytes_down_to_up,
             self.bytes_up_to_down,
-            self.relay_errors
+            self.relay_errors,
+            self.protocol_errors,
+            self.handshake_failed,
+            self.upstream_handshake_failed,
+            self.first_packet_timeout
         )
     }
 }
@@ -144,9 +169,12 @@ mod tests {
         let stats = Stats::new();
         stats.accepted.store(3, Ordering::Relaxed);
         stats.bytes_down_to_up.store(10, Ordering::Relaxed);
+        stats.protocol_errors.store(1, Ordering::Relaxed);
         let s = stats.snapshot();
         assert_eq!(s.accepted, 3);
         assert_eq!(s.bytes_down_to_up, 10);
+        assert_eq!(s.protocol_errors, 1);
         assert!(s.summary().contains("accepted=3"));
+        assert!(s.summary().contains("proto_err=1"));
     }
 }

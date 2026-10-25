@@ -18,6 +18,9 @@ use crate::config::UpstreamConfig;
 pub struct Upstream {
     pub name: String,
     pub addr: SocketAddr,
+    /// 上游 SOCKS5 认证（M1 起真正使用；None 表示无认证）。
+    pub auth_user: Option<String>,
+    pub auth_pwd: Option<String>,
 }
 
 /// 上游选择器：当前实现为无锁 round-robin。
@@ -68,6 +71,8 @@ pub async fn resolve_all(cfgs: &[UpstreamConfig]) -> (Vec<Upstream>, Vec<String>
                 ok.push(Upstream {
                     name: c.name.clone(),
                     addr,
+                    auth_user: c.auth_user.clone(),
+                    auth_pwd: c.auth_pwd.clone(),
                 });
             }
             Err(e) => {
@@ -103,6 +108,8 @@ mod tests {
         Upstream {
             name: name.to_string(),
             addr: SocketAddr::from(([127, 0, 0, 1], port)),
+            auth_user: None,
+            auth_pwd: None,
         }
     }
 

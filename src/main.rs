@@ -13,6 +13,7 @@
 
 mod app;
 mod config;
+mod handshake;
 mod logging;
 mod net;
 mod relay;
@@ -66,9 +67,15 @@ fn main() -> ExitCode {
         warn!("配置提示: {note}");
     }
     if !cfg.tradition_tcp_relay {
-        warn!(
-            "M0 仅实现纯 TCP 透传：traditionTcpRelay=false 的首包识别将在 M1 实现，当前按纯透传运行"
-        );
+        info!("入站模式：SOCKS5 终结（支持 0x00 无认证 / 0x02 用户名密码，ADR-004）");
+        if cfg.auth.is_empty() {
+            info!("未配置 AuthClientInfo：客户端将协商为 0x00 无认证");
+        } else {
+            info!(users = cfg.auth.len(), "已启用客户端用户名密码认证（0x02）");
+        }
+        warn!("M1 仅支持 SOCKS5 入站；SOCKS4/4a 与 HTTP CONNECT 将在 M2 实现");
+    } else {
+        info!("入站模式：纯 TCP 透传（traditionTcpRelay=true），不做协议解析");
     }
 
     let workers = config::effective_worker_threads(&cfg.thread);
@@ -105,6 +112,9 @@ async fn run(cfg: config::Config, workers: usize) -> Result<(), Box<dyn std::err
         buffer_size = cfg.buffer_size,
         max_connections = cfg.max_connections,
         connect_timeout_ms = cfg.connect_timeout.as_millis() as u64,
+        first_packet_timeout_ms = cfg.first_packet_timeout.as_millis() as u64,
+        handshake_timeout_ms = cfg.handshake_timeout.as_millis() as u64,
+        auth_users = cfg.auth.len(),
         retry_times = cfg.retry_times,
         tradition_tcp_relay = cfg.tradition_tcp_relay,
         disable_socks4 = cfg.disable_socks4,
