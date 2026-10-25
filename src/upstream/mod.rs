@@ -23,6 +23,8 @@ pub struct Upstream {
     /// 上游 SOCKS5 认证（M1 起真正使用；None 表示无认证）。
     pub auth_user: Option<String>,
     pub auth_pwd: Option<String>,
+    /// 在健康注册表中的下标（与启用上游的解析顺序一致）。
+    pub health_index: usize,
 }
 
 /// 上游选择规则（与 C++ `upstreamSelectRule` 同名）。
@@ -193,12 +195,15 @@ pub async fn resolve_all(cfgs: &[UpstreamConfig]) -> (Vec<Upstream>, Vec<String>
     for c in cfgs.iter().filter(|c| c.enabled) {
         match resolve_one(&c.host, c.port).await {
             Ok(addr) => {
+                // 健康注册表基于"解析成功"的列表，下标即 ok.len()
+                let health_index = ok.len();
                 info!(upstream = %c.name, host = %c.host, port = c.port, addr = %addr, "上游解析成功");
                 ok.push(Upstream {
                     name: c.name.clone(),
                     addr,
                     auth_user: c.auth_user.clone(),
                     auth_pwd: c.auth_pwd.clone(),
+                    health_index,
                 });
             }
             Err(e) => {
@@ -236,6 +241,7 @@ mod tests {
             addr: SocketAddr::from(([127, 0, 0, 1], port)),
             auth_user: None,
             auth_pwd: None,
+            health_index: 0,
         }
     }
 

@@ -14,6 +14,7 @@
 mod app;
 mod config;
 mod handshake;
+mod health;
 mod logging;
 mod net;
 mod relay;
@@ -120,6 +121,8 @@ async fn run(cfg: config::Config, workers: usize) -> Result<(), Box<dyn std::err
         disable_socks4 = cfg.disable_socks4,
         listen_targets = cfg.listen.len(),
         upstreams = cfg.upstreams.iter().filter(|u| u.enabled).count(),
+        health_period_ms = cfg.health.period.as_millis() as u64,
+        health_timeout_ms = cfg.health.timeout.as_millis() as u64,
         "运行时配置生效"
     );
 
@@ -131,6 +134,7 @@ async fn run(cfg: config::Config, workers: usize) -> Result<(), Box<dyn std::err
         return Err("所有上游均解析失败，无法启动".into());
     }
 
+    let health = health::HealthRegistry::new(&upstreams, cfg.health.clone());
     let selector = Arc::new(upstream::UpstreamSelector::new(
         upstreams,
         cfg.select_rule,
@@ -142,11 +146,22 @@ async fn run(cfg: config::Config, workers: usize) -> Result<(), Box<dyn std::err
         server_change_time_ms = cfg.server_change_time.as_millis() as u64,
         "上游池就绪"
     );
+    info!(
+        period_ms = health.cfg().period.as_millis() as u64,
+        timeout_ms = health.cfg().timeout.as_millis() as u64,
+        backoff_initial_ms = health.cfg().backoff_initial.as_millis() as u64,
+        backoff_multiplier = health.cfg().backoff_multiplier,
+        backoff_max_ms = health.cfg().backoff_max.as_millis() as u64,
+        probe_jitter = health.cfg().probe_jitter,
+        "健康检查已启用：TCP 探活 + fail-fast + DOWN 指数退避"
+    );
     let stats = stats::Stats::new();
     let cancel = CancellationToken::new();
+    health.spawn_probes(cancel.clone());
     let ctx = app::AppCtx::new(
         Arc::clone(&cfg),
         selector,
+        Arc::clone(&health),
         Arc::clone(&stats),
         cancel.clone(),
     );
@@ -166,7 +181,7 @@ async fn run(cfg: config::Config, workers: usize) -> Result<(), Box<dyn std::err
         });
     }
 
-    let stats_task = spawn_stats_logger(Arc::clone(&stats), cancel.clone());
+    let stats_task = spawn_stats_logger(Arc::clone(&stats), Arc::clone(&health), cancel.clone());
 
     let signal = wait_signal().await;
     info!(signal, "收到退出信号，开始优雅关闭");
@@ -194,9 +209,10 @@ async fn run(cfg: config::Config, workers: usize) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// 每 30 秒输出一次统计摘要（M0 版本地日志；M3 换成控制面快照）。
+/// 每 30 秒输出一次统计摘要与不可用上游（M3 换成控制面快照）。
 fn spawn_stats_logger(
     stats: Arc<stats::Stats>,
+    health: Arc<health::HealthRegistry>,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -210,6 +226,26 @@ fn spawn_stats_logger(
                     let snapshot = stats.snapshot();
                     if snapshot.accepted > 0 || snapshot.active > 0 {
                         info!(target: "stats", "{}", snapshot.summary());
+                    }
+                    let unavailable: Vec<String> = health
+                        .snapshot()
+                        .into_iter()
+                        .filter(|s| !s.available)
+                        .map(|s| {
+                            format!(
+                                "{}({},fail={},backoff={}ms)",
+                                s.name, s.addr, s.failures, s.backoff_ms
+                            )
+                        })
+                        .collect();
+                    if !unavailable.is_empty() {
+                        info!(
+                            target: "health",
+                            available = health.available_count(),
+                            total = health.len(),
+                            upstreams = ?unavailable,
+                            "上游健康状态"
+                        );
                     }
                 }
             }

@@ -49,18 +49,17 @@ pub async fn handle_connection(
     bufs: Buffers,
     guard: ActiveGuard,
 ) {
-    // M1.4 接入健康状态后，这里的回调改为读取上游可用性。
-    let Some(upstream_cfg) = ctx.selector.next(&|_| true).cloned() else {
-        // 启动时已保证非空；运行期若被清空则拒绝。
-        ctx.stats.rejected.fetch_add(1, Ordering::Relaxed);
-        debug!(%peer, "无可用上游，关闭连接");
-        return;
-    };
-
     if ctx.cfg.tradition_tcp_relay {
+        // 透传模式：先选上游（无可用上游只能关闭连接）
+        let Some(upstream_cfg) = ctx.pick_upstream().cloned() else {
+            ctx.stats.rejected.fetch_add(1, Ordering::Relaxed);
+            debug!(%peer, "无可用上游，关闭连接");
+            return;
+        };
         handle_tradition(ctx, downstream, upstream_cfg, peer, local, bufs, guard).await;
     } else {
-        handle_socks5(ctx, downstream, upstream_cfg, peer, local, bufs, guard).await;
+        // SOCKS5 终结模式：先完成入站协商拿到 target，再选上游（失败可回 SOCKS5 错误码）
+        handle_socks5(ctx, downstream, peer, local, bufs, guard).await;
     }
 }
 
@@ -86,7 +85,6 @@ async fn handle_tradition(
 async fn handle_socks5(
     ctx: Arc<AppCtx>,
     mut downstream: TcpStream,
-    upstream_cfg: Upstream,
     peer: SocketAddr,
     local: SocketAddr,
     bufs: Buffers,
@@ -146,15 +144,29 @@ async fn handle_socks5(
     };
     trace!(%peer, target = %target, "收到 SOCKS5 CONNECT");
 
-    // 3) 连接上游 TCP
+    // 3) 选择可用上游（全部 DOWN → 明确拒绝，避免黑洞）
+    let Some(upstream_cfg) = ctx.pick_upstream().cloned() else {
+        ctx.stats.rejected.fetch_add(1, Ordering::Relaxed);
+        let _ = socks5::write_error_reply(&mut downstream, socks5::REP_GENERAL_FAILURE).await;
+        debug!(
+            %peer,
+            available = ctx.health.available_count(),
+            total = ctx.health.len(),
+            "所有上游不可用，拒绝 CONNECT"
+        );
+        drain_and_close(downstream).await;
+        return;
+    };
+    let up_name = upstream_cfg.name.clone();
+
+    // 4) 连接上游 TCP
     let Some(upstream_raw) = connect_upstream(&ctx, &upstream_cfg, peer).await else {
         let _ = socks5::write_error_reply(&mut downstream, socks5::REP_HOST_UNREACHABLE).await;
         return;
     };
 
-    // 4) 以上游 SOCKS5 客户端身份握手（含上游认证）；域名交给上游解析（socks5h）
+    // 5) 以上游 SOCKS5 客户端身份握手（含上游认证）；域名交给上游解析（socks5h）
     let up_target = to_socks_target(&target);
-    let up_name = upstream_cfg.name.clone();
     let creds = upstream_cfg
         .auth_user
         .as_deref()
@@ -181,6 +193,11 @@ async fn handle_socks5(
             ctx.stats
                 .upstream_handshake_failed
                 .fetch_add(1, Ordering::Relaxed);
+            // 只有"上游自身故障"才降级；目标不可达/认证配置错等不应误伤上游
+            if is_upstream_fault(&e) {
+                ctx.health
+                    .mark_degraded(upstream_cfg.health_index, "上游握手失败");
+            }
             let rep = rep_from_upstream_error(&e);
             let _ = socks5::write_error_reply(&mut downstream, rep).await;
             debug!(%peer, upstream = %up_name, error = %e, rep, "上游 SOCKS5 握手失败");
@@ -190,20 +207,22 @@ async fn handle_socks5(
             ctx.stats
                 .upstream_handshake_failed
                 .fetch_add(1, Ordering::Relaxed);
+            ctx.health
+                .mark_degraded(upstream_cfg.health_index, "上游握手超时");
             let _ = socks5::write_error_reply(&mut downstream, socks5::REP_TTL_EXPIRED).await;
             debug!(%peer, upstream = %up_name, "上游 SOCKS5 握手超时");
             return;
         }
     };
 
-    // 5) 上游成功后，才回复客户端成功
+    // 6) 上游成功后，才回复客户端成功
     if let Err(e) = socks5::write_success_reply(&mut downstream).await {
         debug!(%peer, error = %e, "写 SOCKS5 成功应答失败");
         return;
     }
     trace!(%peer, %local, upstream = %up_name, target = %target, "隧道建立，开始转发");
 
-    // 6) 双向转发
+    // 7) 双向转发
     relay_streams(ctx, downstream, upstream, bufs, peer, "socks5").await;
 }
 
@@ -245,11 +264,15 @@ async fn connect_upstream(
         }
         Ok(Err(e)) => {
             ctx.stats.connect_failed.fetch_add(1, Ordering::Relaxed);
+            ctx.health
+                .mark_degraded(upstream_cfg.health_index, "连接上游失败");
             debug!(%peer, upstream = %upstream_cfg.name, addr = %upstream_cfg.addr, error = %e, "连接上游失败");
             None
         }
         Err(_) => {
             ctx.stats.connect_failed.fetch_add(1, Ordering::Relaxed);
+            ctx.health
+                .mark_degraded(upstream_cfg.health_index, "连接上游超时");
             debug!(
                 %peer,
                 upstream = %upstream_cfg.name,
@@ -270,6 +293,23 @@ fn to_socks_target(target: &handshake::TargetAddr) -> tokio_socks::TargetAddr<'s
             tokio_socks::TargetAddr::Domain(host.clone().into(), *port)
         }
     }
+}
+
+/// 判断上游错误是否表示"上游自身故障"（需要降级）。
+///
+/// 目标侧错误（HostUnreachable / ConnectionRefused / NetworkUnreachable 等）
+/// 说明上游工作正常、只是目标不可达，不应把上游标记为 DOWN；
+/// 认证失败属于配置问题，同样不降级（否则所有上游会被同时误标）。
+fn is_upstream_fault(e: &tokio_socks::Error) -> bool {
+    use tokio_socks::Error as E;
+    matches!(
+        e,
+        E::Io(_)
+            | E::ProxyServerUnreachable
+            | E::InvalidResponseVersion
+            | E::UnknownAuthMethod
+            | E::InvalidReservedByte
+    )
 }
 
 /// 把上游 SOCKS5 错误映射为回给下游的 REP 码（尽量保留具体原因）。

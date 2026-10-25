@@ -147,6 +147,97 @@ pub struct AuthUser {
     pub pwd: String,
 }
 
+/// 健康检查原始配置（`healthCheck` 节，字段与 docs/07 ADR-002 对齐）。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // max_probe_concurrency / connect_fail_mark_degraded 在 M1.5（TLS 探测）启用
+pub struct RawHealthConfig {
+    #[serde(default)]
+    pub tcp: Option<RawPeriodicProbe>,
+    #[serde(default)]
+    pub connect: Option<RawPeriodicProbe>,
+    #[serde(default)]
+    pub target: Option<RawProbeTarget>,
+    /// 失败即判 DOWN（默认 true；ADR-002 明确不做失败计数/重试）。
+    #[serde(default)]
+    pub fail_fast: Option<bool>,
+    #[serde(default)]
+    pub down_backoff: Option<RawBackoff>,
+    #[serde(default)]
+    pub probe_jitter: Option<f64>,
+    /// M1.5（TLS 探测）使用；M1.4 仅解析。
+    #[serde(default)]
+    pub max_probe_concurrency: Option<usize>,
+    #[serde(default)]
+    pub connect_fail_mark_degraded: Option<bool>,
+}
+
+/// 周期探测原始配置（tcp / connect 共用形状）。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawPeriodicProbe {
+    #[serde(default)]
+    pub period: Option<u64>,
+    #[serde(default)]
+    pub timeout: Option<u64>,
+    #[serde(default)]
+    pub start_delay: Option<u64>,
+}
+
+/// 探测目标（M1.5 使用：TLS + HTTP readiness 探测）。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // 字段在 M1.5（TLS/HTTP 探测）启用
+pub struct RawProbeTarget {
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub sni: Option<String>,
+    #[serde(default)]
+    pub http_path: Option<String>,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    #[serde(default)]
+    pub expect_status: Vec<u16>,
+}
+
+/// DOWN 后的指数退避原始配置。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawBackoff {
+    #[serde(default)]
+    pub initial: Option<u64>,
+    #[serde(default)]
+    pub multiplier: Option<f64>,
+    #[serde(default)]
+    pub max: Option<u64>,
+    #[serde(default)]
+    pub jitter: Option<f64>,
+}
+
+/// 健康检查有效配置（M1.4：TCP 探活 + fail-fast + DOWN 退避）。
+#[derive(Debug, Clone)]
+pub struct HealthConfig {
+    /// 探活周期。
+    pub period: Duration,
+    /// 单次 TCP 探活超时。
+    pub timeout: Duration,
+    /// 启动后首次探测的延迟（错峰，避免同时打所有上游）。
+    pub start_delay: Duration,
+    /// DOWN 后首次重探延迟。
+    pub backoff_initial: Duration,
+    /// 退避倍数。
+    pub backoff_multiplier: f64,
+    /// 退避上限。
+    pub backoff_max: Duration,
+    /// 常规探测周期的随机抖动比例（0..=1）。
+    pub probe_jitter: f64,
+    /// 退避时长的随机抖动比例（0..=1）。
+    pub backoff_jitter: f64,
+}
+
 /// 原始配置：字段名与 C++ `config.json` 对齐。
 ///
 /// 标注 `allow(dead_code)` 的原因：其中一部分字段（探测周期、控制面等）在 M0 只做兼容解析，
@@ -228,7 +319,7 @@ pub struct RawConfig {
     #[serde(default, alias = "EmbedWebServerConfig")]
     pub embed_web_server_config: Option<serde_json::Value>,
     #[serde(default)]
-    pub health_check: Option<serde_json::Value>,
+    pub health_check: Option<RawHealthConfig>,
     #[serde(default)]
     pub upstream_select_rule: Option<String>,
     #[serde(default)]
@@ -312,6 +403,8 @@ pub struct Config {
     pub select_rule: SelectRule,
     /// `change_by_time` 规则的切换周期。
     pub server_change_time: Duration,
+    /// 健康检查配置（M1.4：TCP 探活 + fail-fast + DOWN 退避）。
+    pub health: HealthConfig,
     pub tradition_tcp_relay: bool,
     pub disable_socks4: bool,
     /// 解析过程中发现的"被忽略/降级"的配置项说明，启动时以 warning 打印。
@@ -353,13 +446,16 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
         notes.push("EmbedWebServerConfig 已解析但 Rust 版不实现内嵌 Web 服务器（ADR-001）".into());
     }
     if value.get("healthCheck").is_some() {
-        notes.push("healthCheck 已解析但尚未启用健康检查（M1.4 生效）".into());
+        notes.push("healthCheck 已启用：TCP 探活 + fail-fast + DOWN 指数退避（M1.4）".into());
     }
     if value.get("upstreamSelectRule").is_some() || value.get("serverChangeTime").is_some() {
         notes.push("upstreamSelectRule/serverChangeTime 已启用（M1.3）".into());
     }
     if value.get("testRemoteHost").is_some() || value.get("disableConnectTest").is_some() {
-        notes.push("健康探测相关字段已解析但尚未使用（M1.4 生效）".into());
+        notes.push(
+            "旧版探测字段（testRemoteHost/tcpCheck*/connectCheck*）已忽略，请改用 healthCheck 节"
+                .into(),
+        );
     }
 
     let raw: RawConfig = serde_json::from_value(value)?;
@@ -489,6 +585,16 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
     let server_change_time =
         Duration::from_millis(raw.server_change_time.filter(|v| *v > 0).unwrap_or(60_000));
 
+    // ===== 健康检查（ADR-002：fail-fast，不重试/不防抖）=====
+    let health_raw = raw.health_check.clone().unwrap_or_default();
+    if health_raw.connect.is_some() || health_raw.target.is_some() {
+        notes.push(
+            "healthCheck.connect/target（TLS + HTTP readiness）将在 M1.5 启用；M1.4 先做 TCP 探活"
+                .into(),
+        );
+    }
+    let health = build_health_config(&health_raw)?;
+
     // ===== 客户端认证（ADR-004）=====
     let mut auth: Vec<AuthUser> = Vec::new();
     for (idx, u) in raw.auth_client_info.iter().enumerate() {
@@ -551,6 +657,7 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
         handshake_timeout: Duration::from_millis(handshake_timeout_ms),
         select_rule,
         server_change_time,
+        health,
         auth,
         buffer_size,
         max_connections,
@@ -586,6 +693,74 @@ pub fn effective_worker_threads(thread: &ThreadConfig) -> usize {
         cores
     };
     n.clamp(1, MAX_WORKER_THREADS)
+}
+
+/// 构建健康检查有效配置（M1.4：TCP 探活 + fail-fast + DOWN 指数退避）。
+fn build_health_config(raw: &RawHealthConfig) -> Result<HealthConfig, ConfigError> {
+    const DEFAULT_PERIOD_MS: u64 = 5_000;
+    const DEFAULT_TIMEOUT_MS: u64 = 2_000;
+    const DEFAULT_START_DELAY_MS: u64 = 1_000;
+    const DEFAULT_BACKOFF_INITIAL_MS: u64 = 30_000;
+    const DEFAULT_BACKOFF_MAX_MS: u64 = 600_000;
+    const DEFAULT_MULTIPLIER: f64 = 2.0;
+    const DEFAULT_JITTER: f64 = 0.2;
+
+    // fail-fast 是 ADR-002 的既定策略，不接受关闭
+    if raw.fail_fast == Some(false) {
+        return Err(err(
+            "healthCheck.failFast=false 不受支持：健康检查采用 fail-fast（ADR-002）",
+        ));
+    }
+
+    let tcp = raw.tcp.clone().unwrap_or_default();
+    let period_ms = tcp.period.filter(|v| *v > 0).unwrap_or(DEFAULT_PERIOD_MS);
+    let timeout_ms = tcp.timeout.filter(|v| *v > 0).unwrap_or(DEFAULT_TIMEOUT_MS);
+    let start_delay_ms = tcp.start_delay.unwrap_or(DEFAULT_START_DELAY_MS);
+    if period_ms < 100 {
+        return Err(err("healthCheck.tcp.period 不能小于 100ms"));
+    }
+    if timeout_ms > 60_000 {
+        return Err(err("healthCheck.tcp.timeout 过大（>60000ms）"));
+    }
+    if timeout_ms >= period_ms {
+        return Err(err("healthCheck.tcp.timeout 必须小于 period"));
+    }
+
+    let backoff = raw.down_backoff.clone().unwrap_or_default();
+    let initial_ms = backoff
+        .initial
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_BACKOFF_INITIAL_MS);
+    let max_ms = backoff
+        .max
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_BACKOFF_MAX_MS);
+    if initial_ms > max_ms {
+        return Err(err("healthCheck.downBackoff.initial 不能大于 max"));
+    }
+    let multiplier = backoff.multiplier.unwrap_or(DEFAULT_MULTIPLIER);
+    if !(1.0..=10.0).contains(&multiplier) {
+        return Err(err("healthCheck.downBackoff.multiplier 必须在 [1, 10]"));
+    }
+    let jitter = raw.probe_jitter.unwrap_or(DEFAULT_JITTER);
+    if !(0.0..=1.0).contains(&jitter) {
+        return Err(err("healthCheck.probeJitter 必须在 [0, 1]"));
+    }
+    let backoff_jitter = backoff.jitter.unwrap_or(DEFAULT_JITTER);
+    if !(0.0..=1.0).contains(&backoff_jitter) {
+        return Err(err("healthCheck.downBackoff.jitter 必须在 [0, 1]"));
+    }
+
+    Ok(HealthConfig {
+        period: Duration::from_millis(period_ms),
+        timeout: Duration::from_millis(timeout_ms),
+        start_delay: Duration::from_millis(start_delay_ms),
+        backoff_initial: Duration::from_millis(initial_ms),
+        backoff_multiplier: multiplier,
+        backoff_max: Duration::from_millis(max_ms),
+        probe_jitter: jitter,
+        backoff_jitter,
+    })
 }
 
 #[cfg(test)]
