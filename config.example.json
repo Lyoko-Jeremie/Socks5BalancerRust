@@ -1,0 +1,62 @@
+{
+  "listenHost": "127.0.0.1",
+  "listenPort": 5100,
+  "multiListen": [
+    { "host": "127.0.0.1", "port": 6600 },
+    { "host": "0.0.0.0", "port": 6601 }
+  ],
+  "retryTimes": 3,
+  "connectTimeout": 2000,
+
+  "threadNum": 0,
+  "workerThreads": 0,
+  "maxBlockingThreads": 2,
+  "threadStackSize": 524288,
+
+  "bufferSize": 8192,
+  "maxConnections": 10000,
+  "socketRecvBuffer": 0,
+  "socketSendBuffer": 0,
+  "logLevel": "info",
+
+  "traditionTcpRelay": true,
+  "disableSocks4": false,
+
+  "stateServerHost": "127.0.0.1",
+  "stateServerPort": 5110,
+  "stateMaxResponseBytes": 65536,
+
+  "upstreamSelectRule": "loop",
+  "serverChangeTime": 60000,
+  "sleepTime": 1800000,
+
+  "healthCheck": {
+    "tcp": { "period": 5000, "timeout": 2000, "startDelay": 1000 },
+    "connect": { "period": 300000, "timeout": 11000, "startDelay": 1000 },
+    "target": {
+      "host": "www.google.com",
+      "port": 443,
+      "sni": "",
+      "httpPath": "/",
+      "userAgent": "Socks5BalancerRust/0.1",
+      "expectStatus": []
+    },
+    "failFast": true,
+    "downBackoff": {
+      "initial": 30000,
+      "multiplier": 2.0,
+      "max": 600000,
+      "jitter": 0.2
+    },
+    "probeJitter": 0.2,
+    "maxProbeConcurrency": 4,
+    "connectFailMarkDegraded": true
+  },
+
+  "upstream": [
+    { "name": "serverA", "host": "127.0.0.1", "port": 6100 },
+    { "name": "serverB", "host": "127.0.0.1", "port": 6101, "disable": 1 }
+  ],
+
+  "AuthClientInfo": []
+}

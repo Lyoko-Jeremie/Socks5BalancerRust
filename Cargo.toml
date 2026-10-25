@@ -1,0 +1,46 @@
+[package]
+name = "Socks5BalancerRust"
+version = "0.1.0"
+edition = "2024"
+description = "Socks5BalancerAsio 的 Rust 移植：多上游 SOCKS5 代理 TCP 负载均衡器"
+license = "GPL-3.0"
+
+[dependencies]
+# 异步运行时与网络（ADR-007）
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "time",
+    "sync",
+    "io-util",
+    "signal",
+    "macros",
+] }
+tokio-util = { version = "0.7", features = ["rt"] }
+socket2 = { version = "0.5", features = ["all"] }
+
+# 配置与序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 日志（ADR-007：tracing 三件套，异步 writer）
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+
+# 命令行
+clap = { version = "4", features = ["derive"] }
+
+# 错误类型（ADR-007：边界层使用 thiserror）
+thiserror = "2"
+
+# 全局分配器（ADR-007）
+mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "unwind"
+overflow-checks = false

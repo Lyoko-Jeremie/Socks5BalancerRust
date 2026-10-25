@@ -1,0 +1,22 @@
+﻿{
+  "listenHost": "127.0.0.1",
+  "listenPort": 5100,
+  "multiListen": [
+    { "host": "127.0.0.1", "port": 6610 }
+  ],
+  "retryTimes": 3,
+  "connectTimeout": 2000,
+  "traditionTcpRelay": true,
+  "threadNum": 0,
+  "workerThreads": 0,
+  "maxBlockingThreads": 2,
+  "threadStackSize": 524288,
+  "bufferSize": 8192,
+  "maxConnections": 10000,
+  "logLevel": "info",
+  "stateServerHost": "127.0.0.1",
+  "stateServerPort": 5110,
+  "upstream": [
+    { "name": "localEcho", "host": "127.0.0.1", "port": 6100 }
+  ]
+}

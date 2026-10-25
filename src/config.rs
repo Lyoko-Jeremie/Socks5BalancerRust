@@ -1,0 +1,660 @@
+//! 配置加载与校验。
+//!
+//! 设计要点（见 docs/07-decisions.md）：
+//! - 完整兼容 C++ 版 `config.json` 的字段名（camelCase，部分字段首字母大写需 alias）；
+//! - 新增字段一律可选并带默认值：`bufferSize` / `workerThreads` / `maxBlockingThreads` /
+//!   `threadStackSize` / `maxConnections` / `logLevel` / `socketRecvBuffer` / `socketSendBuffer`；
+//! - `internalBehavior.*` 在 C++ 中从未被解析（死配置），M0 只把其中的 `connectTimeout`
+//!   作为顶层字段缺失时的兜底，其余仅提示忽略；
+//! - 解析后统一做范围校验，错误信息必须能让运维一次改对。
+
+use std::fs;
+use std::path::Path;
+use std::time::Duration;
+
+use serde::Deserialize;
+
+/// 转发缓冲默认值（ADR-005：默认双向 8KB 预分配）。
+pub const DEFAULT_BUFFER_SIZE: usize = 8192;
+/// 允许的缓冲块大小（方案 B：2048/4096/8192）。
+pub const ALLOWED_BUFFER_SIZES: [usize; 3] = [2048, 4096, 8192];
+/// 上游建连默认超时（C++ 版 `connectTimeout` 默认 2000ms，但从未被使用；这里真正落地）。
+pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 2000;
+/// 默认连接数上限（C10K 目标）。
+pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
+/// `spawn_blocking` 线程默认上限。
+pub const DEFAULT_MAX_BLOCKING_THREADS: usize = 2;
+/// 线程栈默认 512KB（ADR-003）。
+pub const DEFAULT_THREAD_STACK_SIZE: usize = 512 * 1024;
+/// worker 线程数硬上限，防止手滑把机器打爆。
+pub const MAX_WORKER_THREADS: usize = 256;
+
+/// 配置错误。
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("读取配置文件失败: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("配置文件不是合法 UTF-8: {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
+    #[error("配置 JSON 解析失败: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("配置非法: {0}")]
+    Invalid(String),
+}
+
+fn err(msg: impl Into<String>) -> ConfigError {
+    ConfigError::Invalid(msg.into())
+}
+
+fn default_listen_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_listen_port() -> u16 {
+    5000
+}
+
+fn default_retry_times() -> usize {
+    3
+}
+
+fn default_max_blocking_threads() -> usize {
+    DEFAULT_MAX_BLOCKING_THREADS
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+/// 一个监听目标（host + port）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListenAddr {
+    #[serde(default = "default_listen_host")]
+    pub host: String,
+    #[serde(default = "default_listen_port")]
+    pub port: u16,
+}
+
+/// 原始上游条目（字段名兼容 C++ 配置）。
+///
+/// `slow_impl` / `auth_*` 等字段在 M0 仅解析，M2（握手兼容/上游认证）启用；
+/// 这里保留定义以保证旧配置可原样读取且字段含义有文档。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawUpstream {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub auth_user: Option<String>,
+    #[serde(default)]
+    pub auth_pwd: Option<String>,
+    /// C++ 的 `slowImpl`，M2（握手兼容）才会使用；M0 只记录。
+    #[serde(default)]
+    pub slow_impl: bool,
+    /// C++ 里可能是 bool 也可能是 0/1 数字，用 Value 兼容。
+    #[serde(default)]
+    pub disable: Option<serde_json::Value>,
+}
+
+impl RawUpstream {
+    /// C++ 语义：`disable` 为 true 或非 0 数字即禁用。
+    fn is_disabled(&self) -> bool {
+        match &self.disable {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(serde_json::Value::Number(n)) => n.as_i64().map(|v| v != 0).unwrap_or(false),
+            Some(serde_json::Value::String(s)) => {
+                matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes")
+            }
+            Some(_) => false,
+        }
+    }
+}
+
+/// C++ 的 `internalBehavior`（整节在 C++ 中未被解析）。
+///
+/// 仅用于兼容解析与 `connectTimeout` 兜底；其余字段保留定义以免旧配置"静默丢字段"。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct InternalBehavior {
+    #[serde(default)]
+    pub connect_timeout: Option<u64>,
+    #[serde(default)]
+    pub socks_test_timeout: Option<u64>,
+    #[serde(default)]
+    pub moment_locale: Option<String>,
+    #[serde(default)]
+    pub statistical_timer_period: Option<u64>,
+}
+
+/// 原始配置：字段名与 C++ `config.json` 对齐。
+///
+/// 标注 `allow(dead_code)` 的原因：其中一部分字段（探测周期、控制面等）在 M0 只做兼容解析，
+/// M1–M3 才会真正使用；保留定义可保证旧配置字段有明确归属，也避免 serde 静默丢弃。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct RawConfig {
+    #[serde(default = "default_listen_host")]
+    pub listen_host: String,
+    #[serde(default = "default_listen_port")]
+    pub listen_port: u16,
+    #[serde(default)]
+    pub multi_listen: Vec<ListenAddr>,
+
+    #[serde(default)]
+    pub upstream: Vec<RawUpstream>,
+
+    #[serde(default = "default_retry_times")]
+    pub retry_times: usize,
+    /// 毫秒；缺省时回落到 `internalBehavior.connectTimeout`，再缺省 2000ms。
+    #[serde(default)]
+    pub connect_timeout: Option<u64>,
+
+    // ===== 线程（ADR-003）=====
+    /// 最大 worker 线程数上限；0 = 自动（= 可用核数）。
+    #[serde(default)]
+    pub thread_num: usize,
+    /// 精确指定 worker 线程数；0 = 不指定。
+    #[serde(default)]
+    pub worker_threads: usize,
+    #[serde(default = "default_max_blocking_threads")]
+    pub max_blocking_threads: usize,
+    #[serde(default)]
+    pub thread_stack_size: Option<usize>,
+
+    // ===== 转发缓冲（ADR-005 / U1=方案 B）=====
+    #[serde(default)]
+    pub buffer_size: Option<usize>,
+
+    // ===== 连接与平台 =====
+    #[serde(default)]
+    pub max_connections: Option<usize>,
+    #[serde(default)]
+    pub socket_recv_buffer: Option<usize>,
+    #[serde(default)]
+    pub socket_send_buffer: Option<usize>,
+    #[serde(default)]
+    pub log_level: Option<String>,
+
+    // ===== 行为开关（部分 M1/M2 生效）=====
+    /// 纯 TCP 透传（M0 唯一模式；M1 起为 false 时启用首包识别）。
+    #[serde(default)]
+    pub tradition_tcp_relay: bool,
+    #[serde(default)]
+    pub disable_socks4: bool,
+
+    // ===== 控制面（M3 生效，M0 仅兼容解析）=====
+    #[serde(default)]
+    pub state_server_host: Option<String>,
+    #[serde(default)]
+    pub state_server_port: Option<u16>,
+    #[serde(default)]
+    pub state_max_response_bytes: Option<usize>,
+
+    // ===== 兼容性字段：解析但不使用（M0/M1 阶段）=====
+    #[serde(default)]
+    pub internal_behavior: Option<InternalBehavior>,
+    #[serde(default, alias = "AuthClientInfo")]
+    pub auth_client_info: Vec<serde_json::Value>,
+    #[serde(default, alias = "EmbedWebServerConfig")]
+    pub embed_web_server_config: Option<serde_json::Value>,
+    #[serde(default)]
+    pub health_check: Option<serde_json::Value>,
+    #[serde(default)]
+    pub upstream_select_rule: Option<String>,
+    #[serde(default)]
+    pub server_change_time: Option<u64>,
+    #[serde(default)]
+    pub sleep_time: Option<u64>,
+    #[serde(default)]
+    pub disable_connect_test: bool,
+    #[serde(default)]
+    pub disable_connection_tracker: bool,
+    #[serde(default)]
+    pub tcp_check_period: Option<u64>,
+    #[serde(default)]
+    pub tcp_check_start: Option<u64>,
+    #[serde(default)]
+    pub connect_check_period: Option<u64>,
+    #[serde(default)]
+    pub connect_check_start: Option<u64>,
+    #[serde(default)]
+    pub addition_check_period: Option<u64>,
+    #[serde(default)]
+    pub test_remote_host: Option<String>,
+    #[serde(default)]
+    pub test_remote_port: Option<u16>,
+}
+
+/// 监听目标（已校验）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenTarget {
+    pub host: String,
+    pub port: u16,
+}
+
+impl std::fmt::Display for ListenTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.host, self.port)
+    }
+}
+
+/// 上游（已校验）。
+#[derive(Debug, Clone)]
+pub struct UpstreamConfig {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub enabled: bool,
+    pub auth_user: Option<String>,
+    pub auth_pwd: Option<String>,
+}
+
+/// 线程配置（ADR-003）。
+#[derive(Debug, Clone, Copy)]
+pub struct ThreadConfig {
+    /// 0 表示交给启动逻辑按 `threadNum`/核数推导。
+    pub worker_threads: usize,
+    pub thread_num: usize,
+    pub max_blocking_threads: usize,
+    pub stack_size: usize,
+}
+
+/// 有效配置（解析 + 校验后的结果）。
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub listen: Vec<ListenTarget>,
+    pub upstreams: Vec<UpstreamConfig>,
+    pub retry_times: usize,
+    pub connect_timeout: Duration,
+    pub buffer_size: usize,
+    pub max_connections: usize,
+    pub log_level: String,
+    pub thread: ThreadConfig,
+    pub socket_recv_buffer: usize,
+    pub socket_send_buffer: usize,
+    pub tradition_tcp_relay: bool,
+    pub disable_socks4: bool,
+    /// 解析过程中发现的"被忽略/降级"的配置项说明，启动时以 warning 打印。
+    pub notes: Vec<String>,
+}
+
+/// 从文件加载配置。
+pub fn load(path: &Path) -> Result<Config, ConfigError> {
+    let bytes = fs::read(path)?;
+    let text = String::from_utf8(bytes)?;
+    load_str(&text)
+}
+
+/// 从字符串加载配置（便于单测）。
+///
+/// 容忍 UTF-8 BOM（项目规范是无 BOM，但为了能用编辑器直接保存的旧文件，这里宽容处理）。
+pub fn load_str(text: &str) -> Result<Config, ConfigError> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let value: serde_json::Value = serde_json::from_str(text)?;
+    from_value(value)
+}
+
+/// 从 JSON Value 构建有效配置。
+pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
+    let mut notes = Vec::new();
+
+    // 先做"被忽略配置"的探测（serde 会静默忽略未知字段，这里显式告知运维）。
+    if value.get("internalBehavior").is_some() {
+        notes.push(
+            "internalBehavior 整节在 C++ 中未被解析；M0 仅用其 connectTimeout 作兜底，其余忽略"
+                .into(),
+        );
+    }
+    if value.get("AuthClientInfo").is_some() || value.get("authClientInfo").is_some() {
+        notes.push("AuthClientInfo 已解析但 M0 不启用认证（M2 生效）".into());
+    }
+    if value.get("EmbedWebServerConfig").is_some() || value.get("embedWebServerConfig").is_some() {
+        notes.push("EmbedWebServerConfig 已解析但 Rust 版不实现内嵌 Web 服务器（ADR-001）".into());
+    }
+    if value.get("healthCheck").is_some() {
+        notes.push("healthCheck 已解析但 M0 不启用健康检查（M1 生效）".into());
+    }
+    if value.get("upstreamSelectRule").is_some() || value.get("serverChangeTime").is_some() {
+        notes.push(
+            "upstreamSelectRule/serverChangeTime 已解析但 M0 仅用 round-robin（M1 生效）".into(),
+        );
+    }
+    if value.get("testRemoteHost").is_some() || value.get("disableConnectTest").is_some() {
+        notes.push("健康探测相关字段已解析但 M0 未使用（M1 生效）".into());
+    }
+
+    let raw: RawConfig = serde_json::from_value(value)?;
+
+    // ===== 监听 =====
+    let mut listen = Vec::new();
+    let push_listen = |host: &str, port: u16, listen: &mut Vec<ListenTarget>| {
+        let host = host.trim();
+        if host.is_empty() {
+            return;
+        }
+        let target = ListenTarget {
+            host: host.to_string(),
+            port,
+        };
+        if !listen.contains(&target) {
+            listen.push(target);
+        }
+    };
+    if raw.listen_port == 0 {
+        return Err(err("listenPort 不能为 0"));
+    }
+    push_listen(&raw.listen_host, raw.listen_port, &mut listen);
+    for m in &raw.multi_listen {
+        if m.port == 0 {
+            return Err(err("multiListen[].port 不能为 0"));
+        }
+        let host = if m.host.trim().is_empty() {
+            raw.listen_host.as_str()
+        } else {
+            m.host.as_str()
+        };
+        push_listen(host, m.port, &mut listen);
+    }
+    if listen.is_empty() {
+        return Err(err("没有任何有效监听地址"));
+    }
+
+    // ===== 上游 =====
+    let mut upstreams = Vec::with_capacity(raw.upstream.len());
+    for (idx, u) in raw.upstream.iter().enumerate() {
+        if u.host.trim().is_empty() {
+            return Err(err(format!("upstream[{idx}].host 为空")));
+        }
+        if u.port == 0 {
+            return Err(err(format!("upstream[{idx}].port 为 0")));
+        }
+        upstreams.push(UpstreamConfig {
+            name: u
+                .name
+                .clone()
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| format!("upstream-{idx}")),
+            host: u.host.trim().to_string(),
+            port: u.port,
+            enabled: !u.is_disabled(),
+            auth_user: u.auth_user.clone(),
+            auth_pwd: u.auth_pwd.clone(),
+        });
+        if u.slow_impl {
+            notes.push(format!(
+                "upstream[{idx}] slowImpl=true：M0 纯透传不涉及（M2 握手兼容模式生效）"
+            ));
+        }
+    }
+    if upstreams.is_empty() {
+        return Err(err("upstream 列表为空，至少需要一个上游"));
+    }
+    if !upstreams.iter().any(|u| u.enabled) {
+        return Err(err("所有上游都被禁用（disable=true），没有可用上游"));
+    }
+    if let Some(u) = upstreams
+        .iter()
+        .find(|u| u.auth_user.is_some() || u.auth_pwd.is_some())
+    {
+        notes.push(format!(
+            "upstream[{}] 配置了认证，M0 纯透传不会使用（M2 生效）",
+            u.name
+        ));
+    }
+
+    // ===== 缓冲（ADR-005 / 方案 B）=====
+    let buffer_size = raw.buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE);
+    if !ALLOWED_BUFFER_SIZES.contains(&buffer_size) {
+        return Err(err(format!(
+            "bufferSize={buffer_size} 非法，允许值: {ALLOWED_BUFFER_SIZES:?}"
+        )));
+    }
+
+    // ===== 超时 =====
+    let connect_timeout_ms = raw
+        .connect_timeout
+        .or_else(|| {
+            raw.internal_behavior
+                .as_ref()
+                .and_then(|i| i.connect_timeout)
+        })
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS);
+    if connect_timeout_ms > 300_000 {
+        return Err(err("connectTimeout 过大（>300000ms）"));
+    }
+
+    // ===== 线程（ADR-003）=====
+    if raw.worker_threads > MAX_WORKER_THREADS {
+        return Err(err(format!(
+            "workerThreads={} 超过上限 {MAX_WORKER_THREADS}",
+            raw.worker_threads
+        )));
+    }
+    if raw.max_blocking_threads == 0 {
+        return Err(err("maxBlockingThreads 不能为 0"));
+    }
+    if raw.max_blocking_threads > 64 {
+        return Err(err("maxBlockingThreads 过大（>64）"));
+    }
+    let stack_size = raw.thread_stack_size.unwrap_or(DEFAULT_THREAD_STACK_SIZE);
+    if !(64 * 1024..=64 * 1024 * 1024).contains(&stack_size) {
+        return Err(err(format!(
+            "threadStackSize={stack_size} 超出允许范围 [65536, 67108864]"
+        )));
+    }
+
+    // ===== 连接数上限 =====
+    let max_connections = raw.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS);
+    if max_connections == 0 {
+        return Err(err("maxConnections 不能为 0"));
+    }
+
+    // ===== socket 缓冲（0 = 使用系统默认）=====
+    let socket_recv_buffer = raw.socket_recv_buffer.unwrap_or(0);
+    let socket_send_buffer = raw.socket_send_buffer.unwrap_or(0);
+
+    Ok(Config {
+        listen,
+        upstreams,
+        retry_times: raw.retry_times.max(1),
+        connect_timeout: Duration::from_millis(connect_timeout_ms),
+        buffer_size,
+        max_connections,
+        log_level: raw.log_level.unwrap_or_else(default_log_level),
+        thread: ThreadConfig {
+            worker_threads: raw.worker_threads,
+            thread_num: raw.thread_num,
+            max_blocking_threads: raw.max_blocking_threads,
+            stack_size,
+        },
+        socket_recv_buffer,
+        socket_send_buffer,
+        tradition_tcp_relay: raw.tradition_tcp_relay,
+        disable_socks4: raw.disable_socks4,
+        notes,
+    })
+}
+
+/// 计算实际 worker 线程数（ADR-003）。
+///
+/// 规则：`workerThreads > 0` 时精确使用；否则 `threadNum > 0` 时取 `min(核数, threadNum)`；
+/// 否则等于核数（最少 1）。
+pub fn effective_worker_threads(thread: &ThreadConfig) -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1);
+    let n = if thread.worker_threads > 0 {
+        thread.worker_threads
+    } else if thread.thread_num > 0 {
+        cores.min(thread.thread_num)
+    } else {
+        cores
+    };
+    n.clamp(1, MAX_WORKER_THREADS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal() -> &'static str {
+        r#"{
+            "listenHost": "127.0.0.1",
+            "listenPort": 5100,
+            "upstream": [ { "host": "127.0.0.1", "port": 6100 } ]
+        }"#
+    }
+
+    #[test]
+    fn 最小配置使用默认值() {
+        let c = load_str(minimal()).unwrap();
+        assert_eq!(c.listen.len(), 1);
+        assert_eq!(c.listen[0].port, 5100);
+        assert_eq!(c.buffer_size, DEFAULT_BUFFER_SIZE);
+        assert_eq!(c.connect_timeout, Duration::from_millis(2000));
+        assert_eq!(c.max_connections, DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(c.thread.max_blocking_threads, DEFAULT_MAX_BLOCKING_THREADS);
+        assert_eq!(c.thread.stack_size, DEFAULT_THREAD_STACK_SIZE);
+        assert!(c.upstreams[0].enabled);
+    }
+
+    #[test]
+    fn 兼容_cpp_完整配置() {
+        // 取自 C++ 仓库 config.json（含首字母大写的键、数字 disable、internalBehavior）
+        let text = r#"{
+            "listenHost": "127.0.0.1",
+            "listenPort": 5100,
+            "retryTimes": 3,
+            "testRemoteHost": "www.google.com",
+            "testRemotePort": 443,
+            "tcpCheckPeriod": 5000,
+            "tcpCheckStart": 1000,
+            "connectCheckPeriod": 300000,
+            "connectCheckStart": 1000,
+            "additionCheckPeriod": 10000,
+            "upstreamSelectRule": "loop",
+            "sleepTime": 1800000,
+            "threadNum": 11,
+            "serverChangeTime": 5000,
+            "stateServerHost": "127.0.0.1",
+            "stateServerPort": 5110,
+            "disableConnectTest": false,
+            "disableConnectionTracker": false,
+            "traditionTcpRelay": false,
+            "disableSocks4": false,
+            "multiListen": [
+                { "host": "127.0.0.1", "port": 6600 },
+                { "host": "127.0.0.1", "port": 6600 }
+            ],
+            "upstream": [
+                { "name": "serverTest", "host": "127.0.0.1", "port": 6100, "disable": 1 },
+                { "name": "serverA", "host": "127.0.0.1", "port": 26702 }
+            ],
+            "AuthClientInfo": [ { "user": "123", "pwd": "321" } ],
+            "internalBehavior": { "connectTimeout": 1234 },
+            "EmbedWebServerConfig": { "enable": true, "host": "127.0.0.1", "port": 5102 }
+        }"#;
+        let c = load_str(text).unwrap();
+        // 去重后 2 个监听
+        assert_eq!(c.listen.len(), 2);
+        // 数字 disable=1 视为禁用
+        assert!(!c.upstreams[0].enabled);
+        assert!(c.upstreams[1].enabled);
+        // 顶层无 connectTimeout，回落 internalBehavior
+        assert_eq!(c.connect_timeout, Duration::from_millis(1234));
+        // 被忽略项有提示
+        assert!(c.notes.iter().any(|n| n.contains("AuthClientInfo")));
+        assert!(c.notes.iter().any(|n| n.contains("EmbedWebServer")));
+    }
+
+    #[test]
+    fn buffer_size_只允许三档() {
+        for ok in [2048, 4096, 8192] {
+            let text = format!(
+                r#"{{"listenPort":5000,"bufferSize":{ok},"upstream":[{{"host":"1.2.3.4","port":1}}]}}"#
+            );
+            assert!(load_str(&text).is_ok(), "bufferSize={ok} 应被接受");
+        }
+        let text =
+            r#"{"listenPort":5000,"bufferSize":3000,"upstream":[{"host":"1.2.3.4","port":1}]}"#;
+        let e = load_str(text).unwrap_err();
+        assert!(e.to_string().contains("bufferSize"));
+    }
+
+    #[test]
+    fn disable_支持布尔与数字() {
+        let text = r#"{"listenPort":5000,"upstream":[
+            {"host":"a","port":1,"disable":true},
+            {"host":"b","port":2,"disable":1},
+            {"host":"c","port":3,"disable":0},
+            {"host":"d","port":4}
+        ]}"#;
+        let c = load_str(text).unwrap();
+        assert!(!c.upstreams[0].enabled);
+        assert!(!c.upstreams[1].enabled);
+        assert!(c.upstreams[2].enabled);
+        assert!(c.upstreams[3].enabled);
+    }
+
+    #[test]
+    fn 全部上游禁用_报错() {
+        let text = r#"{"listenPort":5000,"upstream":[{"host":"a","port":1,"disable":1}]}"#;
+        assert!(load_str(text).is_err());
+    }
+
+    #[test]
+    fn 空上游_报错() {
+        let text = r#"{"listenPort":5000}"#;
+        assert!(load_str(text).is_err());
+    }
+
+    #[test]
+    fn 线程数量_校验() {
+        let text = r#"{"listenPort":5000,"workerThreads":999,"upstream":[{"host":"a","port":1}]}"#;
+        assert!(load_str(text).is_err());
+        let text =
+            r#"{"listenPort":5000,"maxBlockingThreads":0,"upstream":[{"host":"a","port":1}]}"#;
+        assert!(load_str(text).is_err());
+        let text =
+            r#"{"listenPort":5000,"threadStackSize":1024,"upstream":[{"host":"a","port":1}]}"#;
+        assert!(load_str(text).is_err());
+    }
+
+    #[test]
+    fn 计算实际线程数() {
+        let t = ThreadConfig {
+            worker_threads: 3,
+            thread_num: 0,
+            max_blocking_threads: 2,
+            stack_size: DEFAULT_THREAD_STACK_SIZE,
+        };
+        assert_eq!(effective_worker_threads(&t), 3);
+        let t = ThreadConfig {
+            worker_threads: 0,
+            thread_num: 1,
+            ..t
+        };
+        assert_eq!(effective_worker_threads(&t), 1);
+        let t = ThreadConfig {
+            worker_threads: 0,
+            thread_num: 0,
+            ..t
+        };
+        assert!(effective_worker_threads(&t) >= 1);
+    }
+
+    #[test]
+    fn 带_bom_的配置可加载() {
+        let text = "\u{feff}{\"listenPort\":5000,\"upstream\":[{\"host\":\"a\",\"port\":1}]}";
+        assert!(load_str(text).is_ok());
+    }
+}

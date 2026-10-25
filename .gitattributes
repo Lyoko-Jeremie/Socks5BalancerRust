@@ -1,0 +1,7 @@
+# 统一换行：源码/配置/文档一律 LF（与项目 UTF-8 规范配套）
+* text=auto eol=lf
+
+# Windows 脚本保留 CRLF（PowerShell 5.1 习惯；.ps1 另需 UTF-8 BOM，见文件头说明）
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
