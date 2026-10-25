@@ -108,12 +108,15 @@ async fn handle_socks5(
                 .first_packet_timeout
                 .fetch_add(1, Ordering::Relaxed);
             debug!(%peer, timeout_ms = ctx.cfg.first_packet_timeout.as_millis() as u64, "首包超时");
+            // 显式 FIN，避免直接 drop 触发 RST 干扰客户端诊断
+            drain_and_close(downstream).await;
             return;
         }
     }
     if first[0] != socks5::VERSION {
         ctx.stats.protocol_errors.fetch_add(1, Ordering::Relaxed);
         debug!(%peer, first_byte = first[0], "M1 仅支持 SOCKS5 入站（SOCKS4/HTTP 将在 M2 实现）");
+        drain_and_close(downstream).await;
         return;
     }
 
@@ -129,12 +132,14 @@ async fn handle_socks5(
             // negotiate 内部已尽力写回 SOCKS5 错误码
             ctx.stats.handshake_failed.fetch_add(1, Ordering::Relaxed);
             debug!(%peer, error = %e, "入站 SOCKS5 协商失败");
+            drain_and_close(downstream).await;
             return;
         }
         Err(_) => {
             ctx.stats.handshake_failed.fetch_add(1, Ordering::Relaxed);
             let _ = socks5::write_error_reply(&mut downstream, socks5::REP_TTL_EXPIRED).await;
             debug!(%peer, "入站 SOCKS5 握手超时");
+            drain_and_close(downstream).await;
             return;
         }
     };
@@ -199,6 +204,24 @@ async fn handle_socks5(
 
     // 6) 双向转发
     relay_streams(ctx, downstream, upstream, bufs, peer, "socks5").await;
+}
+
+/// 握手失败后的优雅关闭：先半关闭写端，再短暂丢弃剩余输入。
+///
+/// 目的：避免"带着未读输入直接 drop"触发 RST，导致客户端可能收不到刚刚写回的
+/// SOCKS5 错误码（例如 BIND 请求的地址字段还没读，内核缓冲里仍有数据）。
+async fn drain_and_close(mut stream: TcpStream) {
+    let _ = stream.shutdown().await;
+    let mut buf = [0u8; 512];
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
 }
 
 /// 连接上游 TCP（带超时），成功后关闭 Nagle。

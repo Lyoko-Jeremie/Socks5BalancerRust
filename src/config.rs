@@ -433,7 +433,7 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
         .find(|u| u.auth_user.is_some() || u.auth_pwd.is_some())
     {
         notes.push(format!(
-            "upstream[{}] 配置了认证，M0 纯透传不会使用（M2 生效）",
+            "upstream[{}] 配置了 SOCKS5 认证：将在上游握手时使用（0x02）",
             u.name
         ));
     }
