@@ -54,4 +54,23 @@ impl AppCtx {
         self.selector
             .next_excluding(&|idx| self.health.is_available(idx), excluded)
     }
+
+    /// 按客户端 hint 选择上游（首次尝试）；`excluded` 非空时按排除规则重试。
+    pub fn pick_upstream_for_client(
+        &self,
+        client: std::net::IpAddr,
+        excluded: &[usize],
+    ) -> Option<&crate::upstream::Upstream> {
+        if excluded.is_empty() {
+            self.selector
+                .next_for_client(client, &|idx| self.health.is_available(idx))
+        } else {
+            self.pick_upstream_excluding(excluded)
+        }
+    }
+
+    /// 记录客户端成功使用的上游（供下次按 hint 粘性选择）。
+    pub fn record_hint(&self, client: std::net::IpAddr, idx: usize) {
+        self.selector.record_hint(client, idx);
+    }
 }

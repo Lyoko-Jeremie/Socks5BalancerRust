@@ -301,7 +301,10 @@ async fn establish(
     let mut up_name = String::new();
 
     for _ in 0..max_attempts {
-        let Some(upstream_cfg) = ctx.pick_upstream_excluding(&tried).cloned() else {
+        let Some(upstream_cfg) = ctx
+            .pick_upstream_for_client(peer.ip(), &tried)
+            .cloned()
+        else {
             break;
         };
         tried.push(upstream_cfg.health_index);
@@ -341,6 +344,8 @@ async fn establish(
         match tokio::time::timeout(ctx.cfg.handshake_timeout, handshake_fut).await {
             Ok(Ok(stream)) => {
                 up_name = upstream_cfg.name.clone();
+                // 记录每客户端粘性 hint（下次同客户端优先复用该上游）
+                ctx.record_hint(peer.ip(), upstream_cfg.health_index);
                 established = Some(stream);
                 break;
             }
@@ -465,11 +470,15 @@ async fn connect_upstream_with_retry(
     let max_attempts = ctx.cfg.retry_times.saturating_add(1).max(1);
     let mut tried: Vec<usize> = Vec::with_capacity(max_attempts);
     for _ in 0..max_attempts {
-        let Some(cfg) = ctx.pick_upstream_excluding(&tried).cloned() else {
+        let Some(cfg) = ctx
+            .pick_upstream_for_client(peer.ip(), &tried)
+            .cloned()
+        else {
             break;
         };
         tried.push(cfg.health_index);
         if let Some(stream) = connect_upstream(ctx, &cfg, peer).await {
+            ctx.record_hint(peer.ip(), cfg.health_index);
             return Some((cfg, stream));
         }
     }

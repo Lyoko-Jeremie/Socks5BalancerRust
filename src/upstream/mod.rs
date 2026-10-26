@@ -106,7 +106,12 @@ struct SelectState {
     last_change: Instant,
     /// 人工启停（M3 控制面 `enable_upstream` / `disable_upstream`）；索引与上游一致。
     enabled: Vec<bool>,
+    /// 每客户端粘性 hint（客户端 IP → 上次成功的上游下标）；只对粘性型规则生效。
+    hints: std::collections::HashMap<IpAddr, usize>,
 }
+
+/// per-client hint 表容量上限（防止被大量客户端 IP 撑爆内存）。
+const MAX_HINTS: usize = 4096;
 
 /// 上游选择器。
 #[derive(Debug)]
@@ -131,6 +136,7 @@ impl UpstreamSelector {
                 current: 0,
                 last_change: Instant::now(),
                 enabled,
+                hints: std::collections::HashMap::new(),
             }),
         }
     }
@@ -266,6 +272,47 @@ impl UpstreamSelector {
         }
         let filtered = |i: usize| !exclude.contains(&i) && is_available(i);
         self.next(&filtered)
+    }
+
+    /// 按客户端 hint 选择上游。
+    ///
+    /// 粘性型规则（`one_by_one` / `change_by_time`）下，若该客户端上次成功的上游仍可用，
+    /// 直接复用它（对齐 C++ `hintUpstreamIndex` 的每客户端粘性）；其他规则保持原语义。
+    pub fn next_for_client(
+        &self,
+        client: IpAddr,
+        is_available: &dyn Fn(usize) -> bool,
+    ) -> Option<&Upstream> {
+        if matches!(self.rule(), SelectRule::OneByOne | SelectRule::ChangeByTime) {
+            let hint = {
+                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                state
+                    .hints
+                    .get(&client)
+                    .copied()
+                    .filter(|idx| state.enabled.get(*idx).copied().unwrap_or(false))
+            };
+            if let Some(idx) = hint
+                && is_available(idx)
+            {
+                return self.upstreams.get(idx);
+            }
+        }
+        self.next(is_available)
+    }
+
+    /// 记录某客户端成功使用的上游（供下次 `next_for_client` 粘性选择）。
+    ///
+    /// hint 表有容量上限；超过时整体清空（最简单且有界，避免无界增长）。
+    pub fn record_hint(&self, client: IpAddr, idx: usize) {
+        if idx >= self.upstreams.len() {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.hints.len() >= MAX_HINTS && !state.hints.contains_key(&client) {
+            state.hints.clear();
+        }
+        state.hints.insert(client, idx);
     }
 }
 
@@ -482,5 +529,28 @@ mod tests {
             .map(|_| s.next(&all_available).unwrap().name.as_str())
             .collect();
         assert!(names.contains(&"a"), "启用后应可选中: {names:?}");
+    }
+
+    #[test]
+    fn 粘性规则按客户端_hint_选择上游() {
+        let s = selector(SelectRule::OneByOne, Duration::from_secs(60));
+        let c1: IpAddr = "10.0.0.1".parse().unwrap();
+        let c2: IpAddr = "10.0.0.2".parse().unwrap();
+        s.record_hint(c1, 1);
+        s.record_hint(c2, 2);
+        assert_eq!(s.next_for_client(c1, &all_available).unwrap().name, "b");
+        assert_eq!(s.next_for_client(c2, &all_available).unwrap().name, "c");
+        // hint 上游不可用 → 回落到常规规则
+        let only_a = |i: usize| i == 0;
+        assert_eq!(s.next_for_client(c1, &only_a).unwrap().name, "a");
+    }
+
+    #[test]
+    fn 非粘性规则忽略_hint() {
+        let s = selector(SelectRule::Random, Duration::from_secs(60));
+        let c: IpAddr = "10.0.0.9".parse().unwrap();
+        s.record_hint(c, 1);
+        // random 规则不保证选中 hint，但必须仍能返回可用项
+        assert!(s.next_for_client(c, &all_available).is_some());
     }
 }

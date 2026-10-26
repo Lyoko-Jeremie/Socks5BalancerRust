@@ -24,7 +24,7 @@
 | 全部上游不可用 → 快速拒绝（不黑洞） | ✅ | CONNECT 回 REP 0x01，不挂起 |
 | TLS + HTTP readiness 探测（M1.5 / ADR-006） | ✅ | 本地自签 HTTPS 目标 9/9 通过；系统根证书或 `caFile` 自定义信任根；状态码可配 |
 | liveness + readiness 同时满足才可用（ADR-002） | ✅ | readiness 失败（坏目标）时上游不可用；TCP 恢复后 readiness 探测恢复 |
-| 每客户端 hint 粘性（C++ `hintUpstreamIndex`） | ⏳ M3 | 依赖控制面/连接表，M1 用全局规则 |
+| 每客户端 hint 粘性（C++ `hintUpstreamIndex`） | ✅ 后续补齐 | 粘性型规则（`one_by_one`/`change_by_time`）按客户端 IP 复用上次成功上游；hint 表上限 4096，超限整体清空 |
 
 **M1 结论：M1.1–M1.5 全部完成并通过端到端验收；C10K/1K 压测与 M2 为下一步。**
 
@@ -151,7 +151,7 @@
 ## 5. 已知限制
 
 1. **外网 TLS 目标可达性取决于部署环境**：本机对部分外网 IPv4/IPv6 的 TLS 数据会被 RST（curl 直连亦不一致），因此验收改用**本地自签 HTTPS 目标**（`examples/tls_echo_server` + `caFile`），保证可复现。生产部署时 `healthCheck.target` 应配置为**从本机可达**的目标。
-2. **无每客户端 hint 粘性**：C++ 的 `hintUpstreamIndex` 依赖连接表/控制面，计划 M3 随控制面实现。
+2. **每客户端 hint 粘性已补齐**：粘性型规则（`one_by_one`/`change_by_time`）按客户端 IP 复用上次成功的上游；`loop`/`random`/`force_only_one` 保持原规则语义。
 3. **`sleepTime`（长时间无请求暂停探测）未实现**：M1.4 恒探测；按 ADR 可在 M3 控制面做。
 4. **C10K/1K 建连压测未做**：Windows 单机动态端口 16,384 的限制仍在（M0 已记录），需 Linux 或多机验证；M1 的 SOCKS5 握手会额外消耗端口与时间。
 5. **Linux 未实测**：平台差异已用 `cfg` 分隔，CI 待补。

@@ -108,6 +108,7 @@ Rust 版**直接兼容** C++ `config.json` 的主要字段（camelCase），包�
 | 控制面鉴权 | 无 | 无（同），但响应剔除密码 + 默认回环 | 同 C++ |
 | `slowImpl` | 存在（兼容不标准上游） | **未实现** | 若上游非常规，先验证 |
 | 上游 `disable: true` | 该上游不进池 | 保留在池中（`enabled=false`），`/api/v1/upstreams` 可见，可用 `enable_upstream` 启用 | 行为更可控 |
+| 每客户端 hint 粘性 | `hintUpstreamIndex` | 已实现：粘性型规则（`one_by_one`/`change_by_time`）按客户端 IP 复用上次成功上游 | 行为接近 |
 | `embedWebServer` | 内置静态前端 | 不移植（U2） | 前端需独立部署或不用 |
 
 ### 5.3 灰度切换步骤
