@@ -3,6 +3,7 @@
   "stateServerPort": 0,
   "listenPort": 5500,
   "traditionTcpRelay": false,
+  "disableSocks4": false,
   "bufferSize": 4096,
   "connectTimeout": 2000,
   "firstPacketTimeout": 5000,
