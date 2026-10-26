@@ -14,10 +14,15 @@
 //!   C) enabled=false —— 只建 ConnMeta 与子令牌，不做任何计数（隔离"最小成本"）
 //!   D) 纯 CancellationToken::child_token + drop —— 隔离令牌树上的全局锁
 //!   E) Stats 全局原子（3 次/op）—— 无锁原子路径的对照上限
+//!   F) tokio mpsc `try_send`（有界 64K + 单消费者 drain）—— 消息架构的热路径成本
+//!   G) A1 无锁原型（per_listen 原子数组 + per_client 64 分片 + active 分片 + 明细 16 分片）——
+//!      不改架构、只换数据结构时的上限估算
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use socks5_balancer_rust::config::ConnTrackingConfig;
@@ -135,4 +140,91 @@ fn main() {
         stats.active.fetch_sub(1, Ordering::Relaxed);
     });
     bench("E) Stats 全局原子 x4", threads, iters, stats_f);
+
+    // F) 消息架构：有界 mpsc 的 try_send（含单消费者 drain，避免队列满即丢弃）。
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<u64>(65_536);
+    let consumer = std::thread::spawn(move || {
+        let mut n = 0u64;
+        while rx.blocking_recv().is_some() {
+            n += 1;
+        }
+        n
+    });
+    bench(
+        "F) mpsc try_send (64K)",
+        threads,
+        iters,
+        Arc::new(move |n: u64| {
+            let _ = tx.try_send(n);
+        }),
+    );
+    let _ = consumer; // tx 已在 bench 返回时释放，消费者线程自行退出
+
+    // G) A1 原型：只换数据结构（不改架构）时的上限估算。
+    struct ProtoA1 {
+        listen: AtomicU64,
+        client: Vec<Mutex<HashMap<u8, u64>>>,
+        active: Vec<AtomicU64>,
+        next_id: AtomicU64,
+        shards: Vec<Mutex<HashMap<u64, u64>>>,
+    }
+    impl ProtoA1 {
+        fn new() -> Self {
+            Self {
+                listen: AtomicU64::new(0),
+                client: (0..64).map(|_| Mutex::new(HashMap::new())).collect(),
+                active: (0..32).map(|_| AtomicU64::new(0)).collect(),
+                next_id: AtomicU64::new(1),
+                shards: (0..16).map(|_| Mutex::new(HashMap::new())).collect(),
+            }
+        }
+        fn register(&self, ip: u8) {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            self.listen.fetch_add(1, Ordering::Relaxed);
+            {
+                let mut m = self.client[(ip as usize) % 64]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                *m.entry(ip).or_insert(0) += 1;
+            }
+            self.active[(id as usize) % 32].fetch_add(1, Ordering::Relaxed);
+            {
+                let mut s = self.shards[(id as usize) % 16]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                s.insert(id, 0);
+            }
+        }
+        fn unregister(&self, ip: u8, id: u64) {
+            self.listen.fetch_sub(1, Ordering::Relaxed);
+            {
+                let mut m = self.client[(ip as usize) % 64]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(v) = m.get_mut(&ip) {
+                    *v = v.saturating_sub(1);
+                    if *v == 0 {
+                        m.remove(&ip);
+                    }
+                }
+            }
+            self.active[(id as usize) % 32].fetch_sub(1, Ordering::Relaxed);
+            let mut s = self.shards[(id as usize) % 16]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            s.remove(&id);
+        }
+    }
+    let proto = Arc::new(ProtoA1::new());
+    let proto_f = Arc::clone(&proto);
+    bench(
+        "G) A1 原型（原子/分片，无令牌）",
+        threads,
+        iters,
+        Arc::new(move |n: u64| {
+            let ip = (n % 250 + 1) as u8;
+            proto_f.register(ip);
+            proto_f.unregister(ip, n + 1);
+        }),
+    );
 }
