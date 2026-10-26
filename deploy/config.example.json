@@ -19,7 +19,7 @@
   "threadNum": 0,
   "workerThreads": 4,
   "maxBlockingThreads": 2,
-  "threadStackSizeKb": 512,
+  "threadStackSize": 524288,
   "socketRecvBuffer": 0,
   "socketSendBuffer": 0,
 
@@ -32,7 +32,6 @@
       "name": "proxy-a",
       "host": "10.0.0.11",
       "port": 1080,
-      "enabled": true,
       "authUser": "",
       "authPwd": ""
     },
@@ -40,7 +39,6 @@
       "name": "proxy-b",
       "host": "10.0.0.12",
       "port": 1080,
-      "enabled": true,
       "authUser": "user",
       "authPwd": "change-me"
     }

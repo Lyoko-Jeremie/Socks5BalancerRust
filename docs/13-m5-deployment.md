@@ -87,7 +87,7 @@ docker inspect --format '{{.State.Health.Status}}' balancer
 ### 5.1 配置字段兼容
 
 Rust 版**直接兼容** C++ `config.json` 的主要字段（camelCase），包含：
-`listenHost/listenPort/multiListen`、`upstream[]`（name/host/port/enabled/authUser/authPwd）、
+`listenHost/listenPort/multiListen`、`upstream[]`（name/host/port/disable/authUser/authPwd；`disable: true` 表示禁用该上游）、
 `authClientInfo[]`、`stateServerHost/Port`、`threadNum`、`logLevel`、
 `upstreamSelectRule`、`serverChangeTime`、`traditionTcpRelay`、`disableSocks4`、
 `bufferSize`、`maxConnections`、`connectTimeout`、`healthCheck.*`。

@@ -98,7 +98,7 @@ curl -X POST -H "Content-Type: application/json" \
 |---|---|---|
 | `listenHost` / `listenPort` | `127.0.0.1` / `5000` | 代理监听地址与端口 |
 | `multiListen` | `[]` | 额外监听（`[{"host":"...","port":...}]`） |
-| `upstream[]` | — | 上游 SOCKS5：`name`/`host`/`port`/`enabled`/`authUser`/`authPwd` |
+| `upstream[]` | — | 上游 SOCKS5：`name`/`host`/`port`/`disable`/`authUser`/`authPwd`（`disable: true` 禁用该上游） |
 | `upstreamSelectRule` | `random` | `loop` / `random` / `one_by_one` / `change_by_time` / `force_only_one` |
 | `serverChangeTime` | `60000` | `change_by_time` 的切换周期（毫秒） |
 | `bufferSize` | `8192` | 每连接双向缓冲；2048/4096/8192（100MB 口径用 2048） |
