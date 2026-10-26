@@ -39,8 +39,12 @@ clap = { version = "4", features = ["derive"] }
 # 错误类型（ADR-007：边界层使用 thiserror）
 thiserror = "2"
 
-# 全局分配器（ADR-007）
+# 全局分配器（ADR-007）。libmimalloc-sys 直接依赖仅用于设置 mimalloc 运行期选项
+# （free() 后尽早把空闲页归还 OS，保证 10K 连接 RSS 口径，见 docs/12 与 main.rs）。
 mimalloc = { version = "0.1", default-features = false }
+libmimalloc-sys = { version = "0.1.49", default-features = false, features = [
+    "extended",
+] }
 tokio-socks = "0.5.3"
 fastrand = "2.5.0"
 rustls = "0.23"

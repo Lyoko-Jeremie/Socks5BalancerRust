@@ -29,6 +29,42 @@ use tracing::{error, info, warn};
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+/// mimalloc v3 运行期选项索引。
+///
+/// 与 `libmimalloc-sys` 内置 mimalloc **v3** 的 `include/mimalloc.h` 中 `mi_option_e`
+/// 枚举顺序一致（0 起始）：`mi_option_arena_eager_commit` 是第 5 个 **= 4**、
+/// `mi_option_purge_delay` 是第 16 个 **= 15**。
+///
+/// 注意：`libmimalloc-sys` 的 Rust 绑定只导出了部分旧选项名，这两个 v3 选项要按枚举值调用；
+/// 升级 `libmimalloc-sys` 时需重新核对该枚举顺序。
+const MI_OPTION_ARENA_EAGER_COMMIT: std::ffi::c_int = 4;
+const MI_OPTION_PURGE_DELAY: std::ffi::c_int = 15;
+
+/// 应用 mimalloc 的"低 RSS"策略（M4：10K 连接 ≤100MB 口径，见 docs/12 实测）。
+///
+/// - `arena_eager_commit=0`：arena 不预先提交物理页，按需提交；
+/// - `purge_delay=0`：空闲页**立即**归还 OS（mimalloc 默认延迟 10ms 且按比例保留，
+///   在高并发短连接场景会让 RSS 长期停在峰值附近）。
+///
+/// Linux 实测（10,000 空闲连接 60s，bufferSize=2048）：
+/// 默认策略峰值 110.4 MB → 本策略 93.0 MB（空闲基线 20.1 MB → 12.9 MB）。
+///
+/// 运维仍可用环境变量 `MIMALLOC_ARENA_EAGER_COMMIT` / `MIMALLOC_PURGE_DELAY` 覆盖：
+/// mimalloc 在初始化时先读环境变量，这里仅在**未显式设置**时套默认值（不覆盖用户选择）。
+fn apply_mimalloc_low_rss_profile() {
+    let has_env = |name: &str| std::env::var_os(name).is_some();
+    // SAFETY: `mi_option_set` 是 mimalloc 的 C API，进程启动早期单线程调用，
+    // 选项索引与内置 mimalloc v3 头文件一致（见上方常量注释）。
+    unsafe {
+        if !has_env("MIMALLOC_ARENA_EAGER_COMMIT") {
+            libmimalloc_sys::mi_option_set(MI_OPTION_ARENA_EAGER_COMMIT, 0);
+        }
+        if !has_env("MIMALLOC_PURGE_DELAY") {
+            libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0);
+        }
+    }
+}
+
 /// 命令行参数（与 C++ 版 `-c/--config`、`--help`、`--version` 兼容）。
 #[derive(Parser, Debug)]
 #[command(
@@ -43,6 +79,8 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
+    // 必须在启动早期（分配量还很小、worker 线程尚未创建）应用，见函数注释。
+    apply_mimalloc_low_rss_profile();
     let cli = Cli::parse();
 
     let cfg = match config::load(&cli.config) {

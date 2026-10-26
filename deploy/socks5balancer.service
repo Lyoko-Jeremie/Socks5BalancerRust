@@ -20,6 +20,12 @@ LimitNOFILE=131072
 LimitNPROC=65536
 LimitCORE=0
 
+# mimalloc 低 RSS 策略（10K 连接 ≤100MB 口径，见 docs/12 §3.4）：
+# 程序启动时已内置同样的默认值；这里显式设置有两个目的——让选项在 mimalloc 初始化前生效，
+# 以及给运维一个统一的覆盖点（要改/关闭时只改这里，不必改代码）。
+Environment=MIMALLOC_PURGE_DELAY=0
+Environment=MIMALLOC_ARENA_EAGER_COMMIT=0
+
 # 最小权限加固
 NoNewPrivileges=true
 ProtectSystem=strict
