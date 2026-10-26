@@ -1400,21 +1400,25 @@ snap_swap.store(Arc::new(snap));    // 控制面读到的永远是完整快照
 
 | 方法 | 路径 | 作用 | 返回 | 备注 |
 |---|---|---|---|---|
-| `GET` | `/api/v1/status` | 进程 / 总量 / 后端 / 监听 / 健康摘要 / 延迟摘要 | 一个 JSON（≤64 KB 上限） | 读 `Arc<Snapshot>`，零锁 |
-| `GET` | `/api/v1/upstreams` | 后端逐条详情（host/port/name/state/RTT/conns/enabled） | JSON 数组 | 固定数组，索引=解析成功上游的顺序（通常=配置顺序） |
+| `GET` | `/api/v1/status` | 进程 / 总量 / 后端 / 监听 / 健康摘要 | 一个 JSON（≤64 KB 上限） | 实时聚合（无快照缓存） |
+| `GET` | `/api/v1/upstreams` | 后端逐条详情（host/port/name/enabled/health/RTT） | JSON 数组 | 固定数组，索引=解析成功上游的顺序（通常=配置顺序）；RTT 为最近一次探测耗时，无 conns |
 | `POST` | `/api/v1/control` | 控制命令（JSON body） | `{"ok":true}` 或错误 | **唯一的写端点** |
 | `GET` | `/healthz` | 存活探针（容器 / K8s） | `200 ok` 纯文本 | 不读业务状态 |
 
 控制命令（`POST /api/v1/control`，body 形如 `{"cmd":"...","args":{...}}`）：
 
+> **实现状态（2026-10-26）**：已实现 `set_rule`（仅 `rule`，`scope`/`target` 预留未实现）、
+> `enable_upstream` / `disable_upstream`、`check_upstream`；`close_conn` / `close_all`
+> （无连接表）与 `reload_config`（U5 不做）**未实现**，返回 `{"ok":false,"detail":"不支持的命令…"}`。
+
 | `cmd` | 参数 | 作用 |
 |---|---|---|
-| `set_rule` | `rule`、`scope`(global/client/listen)、`target`(ip 或 ip:port) | 改选路规则 |
+| `set_rule` | `rule`（`scope`/`target` 预留） | 改选路规则 |
 | `enable_upstream` / `disable_upstream` | `index` 或 `name` | 启用 / 禁用后端（人工） |
 | `check_upstream` | `index`（可选） | 立即探测（**一次，不重试**） |
-| `close_conn` | `id` 或 `client` | 关闭单条 / 某客户端连接 |
-| `close_all` | — | 关闭全部连接 |
-| `reload_config` | — | 可选：热重载（是否实现见 [07-decisions.md](07-decisions.md) §7 的 U5） |
+| `close_conn` | `id` 或 `client` | 关闭单条 / 某客户端连接（**未实现**） |
+| `close_all` | — | 关闭全部连接（**未实现**） |
+| `reload_config` | — | 热重载（U5：M0–M4 不做） |
 
 **安全默认（[07-decisions.md](07-decisions.md) ADR-001）**：
 

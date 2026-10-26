@@ -84,12 +84,13 @@
 
 ### 2.2 明确的非功能 / 未实现项
 
-来自 `README.md:515-546` 的 TODO 列表，直接标注了**边界**，移植时不应"顺手实现"以免范围失控：
+来自 `README.md:515-546` 的 TODO 列表，直接标注了**边界**，移植时不应"顺手实现"以免范围失控。
+**Rust 移植决策（2026-10-26 登记）**：以下 4 项**不在 Rust 版范围**，不实现也不作为验收项；如需再做需先经 ADR 裁决：
 
-- 未实现：按目标域名选上游（当前"先选上游、后嗅探目标"，架构性限制，见 `src/TcpRelaySession.cpp:210-213` 的 TODO 注释）。
-- 未实现：`best_latency` / `best_stable` / `fast_download_speed` / `fast_upload_speed` 规则（枚举里被注释掉，`src/ConfigRuleEnum.h:22-31`）。
-- 未实现：上游优先级、（原计划的）trojan 协议客户端。
-- "socks5 UDP 支持"处于勾选状态且带说明"仅 localhost/LAN 可用"，但这与当前代码路径**矛盾**：`FirstPackAnalyzer` 遇到 `CMD != CONNECT` 的 SOCKS5 请求根本不会识别（它只嗅探前 3 字节就透传），所以 UDP ASSOCIATE 是否真的可用需要按模式区分，**列为待确认项**。
+- 未实现（Rust 同样不做）：按目标域名选上游（当前"先选上游、后嗅探目标"，架构性限制，见 `src/TcpRelaySession.cpp:210-213` 的 TODO 注释）。
+- 未实现（Rust 同样不做）：`best_latency` / `best_stable` / `fast_download_speed` / `fast_upload_speed` 规则（枚举里被注释掉，`src/ConfigRuleEnum.h:22-31`）。
+- 未实现（Rust 同样不做）：上游优先级、（原计划的）trojan 协议客户端。
+- "socks5 UDP 支持"处于勾选状态且带说明"仅 localhost/LAN 可用"，但这与当前代码路径**矛盾**：`FirstPackAnalyzer` 遇到 `CMD != CONNECT` 的 SOCKS5 请求根本不会识别（它只嗅探前 3 字节就透传），所以 UDP ASSOCIATE 是否真的可用需要按模式区分，**列为待确认项**。Rust 版按 ADR-004 明确只支持 CONNECT（BIND/UDP 回 0x07）。
 
 ---
 

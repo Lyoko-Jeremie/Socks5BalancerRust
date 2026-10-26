@@ -90,20 +90,20 @@ C++ 版健康检查的问题（详见 [04](04-control-monitor.md) §3）：
    | `degraded`（数据面报错，待确认） | 只由探测器按"失败后首次延迟"探测一次，成功即回 `up` |
    | `down` | 按退避序列 `initial × multiplier^n`（cap `max`，±`jitter`）探测；成功一次即回 `up`，失败继续退避 |
 
-5. **检查目标可配置**：`healthCheck.target.{host,port,sni,httpPath,userAgent,expectStatus}`。默认不指向第三方——**默认值改为必填/启动校验**（保留 `testRemoteHost/testRemotePort` 兼容，但启动时若为空则拒绝启动并提示）。
+5. **检查目标可配置**：`healthCheck.target.{host,port,sni,httpPath,userAgent,expectStatus}`。默认不指向第三方——**启动校验按实现允许为空**（不配 target 则只做 TCP liveness；旧 `testRemoteHost/testRemotePort` 已映射到 target，见 U4 裁决）。
 6. **各段时间全部可配置**：探测周期、首次延迟、单次探测超时、失败退避、抖动、最大并发探测数（见 §5 配置草案）。
 7. **判定语义与 C++ 对齐**：
    - `liveness`（TCP 建连）与 `readiness`（经上游 SOCKS5 到目标完成一次 TLS+HTTP 往返）分开记录；
    - 后端可用 = `liveness && readiness && !manual_disabled`（沿用 C++ 的"两者都通过才可用"）；
    - **只看能否完成一次 HTTP 往返**，默认不校验状态码（对齐 C++ `ConnectTestHttps` 的判定）；如需严格可用 `expectStatus` 配置。
-8. **单写者**：只有健康探测器任务写健康状态；数据面只上报"本次连接失败"事件（通过 `mpsc`/原子计数），不直接改状态（对齐 04 §14.6 的并发建议，避免 C++ 的数据竞争）。
+8. **单写者（未完全实现）**：实现中健康探测器任务写健康状态，数据面连接失败直接调用 `mark_degraded`（1s 后快速重探确认），未走"只上报事件"的 mpsc 路径；行为等价（及时摘除），但并发写路径比理想方案多一处（原子操作，无数据竞争）。
 9. **全池不可用**：新连接立即拒绝（RST/关闭）并计入 `rejected_total`，**不黑洞**（C++ 会接受连接后永久挂起，见 04 §4.5）。
 10. **`sleepTime` 保留**：最近 `sleepTime` 内无新连接则暂停常规探测（省流量），但 `down` 后端的退避探测继续（否则无法恢复）。
 
 ### 后果
 - 坏后端在**一个探测周期 + 一次连接失败**内被摘除，不再等 5 分钟。
 - `down` 后端探测频率从"每 5 s"降到"30 s 起指数退避"，避免打断自恢复。
-- 探测目标必须配置，启动即校验；不再依赖 `www.google.com` 的可用性。
+- 探测目标可选：配置后做 TLS/HTTP readiness，不配置则只做 TCP liveness；不再依赖 `www.google.com` 的可用性。
 - 配置字段增加，需要保持旧字段兼容（旧字段映射见 §5.2）。
 
 ---
@@ -121,7 +121,7 @@ C++ 版 `threadNum` 只在上限意义上生效：`实际线程 = min(hardware_c
 4. **总线程预算**（写进文档与验收）：`总线程数 = effective_worker + maxBlockingThreads`；默认 4 核机器 = 4 + 2 = 6 线程（栈按 512 KB 计，虚拟内存约 3 MB，RSS 远小）。
 5. 线程栈大小 `threadStackSize`（可选，默认 512 KB）可配置，用于小内存机器。
 6. 控制面与健康检查**不单独开 runtime/线程**，作为普通 task 运行在同一个多线程 runtime 中（简化部署、降低线程数）；需要阻塞的操作用 `spawn_blocking` 并受 `maxBlockingThreads` 约束。
-7. 运行时配置必须支持热重载（仅线程数不热更；改线程数需重启，启动日志打印实际值）。
+7. **运行时配置热重载：M0–M4 不做（U5 裁决）**；仅线程数不热更（改线程数需重启，启动日志打印实际值）。后续如需再实现 `reload_config`。
 
 ### 后果
 - 线程数完全可控，2~4 核机器可精确限制。
@@ -226,7 +226,7 @@ C++ 版 `ConnectTestHttps`（712 行）是"最能证明上游真的能出网"的
 ### 后果
 - 依赖增加 `rustls`/`tokio-rustls`/`rustls-platform-verifier`/`hyper`（体积与编译时间上升），但完全避免自研 TLS/HTTP。
 - 证书校验失败会正确地把后端判为不可用（与 C++ 一致）。
-- 探测目标必须配置（ADR-002 第 5 条），否则启动失败。
+- 探测目标可选（ADR-002 第 5 条按 U4 裁决放宽）：不配 target 时只做 TCP liveness，启动不失败。
 
 ---
 
@@ -248,9 +248,9 @@ C++ 版 `ConnectTestHttps`（712 行）是"最能证明上游真的能出网"的
 | 出站 TLS | `rustls`、`tokio-rustls`、`rustls-platform-verifier` | 健康探测的 TLS | 见 ADR-006 |
 | HTTP 客户端（探测） | `hyper`（client http1 handshake） | 发送探测请求、读响应 | 不引入 `reqwest`（其 connector 定制成本高） |
 | SOCKS5 上游客户端 | `tokio-socks` | 上游握手（含用户名密码认证）、返回已建连 `TcpStream` | **需验证**：自定义 resolver/超时/`slowImpl` 兼容；若不满足则退回"A 类例外"自研 |
-| DNS | `hickory-resolver`（或启动期 `tokio::net::lookup_host` + 自管 TTL 表） | 上游域名解析、TTL 缓存、健康探测目标解析 | 推荐 hickory（成熟、支持 TTL/并发） |
+| DNS | `tokio::net::lookup_host` + 自管刷新（`dnsTtl`） | 上游域名解析、按 TTL 原地刷新；IP 字面量跳过 | 未引入 hickory-resolver（依赖与复杂度权衡；`dnsTtl` 默认不启用） |
 | 分配器 | `mimalloc`（`libmimalloc-sys`/`mimalloc` crate） | 全局分配器 | 降低多线程竞争与碎片 |
-| 锁/快照 | `parking_lot`、`arc-swap` | 非热路径锁、配置与统计快照 | 热路径仍用原子 |
+| 锁/快照 | `std::sync::Mutex`（非热路径） | 选择器状态、hint 表、上游地址刷新 | 热路径仍用原子；未引入 parking_lot/arc-swap |
 | 随机/抖动 | `fastrand` | 探测错峰、退避抖动 | 线程本地，无全局锁 |
 | CLI | `clap`（derive） | `-c/--config`、`--help`、`--version` | 与 C++ 参数兼容 |
 | 错误 | `thiserror`（边界）、手写 `enum`（热路径） | 错误类型 | 热路径不分配 |
@@ -307,7 +307,7 @@ C++ 版 `ConnectTestHttps`（712 行）是"最能证明上游真的能出网"的
     "tcp":     { "period": 5000,  "timeout": 2000,  "startDelay": 1000 },
     "connect": { "period": 300000,"timeout": 11000, "startDelay": 1000 },
     "target": {
-      "host": "www.google.com",   // 必填（空则启动失败）
+      "host": "www.google.com",   // 可选：不配 target 则只做 TCP liveness
       "port": 443,
       "sni": "",                  // 空=用 host
       "httpPath": "/",            // C++ 为 "\"（笔误），Rust 修正
@@ -378,7 +378,7 @@ C++ 版 `ConnectTestHttps`（712 行）是"最能证明上游真的能出网"的
 
 | # | 事项 | 默认取值 | 影响 |
 |---|---|---|---|
-| U4 | 健康探测 `target.host` 是否允许为空（只做 TCP 探活） | **不允许为空**（启动校验失败） | 部署便利性 |
+| U4 | 健康探测 `target.host` 是否允许为空（只做 TCP 探活） | **实现取"允许为空"**：不配 target 则只做 TCP（ADR-002 #5 的"必填"未强制执行，部署便利性优先；若需强制可后续加校验开关） | 部署便利性 |
 | U5 | 是否需要 `reload_config` 热重载 | **M0–M4 不做**，后续按需 | 可控性 vs 复杂度 |
 | U6 | 是否保留 SOCKS4/4a | **保留**（ADR-004 只约束 SOCKS5 方法） | 兼容性 |
 

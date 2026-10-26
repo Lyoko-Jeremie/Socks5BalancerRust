@@ -250,7 +250,7 @@ D -- OFF --> F[不生成，沿用仓库内已有的 CMakeParams.h]
 - 它**确实由 CMake 定义**（`CMakeLists.txt:124-144` 控制源文件清单、`:289-292` 控制宏），不是死代码。
 - 但**默认 OFF**，官方 CI 会构建 `Normal`（OFF）、`ProxyHandshakeAuth`（ON）、`MINI_BUILD_MODE` 三种产物（`.github/workflows/cmake-multi-platform.yml:46-51`），文件名区分见 `README.md:502-505`。
 - 代码里 `#ifdef Need_ProxyHandshakeAuth` 共 4 处（`src/log/Log.cpp:213`、`src/TcpRelaySession.cpp:259`、`src/TcpRelaySession.h:39`、`:87`），作用点集中，**不影响数据面路径的其它逻辑**。
-- 结论：这是一个**编译期二选一的协议栈实现**，而非"手工开启的隐藏开关"。Rust 首版建议**不实现 Auth 模式**（约 2 700 行），把 `AuthClientInfo` 保留为配置兼容字段即可。
+- 结论：这是一个**编译期二选一的协议栈实现**，而非"手工开启的隐藏开关"。Rust 版**合并为一条路径**：入站认证（SOCKS5 0x02 / SOCKS4 USERID / HTTP Basic）始终可用，由 `authClientInfo` 是否为空决定是否启用（ADR-004），不再保留 C++ 的编译期分支。
 
 ---
 
@@ -537,7 +537,7 @@ services:
 | 内嵌（EmbedWebServer） | 二进制自己提供静态文件 + `/backend` | `EmbedWebServerConfig.enable=true`，`root_path="./html/"` |
 | 外部（Nginx/静态托管） | 只需把 `html/` 丢给任意静态服务器，并把 `/backend` 反代/伪造为一行 JSON | `README.md:334-357` 给出 nginx 配置样例 |
 
-Rust 迁移建议：**不要重启静态文件服务**。前端产物就是 5 个 JS + 4 个 HTML，直接复用现有 `html/` 目录；Rust 侧只需实现 2 个 HTTP 端点（`/` 状态 JSON、`/op` 控制）即可，`/backend` 可由 Nginx 承担（甚至可以让 Rust 也返回那行 JSON，代码量 <30 行）。
+Rust 迁移建议（已按 ADR-001/U2 落地）：**不移植静态文件服务与旧前端**。控制面只有 4 个 `/api/v1/*` 端点（`/healthz`、`/status`、`/upstreams`、`/control`），不实现 `/` 与 `/op` 兼容层；需要页面时另写极简静态页或由 Nginx 承担。
 
 ### 6.7 Systemd 部署（README 提供，`README.md:213-231`）
 
@@ -687,7 +687,7 @@ Rust 迁移建议：**不要重启静态文件服务**。前端产物就是 5 �
 | Linux | `net.ipv4.tcp_wmem` | `4096 16384 4194304` | 同上 |
 | Linux | 每 fd 内核结构 | ≈ 1 KB（socket + epoll 节点，**估算**） | 20 000 fd（双向）→ 约 20 MB 内核内存 |
 
-**结论**：`100 MB` 这类预算只能约束**用户态堆**；内核 socket 缓冲是"按需增长"的，若连接真的在传数据，10 000 并发 × 双向的窗口内存会远超 100 MB。所以指标口径必须写明："100 MB = 进程常驻内存（RSS），不含内核 socket 缓冲；空载/低流量场景"。建议在 Rust 实现里显式把 `SO_RCVBUF`/`SO_SNDBUF` 设为 32~64 KB（避免自动调优把单连接窗口撑到 MB 级），并在文档里声明。
+**结论**：`100 MB` 这类预算只能约束**用户态堆**；内核 socket 缓冲是"按需增长"的，若连接真的在传数据，10 000 并发 × 双向的窗口内存会远超 100 MB。所以指标口径必须写明："100 MB = 进程常驻内存（RSS），不含内核 socket 缓冲；空载/低流量场景"。Rust 实现已提供 `socketRecvBuffer`/`socketSendBuffer` 配置（监听 socket 与 accepted socket 都会设置），部署时显式设为 32~64 KB 可避免自动调优把单连接窗口撑到 MB 级。
 
 ### 8.6 C++ 实现的浪费点清单
 
@@ -840,7 +840,7 @@ sequenceDiagram
 | 出站 TLS（健康探测） | `rustls`、`tokio-rustls`、`rustls-platform-verifier`（备选 `rustls-native-certs`） | 按 ADR-006：强制证书校验（不可关闭）、SNI、系统信任库；**不手写 TLS** |
 | HTTP 客户端（探测） | `hyper`（client http1 handshake） | 发探测请求、读响应；**不引入 `reqwest`**（connector 定制成本高） |
 | SOCKS5 上游客户端 | `tokio-socks` | 上游握手（含用户名密码认证）并返回已建连 `TcpStream`；**需验证**自定义 resolver/超时/`slowImpl` 兼容，不满足则升格为自研例外并登记 |
-| DNS | `hickory-resolver`（备选启动期 `tokio::net::lookup_host` + 自管 TTL 表） | 上游域名解析 + TTL 缓存，替代 C++ 的每连接 `async_resolve`；探测目标解析共用 |
+| DNS | 启动期 `tokio::net::lookup_host` + 自管刷新（`dnsTtl`） | 上游域名解析 + 周期刷新，替代 C++ 的每连接 `async_resolve`；探测目标解析共用 |
 | 分配器 | `mimalloc`（备选 Linux `tikv-jemallocator`） | 全局分配器；每连接 KB 级分配在多线程下会争 `malloc` 锁，mimalloc 在 Windows 上最稳 |
 | 锁/快照 | `parking_lot`、`arc-swap` | 非热路径锁、配置与统计快照；**热路径仍用原子**（分片 `AtomicU64`） |
 | 随机/抖动 | `fastrand` | 探测错峰、退避抖动（ADR-002 的 `probeJitter`/`downBackoff.jitter`） |
@@ -922,7 +922,7 @@ debug_assert!([2048usize, 4096, 8192].contains(&buffer_size));
 | `bufferSize` | **配置项**，默认 8192；100 MB 达标压测设 **2048**（4096 为中间档） | ADR-005 方案 B：2K→≈77 MB、4K→≈117 MB |
 | 连接上限 | 显式 `Semaphore`/计数器；8K 缓冲下 100 MB ≈4,400–4,700 连接 | ADR-005；防止慢速攻击把内存打爆 |
 | accept 策略 | Linux：`SO_REUSEPORT` + 每 worker 一个 listener；Windows：单 listener + 多个并发 accept future | 打破 C++ 的单投递串行链（`src/TcpRelayServer.cpp:66-105`） |
-| DNS | `hickory-resolver` 自带 TTL 缓存；上游 IP 固定时直接 `IpAddr` 跳过解析 | ADR-007；对齐 §9.4 的第一瓶颈 |
+| DNS | 启动期解析 + `dnsTtl` 周期刷新（IP 字面量跳过） | ADR-007；对齐 §9.4 的第一瓶颈 |
 | 计时器 | 合并为 1 个 `tokio::time::interval` 驱动健康检查 tick（`healthCheck.*` 周期） | ADR-002；减少 timer 数量与唤醒次数 |
 | 日志 | `tracing_subscriber` + `non_blocking`，默认 `info`，禁止 per-connection trace | ADR-007；stats 每分钟一条摘要即可 |
 
@@ -970,7 +970,7 @@ debug_assert!([2048usize, 4096, 8192].contains(&buffer_size));
 | 优先级 | 事项 | 理由 |
 | --- | --- | --- |
 | P0 | 定死每连接内存口径：**8K×2 会话建立时预分配（ADR-005）≈17.5–18 KB/连接** + 元数据 ≤1.5 KB；`bufferSize` 常量化（方案 B） | 内存指标的唯一杠杆；100 MB 需 2K/4K 或限制连接数 |
-| P0 | 上游解析结果缓存（启动解析 + TTL 刷新，`hickory-resolver`） | 1000 conn/s 的第一瓶颈 |
+| P0 | 上游解析结果缓存（启动解析 + `dnsTtl` 周期刷新） | 1000 conn/s 的第一瓶颈（已实现） |
 | P0 | 日志默认 `info`、异步写入、禁止 per-connection trace | 第二瓶颈 |
 | P0 | **健康检查 fail-fast + DOWN 退避（ADR-002）**：单次失败即判不可用、不做重试/去抖；`down` 后端按 `initial × multiplier^n` 退避；数据面 connect 失败立即降级并换后端 | 取代 C++ 的 5 分钟判死与全池高频探测（04 §3） |
 | P1 | 统计改为"聚合计数器 + 读时快照"，不按连接存容器 | 省 1.9 KB/连接 + 去锁内分配 |
