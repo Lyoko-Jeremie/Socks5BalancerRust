@@ -264,6 +264,9 @@ pub struct TlsProbeConfig {
 /// 健康检查有效配置（M1.4：TCP 探活；M1.5：+ TLS/HTTP readiness）。
 #[derive(Debug, Clone)]
 pub struct HealthConfig {
+    /// 是否启用健康检查。`disableConnectTest=true` 时为 false：不探测、数据面失败也不降级，
+    /// 完全按人工启停（C++ `disableConnectTest` 语义）。
+    pub enabled: bool,
     /// 探活周期。
     pub period: Duration,
     /// 单次 TCP 探活超时。
@@ -1034,6 +1037,23 @@ fn build_health_config(
     const DEFAULT_TLS_PERIOD_MS: u64 = 300_000;
     const DEFAULT_TLS_TIMEOUT_MS: u64 = 11_000;
 
+    // C++ 语义（docs/03 §7.5、docs/07 ADR-002 #5）：`disableConnectTest=true` 表示
+    // 完全跳过健康检查——不探测、数据面失败也不降级，完全按人工启停。
+    if disable_connect_test {
+        return Ok(HealthConfig {
+            enabled: false,
+            period: Duration::from_millis(DEFAULT_PERIOD_MS),
+            timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
+            start_delay: Duration::from_millis(DEFAULT_START_DELAY_MS),
+            backoff_initial: Duration::from_millis(DEFAULT_BACKOFF_INITIAL_MS),
+            backoff_multiplier: DEFAULT_MULTIPLIER,
+            backoff_max: Duration::from_millis(DEFAULT_BACKOFF_MAX_MS),
+            probe_jitter: DEFAULT_JITTER,
+            backoff_jitter: DEFAULT_JITTER,
+            tls: None,
+        });
+    }
+
     // fail-fast 是 ADR-002 的既定策略，不接受关闭
     if raw.fail_fast == Some(false) {
         return Err(err(
@@ -1145,6 +1165,7 @@ fn build_health_config(
     };
 
     Ok(HealthConfig {
+        enabled: true,
         period: Duration::from_millis(period_ms),
         timeout: Duration::from_millis(timeout_ms),
         start_delay: Duration::from_millis(start_delay_ms),
@@ -1431,6 +1452,10 @@ mod tests {
         }"#;
         let c = load_str(text).unwrap();
         assert!(c.health.tls.is_none());
+        assert!(
+            !c.health.enabled,
+            "disableConnectTest=true 应完全禁用健康检查"
+        );
 
         // 未配置 healthCheck → 只做 TCP
         let c = load_str(minimal()).unwrap();

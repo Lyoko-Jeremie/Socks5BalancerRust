@@ -156,22 +156,28 @@ async fn run(cfg: config::Config, workers: usize) -> Result<(), Box<dyn std::err
         probe_jitter = health.cfg().probe_jitter,
         "健康检查已启用：TCP 探活 + fail-fast + DOWN 指数退避"
     );
-    match &cfg.health.tls {
-        Some(tls) => info!(
-            host = %tls.host,
-            port = tls.port,
-            sni = %tls.sni,
-            http_path = %tls.http_path,
-            period_ms = tls.period.as_millis() as u64,
-            timeout_ms = tls.timeout.as_millis() as u64,
-            max_concurrency = tls.max_concurrency,
-            "TLS/HTTP readiness 探测已启用（ADR-006）"
-        ),
-        None => info!("未配置 healthCheck.target：仅做 TCP liveness 探测"),
+    if cfg.health.enabled {
+        match &cfg.health.tls {
+            Some(tls) => info!(
+                host = %tls.host,
+                port = tls.port,
+                sni = %tls.sni,
+                http_path = %tls.http_path,
+                period_ms = tls.period.as_millis() as u64,
+                timeout_ms = tls.timeout.as_millis() as u64,
+                max_concurrency = tls.max_concurrency,
+                "TLS/HTTP readiness 探测已启用（ADR-006）"
+            ),
+            None => info!("未配置 healthCheck.target：仅做 TCP liveness 探测"),
+        }
+    } else {
+        info!("健康检查已禁用（disableConnectTest=true）：不探测、数据面失败不降级，仅按人工启停");
     }
     let stats = stats::Stats::new();
     let cancel = CancellationToken::new();
-    health.spawn_probes(cancel.clone());
+    if cfg.health.enabled {
+        health.spawn_probes(cancel.clone());
+    }
     let ctx = app::AppCtx::new(
         Arc::clone(&cfg),
         selector,

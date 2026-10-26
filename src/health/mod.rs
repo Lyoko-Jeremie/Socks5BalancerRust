@@ -130,6 +130,11 @@ impl HealthRegistry {
         &self.cfg
     }
 
+    /// 健康检查是否启用（`disableConnectTest=true` 时为 false）。
+    pub fn enabled(&self) -> bool {
+        self.cfg.enabled
+    }
+
     /// 上游当前是否可用 = liveness && readiness（供选择器回调使用）。
     pub fn is_available(&self, idx: usize) -> bool {
         self.entries
@@ -167,8 +172,12 @@ impl HealthRegistry {
 
     /// 立即安排一次探测（M3 控制面 `check_upstream`）：只探测一次、不重试。
     ///
-    /// 通过 `Notify` 唤醒正在等待下次探测的探测任务；返回 false 表示下标越界。
+    /// 通过 `Notify` 唤醒正在等待下次探测的探测任务；返回 false 表示下标越界
+    /// 或健康检查已被 `disableConnectTest` 禁用。
     pub fn probe_now(&self, idx: usize) -> bool {
+        if !self.cfg.enabled {
+            return false;
+        }
         let Some(entry) = self.entries.get(idx) else {
             return false;
         };
@@ -184,7 +193,13 @@ impl HealthRegistry {
     }
 
     /// 数据面失败：立即标记不可用并安排 1s 后快速重探。
+    ///
+    /// 健康检查被禁用（`disableConnectTest=true`）时不做任何标记：
+    /// 此时上游可用性完全由人工启停决定，避免"失败后再无探测恢复"的永久 DOWN。
     pub fn mark_degraded(&self, idx: usize, reason: &str) {
+        if !self.cfg.enabled {
+            return;
+        }
         let Some(entry) = self.entries.get(idx) else {
             return;
         };
@@ -340,6 +355,10 @@ impl HealthRegistry {
 
     /// 为每个上游启动探测任务（随 `cancel` 退出）。
     pub fn spawn_probes(self: &Arc<Self>, cancel: CancellationToken) {
+        if !self.cfg.enabled {
+            info!("健康检查已禁用（disableConnectTest=true）：不启动探测任务");
+            return;
+        }
         for idx in 0..self.entries.len() {
             self.spawn_tcp_probe(idx, cancel.clone());
             if self.cfg.tls.is_some() {
@@ -483,6 +502,7 @@ mod tests {
 
     fn cfg() -> HealthConfig {
         HealthConfig {
+            enabled: true,
             period: Duration::from_millis(50),
             timeout: Duration::from_millis(20),
             start_delay: Duration::from_millis(0),
@@ -513,6 +533,20 @@ mod tests {
         let reg = HealthRegistry::new(&[upstream("a", 1)], cfg());
         assert!(reg.is_available(0));
         assert_eq!(reg.available_count(), 1);
+    }
+
+    #[test]
+    fn 禁用健康检查时不标记降级() {
+        let mut c = cfg();
+        c.enabled = false;
+        let reg = HealthRegistry::new(&[upstream("a", 1)], c);
+        assert!(!reg.enabled());
+        assert!(!reg.probe_now(0), "禁用时不应安排探测");
+        reg.mark_degraded(0, "测试");
+        assert!(
+            reg.is_available(0),
+            "禁用健康检查时数据面失败不应标记降级"
+        );
     }
 
     #[test]

@@ -148,23 +148,32 @@ async fn control(
 /// - `set_rule`：切换选路规则（`args.rule`）。
 fn execute(ctx: &Arc<AppCtx>, cmd: &str, args: &Value) -> (bool, String) {
     match cmd {
-        "check_upstream" => match resolve_index(ctx, args) {
-            Ok(None) => {
-                let total = ctx.health.len();
-                for i in 0..total {
-                    ctx.health.probe_now(i);
+        "check_upstream" => {
+            if !ctx.health.enabled() {
+                (
+                    false,
+                    "健康检查已禁用（disableConnectTest=true）".to_string(),
+                )
+            } else {
+                match resolve_index(ctx, args) {
+                    Ok(None) => {
+                        let total = ctx.health.len();
+                        for i in 0..total {
+                            ctx.health.probe_now(i);
+                        }
+                        (true, format!("已安排 {total} 个上游立即探测"))
+                    }
+                    Ok(Some(i)) => {
+                        if ctx.health.probe_now(i) {
+                            (true, format!("已安排上游 {i} 立即探测"))
+                        } else {
+                            (false, format!("index 越界: {i}"))
+                        }
+                    }
+                    Err(e) => (false, e),
                 }
-                (true, format!("已安排 {total} 个上游立即探测"))
             }
-            Ok(Some(i)) => {
-                if ctx.health.probe_now(i) {
-                    (true, format!("已安排上游 {i} 立即探测"))
-                } else {
-                    (false, format!("index 越界: {i}"))
-                }
-            }
-            Err(e) => (false, e),
-        },
+        }
         "enable_upstream" | "disable_upstream" => {
             let enable = cmd == "enable_upstream";
             match resolve_index(ctx, args) {
