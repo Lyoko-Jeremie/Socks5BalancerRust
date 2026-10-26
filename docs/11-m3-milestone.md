@@ -127,6 +127,7 @@
 3. **RTT 已提供**：`upstreams.rttMs` 是最近一次探测的耗时（TCP 连接 / HTTP 往返）；暂无延迟直方图与按客户端延迟采样。
 4. **状态非快照缓存**：`/status` 每次实时聚合（读原子 + 构造 JSON）；10K 连接下开销可忽略，M4 压测时验证。
 5. **控制面与主服务共享 runtime**：慢请求会占用一个 worker 任务（每连接 10s 超时兜底）。
+6. **`check_upstream` 的边界**：`disableConnectTest=true` 时健康检查被禁用，该命令返回 `ok:false` 并说明原因；健康检查启用但探测任务已退出时无效果（正常生命周期内不会发生）。
 
 ---
 
@@ -148,9 +149,10 @@ curl -X POST -H "Content-Type: application/json" -d '{"cmd":"set_rule","args":{"
 
 ---
 
-## 7. 下一步
+## 7. 下一步（M3 之后）
 
-1. **C10K / 1K 建连压测**（Linux 优先）：连接数上限、RSS、握手 CPU、`bufferSize` 对比、控制面开销。
-2. **M4：性能调优与 24h 长稳**（延迟采样/RTT、keep-alive 逐请求改写评估、`close_all` 是否需要）。
-3. **M5：交付**（Dockerfile/systemd/迁移说明）。
-4. **Linux CI**：双平台构建/单测/冒烟脚本（bash 版）。
+M3 之后的 M4/M5 与后续补丁已完成，剩余项如下：
+
+- ✅ 已补齐：RTT（`/api/v1/upstreams.rttMs`）、DNS TTL（`dnsTtl`）、per-core listener、hint 粘性、retryTimes 失败切换、SOCKS4/HTTP 入站认证、`sleepTime`/`additionCheckPeriod`、CI workflow、fuzz harness、SOCKS5 专项压测客户端。
+- ⏳ 待执行（需 Linux 环境）：C10K / 1K/s、24h 长稳、2 核与吞吐验收、与 C++ 的字节级对比。
+- ❌ 不做（已登记）：`close_conn` / `close_all`（无连接表）、`reload_config`（U5）、HTTP keep-alive 逐请求改写、`slowImpl`。
