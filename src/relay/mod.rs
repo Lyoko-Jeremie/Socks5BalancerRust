@@ -198,8 +198,12 @@ async fn socks4_tunnel(
         debug!(%peer, "SOCKS4 已禁用（disableSocks4=true）");
         return None;
     }
-    let target =
-        match tokio::time::timeout(ctx.cfg.handshake_timeout, socks4::negotiate(stream)).await {
+    let target = match tokio::time::timeout(
+        ctx.cfg.handshake_timeout,
+        socks4::negotiate(stream, &ctx.cfg.auth),
+    )
+    .await
+    {
             Ok(Ok(target)) => target,
             Ok(Err(e)) => {
                 ctx.stats.handshake_failed.fetch_add(1, Ordering::Relaxed);
@@ -247,6 +251,15 @@ async fn http_tunnel(
             return None;
         }
     };
+
+    // 入站 HTTP 认证（对齐 C++ 增强模式）：配置了 authClientInfo 时校验 Basic 凭据。
+    // 失败一次性回 407 并关闭，避免 C++ 的 407 后紧循环问题。
+    if !ctx.cfg.auth.is_empty() && !http::check_proxy_auth(&buf[..head_len], &ctx.cfg.auth) {
+        ctx.stats.handshake_failed.fetch_add(1, Ordering::Relaxed);
+        let _ = http::write_proxy_auth_required(stream).await;
+        debug!(%peer, "HTTP 代理认证失败，已回 407 并关闭");
+        return None;
+    }
 
     let kind = match http::parse(&buf[..head_len]) {
         Ok(kind) => kind,

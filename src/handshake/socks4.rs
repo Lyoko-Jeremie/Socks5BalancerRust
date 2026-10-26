@@ -13,18 +13,23 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::config::AuthUser;
 use crate::handshake::TargetAddr;
 
 pub const VERSION: u8 = 0x04;
 pub const CMD_CONNECT: u8 = 0x01;
 pub const REP_GRANTED: u8 = 0x5A;
 pub const REP_REJECTED: u8 = 0x5B;
+/// USERID 认证失败（C++ 增强模式：`00 5C ...`）。
+pub const REP_AUTH_FAILED: u8 = 0x5C;
 
 /// USERID / 域名的最大长度（防滥用）。
 const MAX_FIELD: usize = 1024;
 
 /// 读取 SOCKS4/4a 请求，返回 CONNECT 目标。
-pub async fn negotiate<S>(stream: &mut S) -> Result<TargetAddr, Error>
+///
+/// `auth` 非空时按 C++ 增强模式校验 USERID（SOCKS4 无密码，只校验用户名）。
+pub async fn negotiate<S>(stream: &mut S, auth: &[AuthUser]) -> Result<TargetAddr, Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -37,8 +42,16 @@ where
     let port = u16::from_be_bytes([head[2], head[3]]);
     let ip = Ipv4Addr::new(head[4], head[5], head[6], head[7]);
 
-    // USERID（丢弃）
-    read_cstr(stream).await?;
+    // USERID：C++ 增强模式用它当用户名做认证（只校验用户名，不校验密码）
+    let userid = read_cstr(stream).await?;
+    if !auth.is_empty() {
+        let user = String::from_utf8_lossy(&userid);
+        let ok = !user.is_empty() && auth.iter().any(|a| a.user == user);
+        if !ok {
+            write_reply_code(stream, REP_AUTH_FAILED).await?;
+            return Err(Error::AuthFailed);
+        }
+    }
 
     if cmd != CMD_CONNECT {
         write_reply(stream, false).await?;
@@ -73,6 +86,14 @@ where
 /// 写 SOCKS4 应答（8 字节）。
 pub async fn write_reply<S: AsyncWrite + Unpin>(stream: &mut S, granted: bool) -> io::Result<()> {
     let rep = if granted { REP_GRANTED } else { REP_REJECTED };
+    write_reply_code(stream, rep).await
+}
+
+/// 写指定 CD 的 SOCKS4 应答（8 字节）；`0x5C` 用于 USERID 认证失败。
+pub async fn write_reply_code<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    rep: u8,
+) -> io::Result<()> {
     stream
         .write_all(&[0x00, rep, 0x00, 0x00, 0, 0, 0, 0])
         .await?;
@@ -109,6 +130,8 @@ pub enum Error {
     UnsupportedCommand(u8),
     #[error("请求非法: {0}")]
     BadRequest(&'static str),
+    #[error("USERID 认证失败")]
+    AuthFailed,
 }
 
 #[cfg(test)]
@@ -117,8 +140,16 @@ mod tests {
     use tokio::io::duplex;
 
     async fn run_session(payload: Vec<u8>) -> (Result<TargetAddr, Error>, Vec<u8>) {
+        run_session_auth(payload, &[]).await
+    }
+
+    async fn run_session_auth(
+        payload: Vec<u8>,
+        auth: &[AuthUser],
+    ) -> (Result<TargetAddr, Error>, Vec<u8>) {
         let (mut client, mut server) = duplex(4096);
-        let handle = tokio::spawn(async move { negotiate(&mut server).await });
+        let auth = auth.to_vec();
+        let handle = tokio::spawn(async move { negotiate(&mut server, &auth).await });
         {
             use tokio::io::AsyncWriteExt;
             client.write_all(&payload).await.unwrap();
@@ -188,5 +219,32 @@ mod tests {
         let mut buf = [0u8; 8];
         c.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, [0x00, 0x5A, 0x00, 0x00, 0, 0, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn userid_认证只校验用户名() {
+        let auth = vec![AuthUser {
+            user: "u".into(),
+            pwd: "ignored".into(),
+        }];
+        // USERID 匹配 → 通过
+        let mut p = vec![0x04, 0x01, 0x17, 0xD4, 127, 0, 0, 1];
+        p.extend_from_slice(b"u\0");
+        let (target, _) = run_session_auth(p, &auth).await;
+        assert!(target.is_ok());
+
+        // USERID 不匹配 → 5C
+        let mut p = vec![0x04, 0x01, 0x17, 0xD4, 127, 0, 0, 1];
+        p.extend_from_slice(b"x\0");
+        let (target, reply) = run_session_auth(p, &auth).await;
+        assert!(matches!(target, Err(Error::AuthFailed)));
+        assert_eq!(reply, vec![0x00, 0x5C, 0x00, 0x00, 0, 0, 0, 0]);
+
+        // USERID 为空 → 5C
+        let mut p = vec![0x04, 0x01, 0x17, 0xD4, 127, 0, 0, 1];
+        p.extend_from_slice(b"\0");
+        let (target, reply) = run_session_auth(p, &auth).await;
+        assert!(matches!(target, Err(Error::AuthFailed)));
+        assert_eq!(reply[1], 0x5C);
     }
 }

@@ -13,8 +13,9 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::config::AuthUser;
 use crate::handshake::TargetAddr;
 
 /// HTTP 请求头最大字节数（防慢速/超大头部攻击）。
@@ -97,6 +98,99 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
         }
     }
     None
+}
+
+/// 入站 HTTP 代理认证（对齐 C++ 增强模式）：校验 `Proxy-Authorization` / `Authorization` 的 Basic 凭据。
+///
+/// `auth` 为空表示不需要认证。返回 `false` 时调用方应回 407 + `Proxy-Authenticate` 并关闭连接。
+pub fn check_proxy_auth(head: &[u8], auth: &[AuthUser]) -> bool {
+    if auth.is_empty() {
+        return true;
+    }
+    let Some((user, pwd)) = proxy_basic_credentials(head) else {
+        return false;
+    };
+    auth.iter().any(|a| a.user == user && a.pwd == pwd)
+}
+
+/// 从请求头中提取 Basic 凭据；优先 `Proxy-Authorization`，其次 `Authorization`。
+fn proxy_basic_credentials(head: &[u8]) -> Option<(String, String)> {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut req = httparse::Request::new(&mut headers);
+    req.parse(head).ok()?;
+    let mut plain = None;
+    for h in req.headers.iter() {
+        if h.name.eq_ignore_ascii_case("proxy-authorization") {
+            // Proxy-Authorization 优先；解析失败时仍允许回落到 Authorization
+            if let Some(v) = parse_basic(h.value) {
+                return Some(v);
+            }
+        } else if h.name.eq_ignore_ascii_case("authorization") {
+            plain = parse_basic(h.value);
+        }
+    }
+    plain
+}
+
+/// 解析 `Basic <base64>`（scheme 大小写不敏感，对齐 RFC 与 docs/03 D11）。
+fn parse_basic(value: &[u8]) -> Option<(String, String)> {
+    let text = std::str::from_utf8(value).ok()?.trim();
+    let (scheme, token) = text.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    let decoded = decode_base64(token.trim())?;
+    let text = String::from_utf8(decoded).ok()?;
+    let (user, pwd) = text.split_once(':')?;
+    Some((user.to_string(), pwd.to_string()))
+}
+
+/// RFC 4648 标准 base64 解码（仅用于认证头，输入很小；不引入额外依赖）。
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for &c in input.as_bytes() {
+        if c == b'=' {
+            break;
+        }
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        let v = val(c)?;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1u32 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// 写 `407 Proxy Authentication Required` 响应并关闭连接。
+///
+/// 不做重试循环：C++ 曾在 407 后未消费请求导致单连接紧循环，这里一次性回 407 即关闭。
+pub async fn write_proxy_auth_required<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> io::Result<()> {
+    let body = "HTTP/1.1 407 Proxy Authentication Required\r\n\
+                Proxy-Authenticate: Basic realm=\"Socks5BalancerRust\"\r\n\
+                Content-Length: 0\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(body.as_bytes()).await?;
+    stream.flush().await
 }
 
 /// 解析请求头（`head` 必须恰好是头部，不含 early data）。
@@ -350,6 +444,45 @@ mod tests {
     fn 缺少端口报错() {
         let h = head("CONNECT example.com HTTP/1.1\r\n\r\n");
         assert!(matches!(parse(&h), Err(Error::BadRequest(_))));
+    }
+
+    #[test]
+    fn 代理认证_basic_校验() {
+        let auth = vec![AuthUser {
+            user: "alice".into(),
+            pwd: "secret".into(),
+        }];
+        // base64("alice:secret") = "YWxpY2U6c2VjcmV0"
+        let mut h = Vec::new();
+        h.extend_from_slice(
+            b"GET http://x/ HTTP/1.1\r\nHost: x\r\nProxy-Authorization: Basic YWxpY2U6c2VjcmV0\r\n\r\n",
+        );
+        assert!(check_proxy_auth(&h, &auth), "正确凭据应通过");
+        // scheme 大小写不敏感（docs/03 D11）
+        let mut h = Vec::new();
+        h.extend_from_slice(
+            b"GET http://x/ HTTP/1.1\r\nHost: x\r\nProxy-Authorization: basic YWxpY2U6c2VjcmV0\r\n\r\n",
+        );
+        assert!(check_proxy_auth(&h, &auth), "basic 小写应通过");
+        // 错误凭据
+        let mut h = Vec::new();
+        h.extend_from_slice(
+            b"GET http://x/ HTTP/1.1\r\nHost: x\r\nProxy-Authorization: Basic YWxpY2U6d3Jvbmc=\r\n\r\n",
+        );
+        assert!(!check_proxy_auth(&h, &auth), "错误凭据应拒绝");
+        // 无认证头
+        let mut h = Vec::new();
+        h.extend_from_slice(b"GET http://x/ HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(!check_proxy_auth(&h, &auth), "缺少认证头应拒绝");
+        assert!(check_proxy_auth(&h, &[]), "未配置认证时应通过");
+    }
+
+    #[test]
+    fn base64_解码() {
+        assert_eq!(decode_base64("YWxpY2U6c2VjcmV0").unwrap(), b"alice:secret");
+        assert_eq!(decode_base64("YQ==").unwrap(), b"a");
+        assert_eq!(decode_base64("").unwrap(), b"");
+        assert!(decode_base64("!!").is_none());
     }
 
     #[tokio::test]

@@ -99,6 +99,7 @@ curl -X POST -H "Content-Type: application/json" \
 | `listenHost` / `listenPort` | `127.0.0.1` / `5000` | 代理监听地址与端口 |
 | `multiListen` | `[]` | 额外监听（`[{"host":"...","port":...}]`） |
 | `upstream[]` | — | 上游 SOCKS5：`name`/`host`/`port`/`disable`/`authUser`/`authPwd`（`disable: true` 禁用该上游） |
+| `authClientInfo` | `[]` | 客户端认证列表（`[{user,pwd}]`）；启用后 SOCKS5 走 0x02、SOCKS4 校验 USERID、HTTP 校验 Basic |
 | `upstreamSelectRule` | `random` | `loop` / `random` / `one_by_one` / `change_by_time` / `force_only_one` |
 | `serverChangeTime` | `60000` | `change_by_time` 的切换周期（毫秒） |
 | `dnsTtl` | 未配置 | 上游域名 DNS 刷新周期（毫秒）；不配则沿用启动期解析结果 |

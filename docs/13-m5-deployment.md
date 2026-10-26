@@ -114,6 +114,7 @@ Rust 版**直接兼容** C++ `config.json` 的主要字段（camelCase），包�
 | 控制面 | 十余端点 + 内置前端 | **4 端点**，无前端 | 原有 `/op?xxx`、`/clientInfo` 等调用需改写 |
 | 控制面鉴权 | 无 | 无（同），但响应剔除密码 + 默认回环 | 同 C++ |
 | `slowImpl` | 存在（兼容不标准上游） | **未实现** | 若上游非常规，先验证 |
+| 入站认证 | 仅增强模式支持三协议 | **默认即支持**：SOCKS5 0x02 / SOCKS4 USERID / HTTP Basic（失败回 5C / 407） | 配置 `authClientInfo` 即生效 |
 | 上游 `disable: true` | 该上游不进池 | 保留在池中（`enabled=false`），`/api/v1/upstreams` 可见，可用 `enable_upstream` 启用 | 行为更可控 |
 | 每客户端 hint 粘性 | `hintUpstreamIndex` | 已实现：粘性型规则（`one_by_one`/`change_by_time`）按客户端 IP 复用上次成功上游 | 行为接近 |
 | `embedWebServer` | 内置静态前端 | 不移植（U2） | 前端需独立部署或不用 |
@@ -175,7 +176,7 @@ fs.file-max = 1000000
 1. **控制面无鉴权**（ADR-001）：默认只监听 `127.0.0.1`；绑定非回环时启动日志告警。
    切勿把 `stateServerPort` 暴露到公网。
 2. **上游密码**：控制面响应与日志均不输出密码；但配置文件本身含明文密码 → 建议 `chmod 600`。
-3. **客户端认证**：`authClientInfo` 支持 0x02 用户名密码；不配置则允许 0x00 无认证（与 C++ 同）。
+3. **客户端认证**：`authClientInfo` 同时覆盖 SOCKS5 0x02 用户名密码、SOCKS4 USERID（只校验用户名）、HTTP Basic（`Proxy-Authorization`/`Authorization`）；不配置则三种入站均免认证。
 4. **TLS 探测证书校验不关闭**：默认系统根证书；企业自签用 `healthCheck.target.caFile`。
 5. **systemd 加固**：已启用 `NoNewPrivileges`、`ProtectSystem=strict`、`PrivateTmp` 等。
 
