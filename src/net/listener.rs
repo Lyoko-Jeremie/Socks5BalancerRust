@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
@@ -179,6 +179,22 @@ fn on_accept(
     // 代理转发对延迟敏感：必须关闭 Nagle（C++ 版全仓库没有设置，见 docs/02 §7）。
     if let Err(e) = stream.set_nodelay(true) {
         debug!(%peer, error = %e, "set_nodelay 失败");
+    }
+
+    // socket 缓冲：Linux 上 accepted socket 会继承 listener 设置，Windows 不继承；
+    // 这里在 accepted 连接上显式再设置一次（M0 文档承诺的 M1 遗留项）。
+    if ctx.cfg.socket_recv_buffer > 0 || ctx.cfg.socket_send_buffer > 0 {
+        let sock = SockRef::from(&stream);
+        if ctx.cfg.socket_recv_buffer > 0
+            && let Err(e) = sock.set_recv_buffer_size(ctx.cfg.socket_recv_buffer)
+        {
+            debug!(%peer, error = %e, "accepted socket set_recv_buffer_size 失败");
+        }
+        if ctx.cfg.socket_send_buffer > 0
+            && let Err(e) = sock.set_send_buffer_size(ctx.cfg.socket_send_buffer)
+        {
+            debug!(%peer, error = %e, "accepted socket set_send_buffer_size 失败");
+        }
     }
 
     // 连接数上限：CAS 抢占名额，超限直接丢弃（RST），不进入转发。

@@ -111,6 +111,16 @@ async fn control(
     peer: SocketAddr,
     max_response: usize,
 ) -> Result<Response<Full<Bytes>>, StatusCode> {
+    // 先按 Content-Length 拒绝超大请求体，避免把超大 body 全部 collect 进内存（ADR-001）。
+    if let Some(len) = req
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        && len > MAX_BODY
+    {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
     let body = req
         .into_body()
         .collect()
