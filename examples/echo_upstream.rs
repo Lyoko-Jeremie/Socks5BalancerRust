@@ -5,7 +5,9 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-#[tokio::main(flavor = "current_thread")]
+// 多线程运行时：压测拓扑里 echo 上游会参与高 QPS 回显，单线程会成为整条压测链路的瓶颈
+// （实测单线程约 6K QPS，导致 balancer 的多核能力测不出来）。
+#[tokio::main]
 async fn main() -> std::io::Result<()> {
     let addr = std::env::args()
         .nth(1)

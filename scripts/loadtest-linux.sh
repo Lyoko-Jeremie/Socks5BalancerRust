@@ -39,7 +39,7 @@ CONNS="${CONNS:-10000}"
 HOLD="${HOLD:-60}"
 RATE_CONNS="${RATE_CONNS:-30000}"
 RATE_HOLD="${RATE_HOLD:-10}"
-RATE_INTERVAL_MS="${RATE_INTERVAL_MS:-1}"   # ~1000 次/秒
+RATE="${RATE:-1000}"                        # 目标建连速率（条/秒）；flood 用绝对时间调度保证长期平均精确
 PROTO_QPS="${PROTO_QPS:-1000}"              # 协议口径目标 QPS
 PROTO_DURATION="${PROTO_DURATION:-60}"      # 协议口径持续秒数
 PROTO_CONCURRENCY="${PROTO_CONCURRENCY:-64}" # 协议口径最大在途连接数
@@ -176,16 +176,29 @@ run_c10k() {
 run_rate() {
     local out="$LOGS/linux-rate-$BUFFER_SIZE.txt"
     : >"$out"
-    echo "== 1K/s 建连：$RATE_CONNS 连接 hold=${RATE_HOLD}s interval=${RATE_INTERVAL_MS}ms ==" | tee -a "$out"
+    echo "== 1K/s 建连：$RATE_CONNS 连接 hold=${RATE_HOLD}s rate=${RATE}/s ==" | tee -a "$out"
     local idle
     idle=$(rss_mb "$BAL_PID")
-    "$FLOOD_BIN" 127.0.0.1:"$LISTEN_PORT" "$RATE_CONNS" "$RATE_HOLD" "$RATE_INTERVAL_MS" >"$LOGS/flood-rate.out" 2>&1 &
+    # 第 4 个参数 interval=0、第 5 个参数为目标速率：flood 用绝对时间调度，
+    # 长期平均速率 = RATE（旧版 sleep(1ms) 串行控速实测只有约 469/s，无法验收 1K/s）。
+    "$FLOOD_BIN" 127.0.0.1:"$LISTEN_PORT" "$RATE_CONNS" "$RATE_HOLD" 0 "$RATE" >"$LOGS/flood-rate.out" 2>&1 &
     local flood_pid=$!
     PIDS+=($flood_pid)
-    sample_while "$BAL_PID" "$((RATE_CONNS * RATE_INTERVAL_MS / 1000 + RATE_HOLD))" "$out"
+    sample_while "$BAL_PID" "$((RATE_CONNS / RATE + RATE_HOLD))" "$out"
     wait "$flood_pid" 2>/dev/null || true
     echo "idleRssMB=$idle" | tee -a "$out"
-    echo "flood: $(tail -1 "$LOGS/flood-rate.out")" | tee -a "$out"
+    local line
+    line="$(tail -1 "$LOGS/flood-rate.out" 2>/dev/null || true)"
+    echo "flood: $line" | tee -a "$out"
+    # 统一 key=value 便于 grep 汇总（缺字段显式 NA）
+    local spawn_rate p99
+    spawn_rate="$(printf '%s' "$line" | grep -o 'spawn rate=[0-9.]*' | tr ' ' '_' || true)"
+    p99="$(printf '%s' "$line" | grep -o 'connect_p99_ms=[0-9.]*' || true)"
+    echo "summary ${spawn_rate:-spawn_rate=NA} ${p99:-connect_p99_ms=NA}" | tee -a "$out"
+    if [[ -z "$p99" ]]; then
+        echo "flood 未输出建连延迟汇总行（见 $LOGS/flood-rate.out）" >&2
+        return 1
+    fi
 }
 
 run_proto() {

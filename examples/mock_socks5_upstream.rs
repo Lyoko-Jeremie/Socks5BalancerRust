@@ -12,7 +12,9 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-#[tokio::main(flavor = "current_thread")]
+// 多线程运行时：压测拓扑里 mock 上游要承受高 QPS 的 SOCKS5 握手，单线程会成为整条压测链路
+// 的瓶颈（实测单线程约 6K QPS，导致 balancer 的多核能力测不出来）。
+#[tokio::main]
 async fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let addr = args
