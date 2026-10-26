@@ -1,10 +1,20 @@
-//! 连接处理：SOCKS5 终结转发（M1）与纯 TCP 透传（`traditionTcpRelay`）。
+//! 连接处理：混合端口协议分派（SOCKS5 / SOCKS4 / HTTP）与纯 TCP 透传。
+//!
+//! M2 起同一监听端口按首包分派：
+//! - SOCKS5（0x05）→ 方法协商/CONNECT（M1）；
+//! - SOCKS4/4a（0x04）→ CONNECT（M2）；
+//! - 其它 → HTTP CONNECT / absolute-form 正向代理（M2，`httparse` 解析）。
+//!
+//! 统一模型：各协议先解析出 `Tunnel { target, prefix, reply }`，再走同一条
+//! "选上游 → 连上游 → 上游 SOCKS5 握手 → 回成功应答 → 写前缀 → 双向转发" 流程：
+//! - `prefix` 用于 HTTP 的 early data（CONNECT 粘包）与改写后的请求头；
+//! - `reply` 决定成功/失败应答格式（SOCKS5 REP / SOCKS4 5A-5B / HTTP 200-502）。
 //!
 //! 关键设计（docs/02 §3/§8、docs/07 ADR-005）：
 //! - 双向缓冲在 accept 时一次性预分配，运行期零分配；
 //! - 每方向"单在途 read + 单在途 write"，天然背压；
 //! - 上游 TCP 建连与 SOCKS5 握手都带超时；
-//! - 握手成功后才向客户端写 SOCKS5 成功应答，失败时写错误码（修正 C++ 缺陷 B-4）；
+//! - 成功应答在"上游握手成功之后"才写，失败回具体错误码；
 //! - 全局取消令牌可中断阻塞中的读写，保证优雅关闭。
 
 use std::io;
@@ -19,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
 use crate::app::AppCtx;
-use crate::handshake::{self, socks5};
+use crate::handshake::{self, Protocol, TargetAddr, http, socks4, socks5};
 use crate::stats::{ActiveGuard, Stats};
 use crate::upstream::Upstream;
 
@@ -40,6 +50,25 @@ impl Buffers {
     }
 }
 
+/// 隧道建立成功后的应答方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reply {
+    Socks5,
+    Socks4,
+    HttpConnect,
+    /// absolute-form：不写应答，直接转发改写后的请求
+    None,
+}
+
+/// 协议解析完成、等待建立隧道。
+struct Tunnel {
+    protocol: Protocol,
+    target: TargetAddr,
+    /// 必须先写给目标的前缀字节（HTTP early data / 改写后的请求头）
+    prefix: Vec<u8>,
+    reply: Reply,
+}
+
 /// 处理一条下游连接。
 pub async fn handle_connection(
     ctx: Arc<AppCtx>,
@@ -50,7 +79,6 @@ pub async fn handle_connection(
     guard: ActiveGuard,
 ) {
     if ctx.cfg.tradition_tcp_relay {
-        // 透传模式：先选上游（无可用上游只能关闭连接）
         let Some(upstream_cfg) = ctx.pick_upstream().cloned() else {
             ctx.stats.rejected.fetch_add(1, Ordering::Relaxed);
             debug!(%peer, "无可用上游，关闭连接");
@@ -58,12 +86,11 @@ pub async fn handle_connection(
         };
         handle_tradition(ctx, downstream, upstream_cfg, peer, local, bufs, guard).await;
     } else {
-        // SOCKS5 终结模式：先完成入站协商拿到 target，再选上游（失败可回 SOCKS5 错误码）
-        handle_socks5(ctx, downstream, peer, local, bufs, guard).await;
+        handle_smart(ctx, downstream, peer, local, bufs, guard).await;
     }
 }
 
-/// 纯 TCP 透传：不做任何协议解析，下游字节直接交给上游（`traditionTcpRelay=true`）。
+/// 纯 TCP 透传（`traditionTcpRelay=true`）。
 async fn handle_tradition(
     ctx: Arc<AppCtx>,
     downstream: TcpStream,
@@ -81,8 +108,8 @@ async fn handle_tradition(
     relay_streams(ctx, downstream, upstream, bufs, peer, "tradition").await;
 }
 
-/// SOCKS5 终结转发：解析入站请求 → 以上游客户端身份建立隧道 → 双向转发。
-async fn handle_socks5(
+/// 混合端口协议分派。
+async fn handle_smart(
     ctx: Arc<AppCtx>,
     mut downstream: TcpStream,
     peer: SocketAddr,
@@ -90,7 +117,7 @@ async fn handle_socks5(
     bufs: Buffers,
     _guard: ActiveGuard,
 ) {
-    // 1) 首包探测（防"哑连接"：M0/C++ 的永久泄漏问题在此消除）。
+    // 1) 首包探测（防"哑连接"）
     let mut first = [0u8; 1];
     match tokio::time::timeout(ctx.cfg.first_packet_timeout, downstream.peek(&mut first)).await {
         Ok(Ok(0)) => {
@@ -107,66 +134,193 @@ async fn handle_socks5(
                 .first_packet_timeout
                 .fetch_add(1, Ordering::Relaxed);
             debug!(%peer, timeout_ms = ctx.cfg.first_packet_timeout.as_millis() as u64, "首包超时");
-            // 显式 FIN，避免直接 drop 触发 RST 干扰客户端诊断
             drain_and_close(downstream).await;
             return;
         }
     }
-    if first[0] != socks5::VERSION {
-        ctx.stats.protocol_errors.fetch_add(1, Ordering::Relaxed);
-        debug!(%peer, first_byte = first[0], "M1 仅支持 SOCKS5 入站（SOCKS4/HTTP 将在 M2 实现）");
+    let protocol = handshake::sniff_first_byte(first[0]);
+    trace!(%peer, protocol = protocol.as_str(), "协议分派");
+
+    // 2) 各协议解析出目标 + 前缀 + 应答方式
+    let tunnel = match protocol {
+        Protocol::Socks5 => socks5_tunnel(&ctx, &mut downstream, peer).await,
+        Protocol::Socks4 => socks4_tunnel(&ctx, &mut downstream, peer).await,
+        Protocol::Http => http_tunnel(&ctx, &mut downstream, peer).await,
+    };
+    let Some(tunnel) = tunnel else {
+        // 各 flow 已尽力写错误应答，这里统一优雅关闭
         drain_and_close(downstream).await;
         return;
-    }
+    };
+    trace!(%peer, protocol = tunnel.protocol.as_str(), target = %tunnel.target, "已解析目标");
 
-    // 2) 入站协商（方法选择 / 认证 / CONNECT 解析）
+    // 3) 统一建立隧道并转发
+    establish(ctx, downstream, tunnel, peer, local, bufs).await;
+}
+
+/// SOCKS5：方法协商 + 可选认证 + CONNECT 解析（错误码由 negotiate 尽力写回）。
+async fn socks5_tunnel(
+    ctx: &Arc<AppCtx>,
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+) -> Option<Tunnel> {
     let target = match tokio::time::timeout(
         ctx.cfg.handshake_timeout,
-        socks5::negotiate(&mut downstream, &ctx.cfg.auth),
+        socks5::negotiate(stream, &ctx.cfg.auth),
     )
     .await
     {
         Ok(Ok(target)) => target,
         Ok(Err(e)) => {
-            // negotiate 内部已尽力写回 SOCKS5 错误码
             ctx.stats.handshake_failed.fetch_add(1, Ordering::Relaxed);
             debug!(%peer, error = %e, "入站 SOCKS5 协商失败");
-            drain_and_close(downstream).await;
-            return;
+            return None;
         }
         Err(_) => {
             ctx.stats.handshake_failed.fetch_add(1, Ordering::Relaxed);
-            let _ = socks5::write_error_reply(&mut downstream, socks5::REP_TTL_EXPIRED).await;
+            let _ = socks5::write_error_reply(stream, socks5::REP_TTL_EXPIRED).await;
             debug!(%peer, "入站 SOCKS5 握手超时");
-            drain_and_close(downstream).await;
-            return;
+            return None;
         }
     };
-    trace!(%peer, target = %target, "收到 SOCKS5 CONNECT");
+    Some(Tunnel {
+        protocol: Protocol::Socks5,
+        target,
+        prefix: Vec::new(),
+        reply: Reply::Socks5,
+    })
+}
 
-    // 3) 选择可用上游（全部 DOWN → 明确拒绝，避免黑洞）
+/// SOCKS4/4a：解析 CONNECT 请求（禁用时回 5B）。
+async fn socks4_tunnel(
+    ctx: &Arc<AppCtx>,
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+) -> Option<Tunnel> {
+    if ctx.cfg.disable_socks4 {
+        ctx.stats.protocol_errors.fetch_add(1, Ordering::Relaxed);
+        let _ = socks4::write_reply(stream, false).await;
+        debug!(%peer, "SOCKS4 已禁用（disableSocks4=true）");
+        return None;
+    }
+    let target =
+        match tokio::time::timeout(ctx.cfg.handshake_timeout, socks4::negotiate(stream)).await {
+            Ok(Ok(target)) => target,
+            Ok(Err(e)) => {
+                ctx.stats.handshake_failed.fetch_add(1, Ordering::Relaxed);
+                debug!(%peer, error = %e, "入站 SOCKS4 协商失败");
+                return None;
+            }
+            Err(_) => {
+                ctx.stats.handshake_failed.fetch_add(1, Ordering::Relaxed);
+                let _ = socks4::write_reply(stream, false).await;
+                debug!(%peer, "入站 SOCKS4 握手超时");
+                return None;
+            }
+        };
+    Some(Tunnel {
+        protocol: Protocol::Socks4,
+        target,
+        prefix: Vec::new(),
+        reply: Reply::Socks4,
+    })
+}
+
+/// HTTP：读取请求头 → CONNECT 或 absolute-form。
+async fn http_tunnel(
+    ctx: &Arc<AppCtx>,
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+) -> Option<Tunnel> {
+    let (buf, head_len) = match tokio::time::timeout(
+        ctx.cfg.handshake_timeout,
+        http::read_head(stream, http::MAX_HEAD_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            ctx.stats.protocol_errors.fetch_add(1, Ordering::Relaxed);
+            let _ = http::write_error(stream, 400, "Bad Request").await;
+            debug!(%peer, error = %e, "HTTP 请求头读取失败");
+            return None;
+        }
+        Err(_) => {
+            ctx.stats.protocol_errors.fetch_add(1, Ordering::Relaxed);
+            let _ = http::write_error(stream, 408, "Request Timeout").await;
+            debug!(%peer, "HTTP 请求头读取超时");
+            return None;
+        }
+    };
+
+    let kind = match http::parse(&buf[..head_len]) {
+        Ok(kind) => kind,
+        Err(e) => {
+            ctx.stats.protocol_errors.fetch_add(1, Ordering::Relaxed);
+            let _ = http::write_error(stream, 400, "Bad Request").await;
+            debug!(%peer, error = %e, "HTTP 请求解析失败");
+            return None;
+        }
+    };
+    let early_data = buf[head_len..].to_vec();
+
+    match kind {
+        http::RequestKind::Connect(target) => Some(Tunnel {
+            protocol: Protocol::Http,
+            target,
+            // CONNECT 的请求头丢弃，early data 必须回放给目标（修正 C++ 粘包失败）
+            prefix: early_data,
+            reply: Reply::HttpConnect,
+        }),
+        http::RequestKind::Forward {
+            target,
+            mut rewritten_head,
+            ..
+        } => {
+            // absolute-form：把改写后的请求头 + early data 一起发给目标
+            rewritten_head.extend_from_slice(&early_data);
+            Some(Tunnel {
+                protocol: Protocol::Http,
+                target,
+                prefix: rewritten_head,
+                reply: Reply::None,
+            })
+        }
+    }
+}
+
+/// 建立到目标的隧道（经上游 SOCKS5），成功后写应答与前缀，再双向转发。
+async fn establish(
+    ctx: Arc<AppCtx>,
+    mut downstream: TcpStream,
+    tunnel: Tunnel,
+    peer: SocketAddr,
+    local: SocketAddr,
+    bufs: Buffers,
+) {
+    // 1) 选上游
     let Some(upstream_cfg) = ctx.pick_upstream().cloned() else {
         ctx.stats.rejected.fetch_add(1, Ordering::Relaxed);
-        let _ = socks5::write_error_reply(&mut downstream, socks5::REP_GENERAL_FAILURE).await;
+        let _ = write_failure(&mut downstream, tunnel.reply, socks5::REP_GENERAL_FAILURE).await;
         debug!(
             %peer,
             available = ctx.health.available_count(),
             total = ctx.health.len(),
-            "所有上游不可用，拒绝 CONNECT"
+            "所有上游不可用，拒绝请求"
         );
         drain_and_close(downstream).await;
         return;
     };
-    let up_name = upstream_cfg.name.clone();
 
-    // 4) 连接上游 TCP
+    // 2) 连接上游 TCP（失败时已 mark_degraded）
     let Some(upstream_raw) = connect_upstream(&ctx, &upstream_cfg, peer).await else {
-        let _ = socks5::write_error_reply(&mut downstream, socks5::REP_HOST_UNREACHABLE).await;
+        let _ = write_failure(&mut downstream, tunnel.reply, socks5::REP_HOST_UNREACHABLE).await;
         return;
     };
 
-    // 5) 以上游 SOCKS5 客户端身份握手（含上游认证）；域名交给上游解析（socks5h）
-    let up_target = to_socks_target(&target);
+    // 3) 以上游 SOCKS5 客户端身份握手（含上游认证；域名交给上游解析）
+    let up_target = to_socks_target(&tunnel.target);
+    let up_name = upstream_cfg.name.clone();
     let creds = upstream_cfg
         .auth_user
         .as_deref()
@@ -178,7 +332,7 @@ async fn handle_socks5(
             )
         });
 
-    let handshake = async move {
+    let handshake_fut = async move {
         match creds {
             Some((user, pwd)) => {
                 Socks5Stream::connect_with_password_and_socket(upstream_raw, up_target, &user, &pwd)
@@ -187,19 +341,18 @@ async fn handle_socks5(
             None => Socks5Stream::connect_with_socket(upstream_raw, up_target).await,
         }
     };
-    let upstream = match tokio::time::timeout(ctx.cfg.handshake_timeout, handshake).await {
+    let mut upstream = match tokio::time::timeout(ctx.cfg.handshake_timeout, handshake_fut).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
             ctx.stats
                 .upstream_handshake_failed
                 .fetch_add(1, Ordering::Relaxed);
-            // 只有"上游自身故障"才降级；目标不可达/认证配置错等不应误伤上游
             if is_upstream_fault(&e) {
                 ctx.health
                     .mark_degraded(upstream_cfg.health_index, "上游握手失败");
             }
             let rep = rep_from_upstream_error(&e);
-            let _ = socks5::write_error_reply(&mut downstream, rep).await;
+            let _ = write_failure(&mut downstream, tunnel.reply, rep).await;
             debug!(%peer, upstream = %up_name, error = %e, rep, "上游 SOCKS5 握手失败");
             return;
         }
@@ -209,27 +362,59 @@ async fn handle_socks5(
                 .fetch_add(1, Ordering::Relaxed);
             ctx.health
                 .mark_degraded(upstream_cfg.health_index, "上游握手超时");
-            let _ = socks5::write_error_reply(&mut downstream, socks5::REP_TTL_EXPIRED).await;
+            let _ = write_failure(&mut downstream, tunnel.reply, socks5::REP_TTL_EXPIRED).await;
             debug!(%peer, upstream = %up_name, "上游 SOCKS5 握手超时");
             return;
         }
     };
 
-    // 6) 上游成功后，才回复客户端成功
-    if let Err(e) = socks5::write_success_reply(&mut downstream).await {
-        debug!(%peer, error = %e, "写 SOCKS5 成功应答失败");
+    // 4) 上游成功后，才回复客户端成功
+    let reply_result = match tunnel.reply {
+        Reply::Socks5 => socks5::write_success_reply(&mut downstream).await,
+        Reply::Socks4 => socks4::write_reply(&mut downstream, true).await,
+        Reply::HttpConnect => http::write_connect_ok(&mut downstream).await,
+        Reply::None => Ok(()),
+    };
+    if let Err(e) = reply_result {
+        debug!(%peer, error = %e, "写成功应答失败");
         return;
     }
-    trace!(%peer, %local, upstream = %up_name, target = %target, "隧道建立，开始转发");
 
-    // 7) 双向转发
-    relay_streams(ctx, downstream, upstream, bufs, peer, "socks5").await;
+    // 5) 回放前缀（HTTP early data / 改写后的请求头）
+    if !tunnel.prefix.is_empty()
+        && let Err(e) = upstream.write_all(&tunnel.prefix).await
+    {
+        debug!(%peer, error = %e, "写前缀数据失败");
+        return;
+    }
+
+    trace!(
+        %peer,
+        %local,
+        protocol = tunnel.protocol.as_str(),
+        upstream = %up_name,
+        target = %tunnel.target,
+        "隧道建立，开始转发"
+    );
+
+    // 6) 双向转发
+    relay_streams(ctx, downstream, upstream, bufs, peer, "smart").await;
 }
 
-/// 握手失败后的优雅关闭：先半关闭写端，再短暂丢弃剩余输入。
-///
-/// 目的：避免"带着未读输入直接 drop"触发 RST，导致客户端可能收不到刚刚写回的
-/// SOCKS5 错误码（例如 BIND 请求的地址字段还没读，内核缓冲里仍有数据）。
+/// 按协议写失败应答（SOCKS5 REP / SOCKS4 5B / HTTP 502）。
+async fn write_failure<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    reply: Reply,
+    rep: u8,
+) -> io::Result<()> {
+    match reply {
+        Reply::Socks5 => socks5::write_error_reply(stream, rep).await,
+        Reply::Socks4 => socks4::write_reply(stream, false).await,
+        Reply::HttpConnect | Reply::None => http::write_error(stream, 502, "Bad Gateway").await,
+    }
+}
+
+/// 握手失败后的优雅关闭：先半关闭写端，再短暂丢弃剩余输入，避免 RST 丢错误码。
 async fn drain_and_close(mut stream: TcpStream) {
     let _ = stream.shutdown().await;
     let mut buf = [0u8; 512];
@@ -244,7 +429,7 @@ async fn drain_and_close(mut stream: TcpStream) {
     .await;
 }
 
-/// 连接上游 TCP（带超时），成功后关闭 Nagle。
+/// 连接上游 TCP（带超时），成功后关闭 Nagle；失败时标记上游降级。
 async fn connect_upstream(
     ctx: &Arc<AppCtx>,
     upstream_cfg: &Upstream,
@@ -286,10 +471,10 @@ async fn connect_upstream(
 }
 
 /// 把入站目标地址转成 tokio-socks 的目标地址类型（域名保持域名，交给上游解析）。
-fn to_socks_target(target: &handshake::TargetAddr) -> tokio_socks::TargetAddr<'static> {
+fn to_socks_target(target: &TargetAddr) -> tokio_socks::TargetAddr<'static> {
     match target {
-        handshake::TargetAddr::Ip(addr) => tokio_socks::TargetAddr::Ip(*addr),
-        handshake::TargetAddr::Domain { host, port } => {
+        TargetAddr::Ip(addr) => tokio_socks::TargetAddr::Ip(*addr),
+        TargetAddr::Domain { host, port } => {
             tokio_socks::TargetAddr::Domain(host.clone().into(), *port)
         }
     }
@@ -330,7 +515,7 @@ fn rep_from_upstream_error(e: &tokio_socks::Error) -> u8 {
     }
 }
 
-/// 双向转发（对任意 AsyncRead+AsyncWrite 的流，便于 tradition/SOCKS5 复用）。
+/// 双向转发（对任意 AsyncRead+AsyncWrite 的流）。
 async fn relay_streams<D, U>(
     ctx: Arc<AppCtx>,
     downstream: D,
@@ -365,7 +550,7 @@ async fn relay_streams<D, U>(
         cancel,
     );
 
-    // 任一方向结束（EOF/错误/取消）即关闭整条连接，与 C++ 版行为一致。
+    // 任一方向结束（EOF/错误/取消）即关闭整条连接。
     let (direction, result) = tokio::select! {
         r = up_flow => ("down->up", r),
         r = down_flow => ("up->down", r),
@@ -406,7 +591,6 @@ where
             r = reader.read(&mut buf) => r?,
         };
         if n == 0 {
-            // 正常半关闭：把 FIN 传递给对端后退出。
             let _ = writer.shutdown().await;
             return Ok(());
         }
@@ -443,7 +627,6 @@ mod tests {
     async fn 透传回环正确() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
-        // 两个 duplex 端点分别代表"读来源"和"写目标"，中间跑 pump。
         let (mut source_writer, pump_reader) = duplex(1024);
         let (pump_writer, mut sink_reader) = duplex(1024);
 
@@ -458,17 +641,15 @@ mod tests {
             cancel.clone(),
         ));
 
-        source_writer.write_all(b"hello-m0").await.unwrap();
+        source_writer.write_all(b"hello-m2").await.unwrap();
         let mut out = [0u8; 8];
         sink_reader.read_exact(&mut out).await.unwrap();
-        assert_eq!(&out, b"hello-m0");
+        assert_eq!(&out, b"hello-m2");
         assert_eq!(stats.bytes_down_to_up.load(Ordering::Relaxed), 8);
 
-        // 关闭写端 → pump 读到 EOF → 正常返回 Ok
         drop(source_writer);
         task.await.unwrap().unwrap();
 
-        // 取消令牌可中断阻塞中的读
         let (mut source2, pump_reader2) = duplex(1024);
         let (pump_writer2, _sink2) = duplex(1024);
         let cancel2 = CancellationToken::new();
@@ -508,7 +689,7 @@ mod tests {
 
     #[test]
     fn 目标地址转换保持域名() {
-        let t = handshake::TargetAddr::Domain {
+        let t = TargetAddr::Domain {
             host: "example.com".into(),
             port: 443,
         };
@@ -519,5 +700,34 @@ mod tests {
             }
             other => panic!("应为域名目标，实际 {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn 失败应答格式按协议区分() {
+        use tokio::io::AsyncReadExt;
+        // SOCKS5
+        let (mut c, mut s) = tokio::io::duplex(64);
+        write_failure(&mut s, Reply::Socks5, socks5::REP_CONNECTION_REFUSED)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 10];
+        c.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf[0], 0x05);
+        assert_eq!(buf[1], 0x05);
+
+        // SOCKS4
+        let (mut c, mut s) = tokio::io::duplex(64);
+        write_failure(&mut s, Reply::Socks4, 0).await.unwrap();
+        let mut buf = [0u8; 8];
+        c.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, [0x00, 0x5B, 0, 0, 0, 0, 0, 0]);
+
+        // HTTP
+        let (mut c, mut s) = tokio::io::duplex(128);
+        write_failure(&mut s, Reply::HttpConnect, 0).await.unwrap();
+        let mut chunk = [0u8; 128];
+        let n = c.read(&mut chunk).await.unwrap();
+        let text = String::from_utf8_lossy(&chunk[..n]);
+        assert!(text.starts_with("HTTP/1.1 502"), "实际: {text}");
     }
 }

@@ -8,7 +8,9 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "fastrand",
+ "http",
  "http-body-util",
+ "httparse",
  "hyper",
  "hyper-util",
  "mimalloc",

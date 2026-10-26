@@ -1,0 +1,20 @@
+{
+  "listenHost": "127.0.0.1",
+  "listenPort": 5501,
+  "traditionTcpRelay": false,
+  "bufferSize": 2048,
+  "connectTimeout": 2000,
+  "firstPacketTimeout": 5000,
+  "handshakeTimeout": 5000,
+  "logLevel": "debug",
+  "disableSocks4": true,
+  "upstream": [
+    {
+      "name": "mockAuth",
+      "host": "127.0.0.1",
+      "port": 6200,
+      "authUser": "alice",
+      "authPwd": "secret"
+    }
+  ]
+}
