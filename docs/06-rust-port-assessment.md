@@ -267,7 +267,7 @@ release 默认 info；热点禁止格式化；每连接**不允许**逐包日志
 |---|---|---|
 | **M0 骨架** ✅*（2026-10-26 完成，见 [08-m0-milestone.md](08-m0-milestone.md)）* | 配置（含新字段兼容）、日志、runtime（线程可配）、多监听、纯 TCP 透传 | 实测：空闲 RSS 12.55 MB（32 线程）/ 11.37 MB（2 线程）；500/1000 连接全成功；`workers` 与 `bufferSize` 生效；clippy/fmt/18 单测全绿 |
 | **M1 核心** ✅*（M1.1–M1.5 完成，见 [09-m1-milestone.md](09-m1-milestone.md)）* | SOCKS5 0x00/0x02 方法协商、上游选择 5 规则、TLS/TCP 健康检查（fail-fast+降频）、超时/背压/连接上限 | 协议端到端 10/10、健康检查 6/6、TLS readiness 9/9；单测 53 全绿；10K/1K 压测待做 |
-| **M2 协议完整** | SOCKS4/4a、HTTP CONNECT/forward、上游认证、TLS 探测对齐（ADR-006） | 各协议端到端用例 + 与 C++ 字节级对比 |
+| **M2 协议完整** ✅*（2026-10-26 完成，见 [10-m2-milestone.md](10-m2-milestone.md)）* | SOCKS4/4a、HTTP CONNECT/forward、上游认证、TLS 探测对齐（ADR-006） | 混合协议端到端 9/9（SOCKS5 回归 / SOCKS4-4a / BIND / CONNECT / early data / forward 改写 / 400 / disableSocks4）；单测 69 全绿 |
 | **M3 控制面** | 精简 4 端点、无鉴权、统计快照 | 端点契约测试；响应无密码 |
 | **M4 达标** | 压测调优、内存校准、24h 长稳 | §9.2 全部达标（方案 B 双口径：8K 性能基线 + 2K 内存达标） |
 | **M5 交付** | Dockerfile/systemd/迁移说明 | 可替换原版 |

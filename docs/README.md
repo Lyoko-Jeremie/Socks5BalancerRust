@@ -33,12 +33,13 @@
 | 6 | [06-rust-port-assessment.md](06-rust-port-assessment.md) | **硬指标可行性评估与 Rust 架构映射**：指标口径、内存/CPU 预算模型、crate 选型、模块划分、数据面约束、验收压测方案、里程碑、风险登记表 | ~345 行 |
 | 7 | [07-decisions.md](07-decisions.md) | **架构决策记录（ADR）**：8 条已决策 + 配置草案 + 旧字段兼容映射 + 指标重算 + 裁决记录（U1=方案 B、U2=不复用前端已裁决；U4–U6 待确认）。**与其他文档冲突时以此为准** | ~380 行 |
 | 8 | [08-m0-milestone.md](08-m0-milestone.md) | **M0 里程碑报告**：骨架实现范围、验收结果、实测 RSS/连接数、踩坑与修正、已知限制、如何运行、M1 计划 | ~240 行 |
-| 9 | [09-m1-milestone.md](09-m1-milestone.md) | **M1 里程碑报告**：SOCKS5 0x00/0x02、上游握手、5 条选路规则、健康检查（fail-fast + 退避 + 数据面降级）、验收结果、M1.5 待办 | ~200 行 |
+| 9 | [09-m1-milestone.md](09-m1-milestone.md) | **M1 里程碑报告**：SOCKS5 0x00/0x02、上游握手、5 条选路规则、健康检查（fail-fast + 退避 + 数据面降级）、TLS readiness、验收结果 | ~200 行 |
+| 10 | [10-m2-milestone.md](10-m2-milestone.md) | **M2 里程碑报告**：首包嗅探、SOCKS4/4a、HTTP CONNECT / absolute-form、early data 回放、origin-form 改写、验收结果 | ~180 行 |
 
-阅读顺序建议：**01 → 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09**。
+阅读顺序建议：**01 → 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09 → 10**。
 只想快速决策：读本文 §3/§4/§5；准备动手写代码：读 **07（决策）+ 02 §8 + 06 §7**。
 
-> **当前进度（2026-10-26）**：**M0 骨架 ✅；M1（M1.1–M1.5）全部 ✅**。已实现：SOCKS5 入站 0x00/0x02（RFC1929、CONNECT、错误码回传）、上游 SOCKS5 握手（含上游认证）、5 条选路规则、fail-fast 健康检查（DOWN 指数退避 + 数据面降级 + 快速重探）、**TLS + HTTP readiness 探测（系统根证书 / caFile，hyper）**。端到端验收：协议 10/10、健康检查 6/6、TLS readiness 9/9；单元测试 **53** 个全绿；clippy/fmt 通过。**下一步：C10K/1K 压测（Linux 优先）与 M2（SOCKS4/HTTP）**。详见 [09-m1-milestone.md](09-m1-milestone.md)。
+> **当前进度（2026-10-26）**：**M0 ✅；M1（M1.1–M1.5）✅；M2 ✅**。已实现：SOCKS5 入站 0x00/0x02（RFC1929、CONNECT、错误码回传）、上游 SOCKS5 握手（含上游认证）、5 条选路规则、fail-fast 健康检查（DOWN 指数退避 + 数据面降级 + 快速重探）、TLS + HTTP readiness 探测（系统根证书 / caFile）、**混合端口（同一端口同时服务 SOCKS5 / SOCKS4-4a / HTTP CONNECT / HTTP forward）**。端到端验收：协议 10/10、健康检查 6/6、TLS readiness 9/9、混合协议 9/9；单元测试 **69** 个全绿；clippy/fmt 通过。**下一步：M3 精简控制面，C10K/1K 压测（Linux 优先）**。详见 [10-m2-milestone.md](10-m2-milestone.md)。
 
 > **2026-10-26 修订**：用户已就 7 项关键取舍作出决策（控制面精简不鉴权、健康检查 fail-fast 不重试且异常后端降频、线程数可配置、SOCKS5 仅 0x00/0x02、双向 8K 预分配、TLS 探测对齐 C++、优先成熟库），已固化为 [07-decisions.md](07-decisions.md)，并同步修订 01/02/04/05/06 的"Rust 建议"部分。C++ 现状分析部分不变。
 
