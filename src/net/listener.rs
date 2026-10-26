@@ -235,9 +235,13 @@ fn on_accept(
     // ADR-005：会话建立时一次性预分配双向缓冲（运行期零分配）。
     let bufs = relay::Buffers::alloc(ctx.cfg.buffer_size);
 
+    // 连接监测：注册连接（默认开启明细；guard 在连接结束时自动注销）。
+    // 返回的 token 由 guard 内部持有（全局取消令牌的子令牌），用于按连接中断。
+    let (conn_guard, _conn_token) = ctx.conns.register(peer, local, &ctx.cancel);
+
     let ctx = Arc::clone(ctx);
     tasks.spawn(async move {
-        relay::handle_connection(ctx, stream, peer, local, bufs, guard).await;
+        relay::handle_connection(ctx, stream, peer, local, bufs, guard, conn_guard).await;
     });
 }
 

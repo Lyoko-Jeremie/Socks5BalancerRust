@@ -440,7 +440,15 @@ mod tests {
         ));
         let health = HealthRegistry::new(&upstreams, cfg.health.clone());
         let stats = Stats::new();
-        AppCtx::new(cfg, selector, health, stats, CancellationToken::new())
+        let conns = crate::conn::ConnRegistry::new(cfg.conn_tracking.clone(), upstreams.len());
+        AppCtx::new(
+            cfg,
+            selector,
+            health,
+            stats,
+            conns,
+            CancellationToken::new(),
+        )
     }
 
     #[test]

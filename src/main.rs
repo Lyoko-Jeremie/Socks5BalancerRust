@@ -12,7 +12,7 @@
 //! 健康检查（fail-fast + DOWN 退避）、TLS 探测等（见 docs/07-decisions.md）。
 
 // 模块定义在库 crate（src/lib.rs）中，二进制只做装配与启动
-use socks5_balancer_rust::{app, config, control, health, logging, net, stats, upstream};
+use socks5_balancer_rust::{app, config, conn, control, health, logging, net, stats, upstream};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -179,6 +179,18 @@ async fn run(cfg: config::Config, workers: usize) -> Result<(), Box<dyn std::err
     }
     let stats = stats::Stats::new();
     let cancel = CancellationToken::new();
+    // 连接监测（默认开启明细，与 C++ 会话表行为接近）
+    let conns = conn::ConnRegistry::new(cfg.conn_tracking.clone(), selector.len());
+    if cfg.conn_tracking.enabled {
+        info!(
+            detail = cfg.conn_tracking.detail,
+            detail_limit = cfg.conn_tracking.detail_limit,
+            client_top_limit = cfg.conn_tracking.client_top_limit,
+            "连接监测已启用"
+        );
+    } else {
+        info!("连接监测已禁用（connectionTracking.enabled=false）");
+    }
     if cfg.health.enabled {
         health.spawn_probes(cancel.clone());
     }
@@ -195,6 +207,7 @@ async fn run(cfg: config::Config, workers: usize) -> Result<(), Box<dyn std::err
         selector,
         Arc::clone(&health),
         Arc::clone(&stats),
+        Arc::clone(&conns),
         cancel.clone(),
     );
 

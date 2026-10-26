@@ -29,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
 use crate::app::AppCtx;
+use crate::conn::{ConnGuard, ConnMeta, ConnState};
 use crate::handshake::{self, Protocol, TargetAddr, http, socks4, socks5};
 use crate::stats::{ActiveGuard, Stats};
 use crate::upstream::Upstream;
@@ -77,13 +78,16 @@ pub async fn handle_connection(
     local: SocketAddr,
     bufs: Buffers,
     guard: ActiveGuard,
+    conn: ConnGuard,
 ) {
     // sleepTime：记录"有新连接"的活动时间，健康检查会据此暂停/恢复常规探测
     ctx.health.note_activity();
+    // 连接级取消令牌（全局令牌的子令牌）：`close_conn` 取消它即可中断该连接
+    let token = conn.token().clone();
     if ctx.cfg.tradition_tcp_relay {
-        handle_tradition(ctx, downstream, peer, local, bufs, guard).await;
+        handle_tradition(ctx, downstream, peer, local, bufs, guard, conn, token).await;
     } else {
-        handle_smart(ctx, downstream, peer, local, bufs, guard).await;
+        handle_smart(ctx, downstream, peer, local, bufs, guard, conn, token).await;
     }
 }
 
@@ -95,14 +99,29 @@ async fn handle_tradition(
     local: SocketAddr,
     bufs: Buffers,
     _guard: ActiveGuard,
+    conn: ConnGuard,
+    token: CancellationToken,
 ) {
+    conn.set_state(ConnState::ConnectingUpstream);
     // ADR-002 #3：建连失败立即切下一个可用上游（最多 retryTimes+1 次）。
     let Some((upstream_cfg, upstream)) = connect_upstream_with_retry(&ctx, peer, local).await
     else {
         return;
     };
+    conn.set_upstream(upstream_cfg.health_index);
+    conn.set_state(ConnState::Relaying);
     trace!(%peer, %local, upstream = %upstream_cfg.name, addr = %upstream_cfg.addr(), "开始透传");
-    relay_streams(ctx, downstream, upstream, bufs, peer, "tradition").await;
+    relay_streams(
+        ctx,
+        downstream,
+        upstream,
+        bufs,
+        peer,
+        "tradition",
+        Some(conn.meta().clone()),
+        token,
+    )
+    .await;
 }
 
 /// 混合端口协议分派。
@@ -113,6 +132,8 @@ async fn handle_smart(
     local: SocketAddr,
     bufs: Buffers,
     _guard: ActiveGuard,
+    conn: ConnGuard,
+    token: CancellationToken,
 ) {
     // 1) 首包探测（防"哑连接"）
     let mut first = [0u8; 1];
@@ -136,6 +157,8 @@ async fn handle_smart(
         }
     }
     let protocol = handshake::sniff_first_byte(first[0]);
+    conn.set_protocol(protocol);
+    conn.set_state(ConnState::Handshaking);
     trace!(%peer, protocol = protocol.as_str(), "协议分派");
 
     // 2) 各协议解析出目标 + 前缀 + 应答方式
@@ -152,7 +175,7 @@ async fn handle_smart(
     trace!(%peer, protocol = tunnel.protocol.as_str(), target = %tunnel.target, "已解析目标");
 
     // 3) 统一建立隧道并转发
-    establish(ctx, downstream, tunnel, peer, local, bufs).await;
+    establish(ctx, downstream, tunnel, peer, local, bufs, conn, token).await;
 }
 
 /// SOCKS5：方法协商 + 可选认证 + CONNECT 解析（错误码由 negotiate 尽力写回）。
@@ -320,7 +343,10 @@ async fn establish(
     peer: SocketAddr,
     local: SocketAddr,
     bufs: Buffers,
+    conn: ConnGuard,
+    token: CancellationToken,
 ) {
+    conn.set_state(ConnState::ConnectingUpstream);
     // 1) 选择上游并建立到上游的连接（ADR-002 #3：失败立即切下一个可用后端）
     //    最多尝试 `retryTimes + 1` 个不同上游；目标侧错误（如 ConnectionRefused）也会换一个
     //    出口重试，因为不同上游的出口网络可能不同。
@@ -376,6 +402,7 @@ async fn establish(
                 up_name = upstream_cfg.name.clone();
                 // 记录每客户端粘性 hint（下次同客户端优先复用该上游）
                 ctx.record_hint(peer.ip(), upstream_cfg.health_index);
+                conn.set_upstream(upstream_cfg.health_index);
                 established = Some(stream);
                 break;
             }
@@ -458,7 +485,18 @@ async fn establish(
     );
 
     // 6) 双向转发
-    relay_streams(ctx, downstream, upstream, bufs, peer, "smart").await;
+    conn.set_state(ConnState::Relaying);
+    relay_streams(
+        ctx,
+        downstream,
+        upstream,
+        bufs,
+        peer,
+        "smart",
+        Some(conn.meta().clone()),
+        token,
+    )
+    .await;
 }
 
 /// 按协议写失败应答（SOCKS5 REP / SOCKS4 5B / HTTP 502）。
@@ -614,6 +652,8 @@ async fn relay_streams<D, U>(
     bufs: Buffers,
     peer: SocketAddr,
     mode: &'static str,
+    meta: Option<Arc<ConnMeta>>,
+    token: CancellationToken,
 ) where
     D: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
@@ -622,7 +662,6 @@ async fn relay_streams<D, U>(
     let (up_r, up_w) = tokio::io::split(upstream);
 
     let stats = Arc::clone(&ctx.stats);
-    let cancel = ctx.cancel.clone();
 
     let up_flow = pump(
         down_r,
@@ -630,7 +669,8 @@ async fn relay_streams<D, U>(
         bufs.down_to_up,
         Direction::DownToUp,
         Arc::clone(&stats),
-        cancel.clone(),
+        meta.clone(),
+        token.clone(),
     );
     let down_flow = pump(
         up_r,
@@ -638,7 +678,8 @@ async fn relay_streams<D, U>(
         bufs.up_to_down,
         Direction::UpToDown,
         Arc::clone(&stats),
-        cancel,
+        meta,
+        token,
     );
 
     // 任一方向结束（EOF/错误/取消）即关闭整条连接。
@@ -669,7 +710,8 @@ async fn pump<R, W>(
     mut buf: Box<[u8]>,
     direction: Direction,
     stats: Arc<Stats>,
-    cancel: CancellationToken,
+    meta: Option<Arc<ConnMeta>>,
+    token: CancellationToken,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -678,7 +720,7 @@ where
     loop {
         let n = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Ok(()),
+            _ = token.cancelled() => return Ok(()),
             r = reader.read(&mut buf) => r?,
         };
         if n == 0 {
@@ -686,16 +728,26 @@ where
             return Ok(());
         }
         match direction {
-            Direction::DownToUp => stats
-                .bytes_down_to_up
-                .fetch_add(n as u64, Ordering::Relaxed),
-            Direction::UpToDown => stats
-                .bytes_up_to_down
-                .fetch_add(n as u64, Ordering::Relaxed),
+            Direction::DownToUp => {
+                stats
+                    .bytes_down_to_up
+                    .fetch_add(n as u64, Ordering::Relaxed);
+                if let Some(m) = &meta {
+                    m.add_bytes(true, n);
+                }
+            }
+            Direction::UpToDown => {
+                stats
+                    .bytes_up_to_down
+                    .fetch_add(n as u64, Ordering::Relaxed);
+                if let Some(m) = &meta {
+                    m.add_bytes(false, n);
+                }
+            }
         };
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Ok(()),
+            _ = token.cancelled() => return Ok(()),
             r = writer.write_all(&buf[..n]) => r?,
         }
     }
@@ -729,6 +781,7 @@ mod tests {
             vec![0u8; 64].into_boxed_slice(),
             Direction::DownToUp,
             Arc::clone(&stats),
+            None,
             cancel.clone(),
         ));
 
@@ -750,6 +803,7 @@ mod tests {
             vec![0u8; 64].into_boxed_slice(),
             Direction::UpToDown,
             Arc::clone(&stats),
+            None,
             cancel2.clone(),
         ));
         source2.write_all(b"x").await.unwrap();

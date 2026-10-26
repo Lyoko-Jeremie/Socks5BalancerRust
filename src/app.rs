@@ -9,6 +9,7 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
+use crate::conn::ConnRegistry;
 use crate::health::HealthRegistry;
 use crate::stats::Stats;
 use crate::upstream::UpstreamSelector;
@@ -20,6 +21,8 @@ pub struct AppCtx {
     pub selector: Arc<UpstreamSelector>,
     pub health: Arc<HealthRegistry>,
     pub stats: Arc<Stats>,
+    /// 连接监测注册表（M3+；默认开启明细）。
+    pub conns: Arc<ConnRegistry>,
     /// 进程启动时刻（控制面 `uptimeSeconds` 用）。
     pub started: Instant,
     /// 全局取消令牌：收到退出信号时取消，accept 循环、relay 与探测任务都会响应。
@@ -32,6 +35,7 @@ impl AppCtx {
         selector: Arc<UpstreamSelector>,
         health: Arc<HealthRegistry>,
         stats: Arc<Stats>,
+        conns: Arc<ConnRegistry>,
         cancel: CancellationToken,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -39,6 +43,7 @@ impl AppCtx {
             selector,
             health,
             stats,
+            conns,
             started: Instant::now(),
             cancel,
         })
