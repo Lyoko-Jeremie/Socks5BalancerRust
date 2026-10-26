@@ -22,6 +22,7 @@ mod relay;
 mod stats;
 mod upstream;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -196,11 +197,26 @@ async fn run(cfg: config::Config, workers: usize) -> Result<(), Box<dyn std::err
         cancel.clone(),
     );
 
-    let listeners =
-        net::listener::bind_all(&cfg.listen, cfg.socket_recv_buffer, cfg.socket_send_buffer)
-            .await?;
-    for (_, local) in &listeners {
-        info!(%local, "监听已就绪");
+    // per-core accept（docs/02 §2）：Linux 上每个监听地址按核数复制 listener（SO_REUSEPORT
+    // 由内核分发，降低单 accept 队列锁竞争）；Windows 不支持且会带来端口劫持风险，固定 1 个。
+    // 上限 4：tokio 多线程下 accept 本身已可并行，副本过多只会增加 socket 数量。
+    let replicas = if cfg!(unix) { workers.clamp(1, 4) } else { 1 };
+    let listeners = net::listener::bind_all(
+        &cfg.listen,
+        cfg.socket_recv_buffer,
+        cfg.socket_send_buffer,
+        replicas,
+    )
+    .await?;
+    {
+        let mut by_addr: std::collections::BTreeMap<SocketAddr, usize> =
+            std::collections::BTreeMap::new();
+        for (_, local) in &listeners {
+            *by_addr.entry(*local).or_default() += 1;
+        }
+        for (local, n) in &by_addr {
+            info!(%local, replicas = n, "监听已就绪");
+        }
     }
 
     let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();

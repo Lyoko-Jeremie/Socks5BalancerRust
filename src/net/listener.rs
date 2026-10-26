@@ -25,13 +25,19 @@ use crate::stats::ActiveGuard;
 const LISTEN_BACKLOG: i32 = 1024;
 
 /// 绑定全部监听目标，返回 `(listener, 本地地址)`。
+///
+/// `replicas > 1` 时每个监听地址会绑定多个 socket（Linux `SO_REUSEPORT` 由内核分发），
+/// 供 per-core accept 使用；第 2 个起绑定失败会降级为单 listener（只告警）。
 pub async fn bind_all(
     targets: &[ListenTarget],
     socket_recv_buffer: usize,
     socket_send_buffer: usize,
+    replicas: usize,
 ) -> io::Result<Vec<(TcpListener, SocketAddr)>> {
     let mut out: Vec<(TcpListener, SocketAddr)> = Vec::new();
     let mut last_err: Option<io::Error> = None;
+    let mut seen: Vec<SocketAddr> = Vec::new();
+    let replicas = replicas.max(1);
 
     for t in targets {
         let addrs = match tokio::net::lookup_host((t.host.as_str(), t.port)).await {
@@ -47,17 +53,31 @@ pub async fn bind_all(
             continue;
         }
         for addr in addrs {
-            if out.iter().any(|(_, local)| *local == addr) {
+            // 同一目标解析出的重复地址只处理一次（避免与 replicas 去重逻辑冲突）
+            if seen.contains(&addr) {
                 continue;
             }
-            match bind_one(addr, socket_recv_buffer, socket_send_buffer) {
-                Ok(listener) => {
-                    let local = listener.local_addr()?;
-                    out.push((listener, local));
-                }
-                Err(e) => {
-                    warn!(%addr, error = %e, "绑定失败");
-                    last_err = Some(e);
+            seen.push(addr);
+            for i in 0..replicas {
+                match bind_one(addr, socket_recv_buffer, socket_send_buffer) {
+                    Ok(listener) => {
+                        let local = listener.local_addr()?;
+                        out.push((listener, local));
+                    }
+                    Err(e) => {
+                        if i == 0 {
+                            warn!(%addr, error = %e, "绑定失败");
+                            last_err = Some(e);
+                        } else {
+                            debug!(
+                                %addr,
+                                replicas = i,
+                                error = %e,
+                                "per-core listener 副本绑定失败，已降级"
+                            );
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -88,7 +108,7 @@ fn bind_one(
     //   代理服务端不应接受这种语义；Windows 上保持默认（不设置），端口被占用时直接 bind 失败更安全。
     #[cfg(unix)]
     sock.set_reuse_address(true)?;
-    // Linux：每个 worker 可各自 accept（M1 起配合多 listener 使用；此处先打开不影响语义）
+    // Linux：每个监听地址绑定多个 socket（replicas），由内核按 SO_REUSEPORT 分发到不同 accept 任务。
     #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
     {
         if let Err(e) = sock.set_reuse_port(true) {
