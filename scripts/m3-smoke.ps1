@@ -1,4 +1,4 @@
-# M3 精简控制面验收（Windows PowerShell 5.1+）
+﻿# M3 精简控制面验收（Windows PowerShell 5.1+）
 #
 # 覆盖（ADR-001：4 端点、无鉴权、默认回环、响应不含密码）：
 #   1) GET /healthz → 200 ok

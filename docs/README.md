@@ -42,7 +42,7 @@
 阅读顺序建议：**01 → 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09 → 10 → 11 → 12 → 13**。
 只想快速决策：读本文 §3/§4/§5；准备动手写代码：读 **07（决策）+ 02 §8 + 06 §7**。
 
-> **当前进度（2026-10-26）**：**M0 ✅；M1（M1.1–M1.5）✅；M2 ✅；M3 ✅；M4 内存基线 ✅；M5 交付物 ✅（待 Linux 实测回填）**。已实现：SOCKS5 入站 0x00/0x02（RFC1929、CONNECT、错误码回传）、**SOCKS4 USERID 与 HTTP Basic 入站认证**、上游 SOCKS5 握手（含上游认证）、5 条选路规则 + **每客户端 hint 粘性**、**retryTimes 数据面失败切换**、fail-fast 健康检查（DOWN 指数退避 + 数据面降级 + 快速重探 + **sleepTime 空闲暂停 + additionCheckPeriod 全池加速 + 探测 RTT**）、TLS + HTTP readiness 探测（**expectStatus 空=不校验**）、混合端口（SOCKS5 / SOCKS4-4a / HTTP CONNECT / HTTP forward）、**DNS TTL 刷新（dnsTtl）**、**Linux per-core listener（SO_REUSEPORT）**、精简控制面（4 端点、运行期启停/改规则/立即探测、无鉴权仅回环、响应不含密码）。端到端验收：协议 10/10、健康检查 6/6、TLS readiness 9/9、混合协议 9/9、控制面 19/19；单元测试 **90** 个全绿；**内存实测：`bufferSize=2048` 下 10K 空闲连接推算 ≈ 98.5 MB（Windows 口径；Linux 预计 ~69 MB）**。交付物：Dockerfile（含 `.dockerignore`）、systemd 单元、生产配置、`.github/workflows/ci.yml`（Linux/Windows 双平台 CI + 编码检查）、`fuzz/`（SOCKS5/HTTP/SOCKS4 解析）、Linux C10K/1K 压测与 24h 长稳脚本。**下一步：Linux C10K/1K 实测、24h 长稳、用实测回填 12 号文档**。详见 [13-m5-deployment.md](13-m5-deployment.md)。
+> **当前进度（2026-10-26）**：**M0 ✅；M1（M1.1–M1.5）✅；M2 ✅；M3 ✅；M4 内存基线 ✅；M5 交付物 ✅（待 Linux 实测回填）**。已实现：SOCKS5 入站 0x00/0x02（RFC1929、CONNECT、错误码回传）、**SOCKS4 USERID 与 HTTP Basic 入站认证**、上游 SOCKS5 握手（含上游认证）、5 条选路规则 + **每客户端 hint 粘性**、**retryTimes 数据面失败切换**、fail-fast 健康检查（DOWN 指数退避 + 数据面降级 + 快速重探 + **sleepTime 空闲暂停 + additionCheckPeriod 全池加速 + 探测 RTT**）、TLS + HTTP readiness 探测（**expectStatus 空=不校验**）、混合端口（SOCKS5 / SOCKS4-4a / HTTP CONNECT / HTTP forward）、**DNS TTL 刷新（dnsTtl）**、**Linux per-core listener（SO_REUSEPORT）**、精简控制面（4 基础端点 + 2 连接监测端点、运行期启停/改规则/立即探测、**连接监测默认明细**（`/api/v1/connections`、`/summary`）与 `close_conn`/`close_all`、独立监控监听、无鉴权仅回环、响应不含密码）。端到端验收：协议 10/10、健康检查 6/6、TLS readiness 9/9、混合协议 9/9、控制面 19/19；单元测试 **105** 个全绿；**内存实测：`bufferSize=2048` 下 10K 空闲连接推算 ≈ 98.5 MB（Windows 口径；Linux 预计 ~69 MB；连接监测明细默认开启再 +1.5–2 MB，严格 100MB 口径可 `connectionTracking.detail=false`）**。交付物：Dockerfile（含 `.dockerignore`）、systemd 单元、生产配置、`.github/workflows/ci.yml`（Linux/Windows 双平台 CI + 编码检查）、`fuzz/`（SOCKS5/HTTP/SOCKS4 解析）、Linux C10K/1K 压测与 24h 长稳脚本。**下一步：Linux C10K/1K 实测、24h 长稳、用实测回填 12 号文档**。详见 [13-m5-deployment.md](13-m5-deployment.md)。
 
 > **2026-10-26 修订**：用户已就 7 项关键取舍作出决策（控制面精简不鉴权、健康检查 fail-fast 不重试且异常后端降频、线程数可配置、SOCKS5 仅 0x00/0x02、双向 8K 预分配、TLS 探测对齐 C++、优先成熟库），已固化为 [07-decisions.md](07-decisions.md)，并同步修订 01/02/04/05/06 的"Rust 建议"部分。C++ 现状分析部分不变。
 
@@ -63,7 +63,7 @@
 
 | 指标 | C++ 现状 | 判定 | Rust 可行性（按 [07](07-decisions.md) 决策） |
 |---|---|---|---|
-| 运行时内存 ≤100 MB | 实测 **22,039 B/连接** → 10,000 连接 ≈ **210 MiB**（超 110%） | ❌ 不可达 | ✅ **ADR-005 + U1=方案 B**：默认 `bufferSize=8192` 保持双向 8K 预分配（10K ≈197–200 MB，性能基线）；`bufferSize` 可配 2048/4096/8192，**100MB 达标压测用 2048（Windows 10K 实测推算 ≈98.5 MB，临界达标；Linux 预计 ~69 MB）** |
+| 运行时内存 ≤100 MB | 实测 **22,039 B/连接** → 10,000 连接 ≈ **210 MiB**（超 110%） | ❌ 不可达 | ✅ **ADR-005 + U1=方案 B**：默认 `bufferSize=8192` 保持双向 8K 预分配（10K ≈197–200 MB，性能基线）；`bufferSize` 可配 2048/4096/8192，**100MB 达标压测用 2048（Windows 10K 实测推算 ≈98.5 MB，临界达标；Linux 预计 ~69 MB；连接监测明细默认开启再 +1.5–2 MB，可 `connectionTracking.detail=false` 回退）** |
 | 持有 C10K 连接 | 仅缓冲就 160 MB；另有"建连不发首包"的**永久泄漏**（无超时 + 引用环） | ❌ 不可达 | ✅ 功能可达；内存按 `bufferSize` 双口径验收（8K 性能基线 / 2K 达 100MB）；全链路超时消除泄漏 |
 | 1,000 连接/秒 | 每连接一次**无缓存 DNS**、同步无过滤日志、~6–7 次全局统计锁、accept 串行、无 connect 超时 | ❌ 高风险 | ✅ 预算 2 ms/连接（2 核），改造后实际约 10–30 µs |
 | 2~4 core | 单 `io_context`、无分片、统计/日志全局锁；`min(核数, threadNum) ≤ 2` 时退化为单线程 | ⚠️ 多核利用差 | ✅ per-core accept（REUSEPORT）+ 分片指标 + 线程数可配（ADR-003） |
