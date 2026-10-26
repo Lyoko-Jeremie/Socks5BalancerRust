@@ -255,6 +255,19 @@ async fn run(cfg: config::Config, workers: usize) -> Result<(), Box<dyn std::err
         info!("控制面未启用（stateServerPort=0）");
     }
 
+    // 监控面（可选独立监听，配置 monitorServerHost/monitorServerPort）：
+    // 只读端点（含连接明细/摘要），不提供 /api/v1/control 写命令。
+    if let Some(monitor_bind) = cfg.monitor_server.clone() {
+        let ctx = Arc::clone(&ctx);
+        let max_response = cfg.state_max_response_bytes;
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            control::serve_monitor(ctx, monitor_bind, max_response, cancel).await;
+        });
+    } else if cfg.state_server.is_some() {
+        info!("监控端点复用控制面监听（未配置 monitorServerPort）");
+    }
+
     let signal = wait_signal().await;
     info!(signal, "收到退出信号，开始优雅关闭");
     cancel.cancel();

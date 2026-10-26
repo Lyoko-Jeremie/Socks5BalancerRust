@@ -61,6 +61,15 @@ enum Reply {
     None,
 }
 
+/// 每连接转发上下文（聚合参数，避免函数参数过多）。
+struct Session {
+    peer: SocketAddr,
+    local: SocketAddr,
+    bufs: Buffers,
+    conn: ConnGuard,
+    token: CancellationToken,
+}
+
 /// 协议解析完成、等待建立隧道。
 struct Tunnel {
     protocol: Protocol,
@@ -84,10 +93,17 @@ pub async fn handle_connection(
     ctx.health.note_activity();
     // 连接级取消令牌（全局令牌的子令牌）：`close_conn` 取消它即可中断该连接
     let token = conn.token().clone();
+    let session = Session {
+        peer,
+        local,
+        bufs,
+        conn,
+        token,
+    };
     if ctx.cfg.tradition_tcp_relay {
-        handle_tradition(ctx, downstream, peer, local, bufs, guard, conn, token).await;
+        handle_tradition(ctx, downstream, session, guard).await;
     } else {
-        handle_smart(ctx, downstream, peer, local, bufs, guard, conn, token).await;
+        handle_smart(ctx, downstream, session, guard).await;
     }
 }
 
@@ -95,29 +111,32 @@ pub async fn handle_connection(
 async fn handle_tradition(
     ctx: Arc<AppCtx>,
     downstream: TcpStream,
-    peer: SocketAddr,
-    local: SocketAddr,
-    bufs: Buffers,
+    session: Session,
     _guard: ActiveGuard,
-    conn: ConnGuard,
-    token: CancellationToken,
 ) {
-    conn.set_state(ConnState::ConnectingUpstream);
+    session.conn.set_state(ConnState::ConnectingUpstream);
     // ADR-002 #3：建连失败立即切下一个可用上游（最多 retryTimes+1 次）。
-    let Some((upstream_cfg, upstream)) = connect_upstream_with_retry(&ctx, peer, local).await
+    let Some((upstream_cfg, upstream)) =
+        connect_upstream_with_retry(&ctx, session.peer, session.local).await
     else {
         return;
     };
-    conn.set_upstream(upstream_cfg.health_index);
-    conn.set_state(ConnState::Relaying);
-    trace!(%peer, %local, upstream = %upstream_cfg.name, addr = %upstream_cfg.addr(), "开始透传");
+    session.conn.set_upstream(upstream_cfg.health_index);
+    session.conn.set_state(ConnState::Relaying);
+    trace!(peer = %session.peer, local = %session.local, upstream = %upstream_cfg.name, addr = %upstream_cfg.addr(), "开始透传");
+    let Session {
+        peer,
+        bufs,
+        conn,
+        token,
+        ..
+    } = session;
     relay_streams(
         ctx,
         downstream,
         upstream,
-        bufs,
         peer,
-        "tradition",
+        bufs,
         Some(conn.meta().clone()),
         token,
     )
@@ -128,13 +147,16 @@ async fn handle_tradition(
 async fn handle_smart(
     ctx: Arc<AppCtx>,
     mut downstream: TcpStream,
-    peer: SocketAddr,
-    local: SocketAddr,
-    bufs: Buffers,
+    session: Session,
     _guard: ActiveGuard,
-    conn: ConnGuard,
-    token: CancellationToken,
 ) {
+    let Session {
+        peer,
+        local,
+        bufs,
+        conn,
+        token,
+    } = session;
     // 1) 首包探测（防"哑连接"）
     let mut first = [0u8; 1];
     match tokio::time::timeout(ctx.cfg.first_packet_timeout, downstream.peek(&mut first)).await {
@@ -175,7 +197,14 @@ async fn handle_smart(
     trace!(%peer, protocol = tunnel.protocol.as_str(), target = %tunnel.target, "已解析目标");
 
     // 3) 统一建立隧道并转发
-    establish(ctx, downstream, tunnel, peer, local, bufs, conn, token).await;
+    let session = Session {
+        peer,
+        local,
+        bufs,
+        conn,
+        token,
+    };
+    establish(ctx, downstream, tunnel, session).await;
 }
 
 /// SOCKS5：方法协商 + 可选认证 + CONNECT 解析（错误码由 negotiate 尽力写回）。
@@ -336,16 +365,14 @@ async fn http_tunnel(
 }
 
 /// 建立到目标的隧道（经上游 SOCKS5），成功后写应答与前缀，再双向转发。
-async fn establish(
-    ctx: Arc<AppCtx>,
-    mut downstream: TcpStream,
-    tunnel: Tunnel,
-    peer: SocketAddr,
-    local: SocketAddr,
-    bufs: Buffers,
-    conn: ConnGuard,
-    token: CancellationToken,
-) {
+async fn establish(ctx: Arc<AppCtx>, mut downstream: TcpStream, tunnel: Tunnel, session: Session) {
+    let Session {
+        peer,
+        local,
+        bufs,
+        conn,
+        token,
+    } = session;
     conn.set_state(ConnState::ConnectingUpstream);
     // 1) 选择上游并建立到上游的连接（ADR-002 #3：失败立即切下一个可用后端）
     //    最多尝试 `retryTimes + 1` 个不同上游；目标侧错误（如 ConnectionRefused）也会换一个
@@ -490,9 +517,8 @@ async fn establish(
         ctx,
         downstream,
         upstream,
-        bufs,
         peer,
-        "smart",
+        bufs,
         Some(conn.meta().clone()),
         token,
     )
@@ -649,9 +675,8 @@ async fn relay_streams<D, U>(
     ctx: Arc<AppCtx>,
     downstream: D,
     upstream: U,
-    bufs: Buffers,
     peer: SocketAddr,
-    mode: &'static str,
+    bufs: Buffers,
     meta: Option<Arc<ConnMeta>>,
     token: CancellationToken,
 ) where
@@ -689,10 +714,10 @@ async fn relay_streams<D, U>(
     };
 
     match result {
-        Ok(()) => trace!(%peer, mode, direction, "转发结束"),
+        Ok(()) => trace!(%peer, direction, "转发结束"),
         Err(e) => {
             stats.relay_errors.fetch_add(1, Ordering::Relaxed);
-            debug!(%peer, mode, direction, error = %e, "转发异常结束");
+            debug!(%peer, direction, error = %e, "转发异常结束");
         }
     }
 }
