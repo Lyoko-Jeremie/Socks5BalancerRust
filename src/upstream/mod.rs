@@ -9,12 +9,12 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tracing::{info, warn};
 use crate::config::UpstreamConfig;
+use tracing::{info, warn};
 
 /// 已解析的上游。
 #[derive(Debug, Clone)]
@@ -191,7 +191,8 @@ impl UpstreamSelector {
     /// 按规则选择一个可用上游；全部不可用返回 `None`（调用方应快速拒绝）。
     ///
     /// 可用 = 人工启用 && `is_available`（健康状态）。
-    pub fn next(&self, is_available: &dyn Fn(usize) -> bool) -> Option<&Upstream> {        if self.is_empty() {
+    pub fn next(&self, is_available: &dyn Fn(usize) -> bool) -> Option<&Upstream> {
+        if self.is_empty() {
             return None;
         }
         let n = self.upstreams.len();

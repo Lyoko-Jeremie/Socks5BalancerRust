@@ -182,9 +182,7 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
 /// 写 `407 Proxy Authentication Required` 响应并关闭连接。
 ///
 /// 不做重试循环：C++ 曾在 407 后未消费请求导致单连接紧循环，这里一次性回 407 即关闭。
-pub async fn write_proxy_auth_required<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-) -> io::Result<()> {
+pub async fn write_proxy_auth_required<S: AsyncWrite + Unpin>(stream: &mut S) -> io::Result<()> {
     let body = "HTTP/1.1 407 Proxy Authentication Required\r\n\
                 Proxy-Authenticate: Basic realm=\"Socks5BalancerRust\"\r\n\
                 Content-Length: 0\r\n\

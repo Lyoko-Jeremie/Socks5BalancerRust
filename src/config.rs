@@ -654,7 +654,9 @@ fn legacy_health_config(raw: &RawConfig, notes: &mut Vec<String>) -> RawHealthCo
                 tcp.start_delay = Some(v);
                 mapped.push("tcpCheckStart");
             } else {
-                notes.push("tcpCheckStart 与 healthCheck.tcp.startDelay 同时配置，新字段优先".into());
+                notes.push(
+                    "tcpCheckStart 与 healthCheck.tcp.startDelay 同时配置，新字段优先".into(),
+                );
             }
         }
     }
@@ -1594,7 +1596,8 @@ mod tests {
     }
 
     #[test]
-    fn 新字段优先于旧探测字段() {        let text = r#"{
+    fn 新字段优先于旧探测字段() {
+        let text = r#"{
             "listenPort": 5000,
             "tcpCheckPeriod": 7000,
             "testRemoteHost": "old.example.com",
@@ -1606,7 +1609,10 @@ mod tests {
         }"#;
         let c = load_str(text).unwrap();
         assert_eq!(c.health.period, Duration::from_millis(3_000));
-        assert_eq!(c.health.tls.expect("应启用 TLS 探测").host, "new.example.com");
+        assert_eq!(
+            c.health.tls.expect("应启用 TLS 探测").host,
+            "new.example.com"
+        );
         assert!(
             c.notes.iter().any(|n| n.contains("新字段优先")),
             "notes={:?}",

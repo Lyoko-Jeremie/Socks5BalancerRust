@@ -651,10 +651,7 @@ mod tests {
         assert!(!reg.enabled());
         assert!(!reg.probe_now(0), "禁用时不应安排探测");
         reg.mark_degraded(0, "测试");
-        assert!(
-            reg.is_available(0),
-            "禁用健康检查时数据面失败不应标记降级"
-        );
+        assert!(reg.is_available(0), "禁用健康检查时数据面失败不应标记降级");
     }
 
     #[test]

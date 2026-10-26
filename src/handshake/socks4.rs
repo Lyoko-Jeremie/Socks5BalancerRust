@@ -90,10 +90,7 @@ pub async fn write_reply<S: AsyncWrite + Unpin>(stream: &mut S, granted: bool) -
 }
 
 /// 写指定 CD 的 SOCKS4 应答（8 字节）；`0x5C` 用于 USERID 认证失败。
-pub async fn write_reply_code<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    rep: u8,
-) -> io::Result<()> {
+pub async fn write_reply_code<S: AsyncWrite + Unpin>(stream: &mut S, rep: u8) -> io::Result<()> {
     stream
         .write_all(&[0x00, rep, 0x00, 0x00, 0, 0, 0, 0])
         .await?;

@@ -99,7 +99,8 @@ async fn handle_tradition(
     // ADR-002 #3：建连失败立即切下一个可用上游（最多 retryTimes+1 次）。
     let Some((upstream_cfg, upstream)) = connect_upstream_with_retry(&ctx, peer).await else {
         return;
-    };    trace!(%peer, %local, upstream = %upstream_cfg.name, addr = %upstream_cfg.addr(), "开始透传");
+    };
+    trace!(%peer, %local, upstream = %upstream_cfg.name, addr = %upstream_cfg.addr(), "开始透传");
     relay_streams(ctx, downstream, upstream, bufs, peer, "tradition").await;
 }
 
@@ -204,19 +205,19 @@ async fn socks4_tunnel(
     )
     .await
     {
-            Ok(Ok(target)) => target,
-            Ok(Err(e)) => {
-                ctx.stats.handshake_failed.fetch_add(1, Ordering::Relaxed);
-                debug!(%peer, error = %e, "入站 SOCKS4 协商失败");
-                return None;
-            }
-            Err(_) => {
-                ctx.stats.handshake_failed.fetch_add(1, Ordering::Relaxed);
-                let _ = socks4::write_reply(stream, false).await;
-                debug!(%peer, "入站 SOCKS4 握手超时");
-                return None;
-            }
-        };
+        Ok(Ok(target)) => target,
+        Ok(Err(e)) => {
+            ctx.stats.handshake_failed.fetch_add(1, Ordering::Relaxed);
+            debug!(%peer, error = %e, "入站 SOCKS4 协商失败");
+            return None;
+        }
+        Err(_) => {
+            ctx.stats.handshake_failed.fetch_add(1, Ordering::Relaxed);
+            let _ = socks4::write_reply(stream, false).await;
+            debug!(%peer, "入站 SOCKS4 握手超时");
+            return None;
+        }
+    };
     Some(Tunnel {
         protocol: Protocol::Socks4,
         target,
@@ -316,10 +317,7 @@ async fn establish(
     let mut up_name = String::new();
 
     for _ in 0..max_attempts {
-        let Some(upstream_cfg) = ctx
-            .pick_upstream_for_client(peer.ip(), &tried)
-            .cloned()
-        else {
+        let Some(upstream_cfg) = ctx.pick_upstream_for_client(peer.ip(), &tried).cloned() else {
             break;
         };
         tried.push(upstream_cfg.health_index);
@@ -485,10 +483,7 @@ async fn connect_upstream_with_retry(
     let max_attempts = ctx.cfg.retry_times.saturating_add(1).max(1);
     let mut tried: Vec<usize> = Vec::with_capacity(max_attempts);
     for _ in 0..max_attempts {
-        let Some(cfg) = ctx
-            .pick_upstream_for_client(peer.ip(), &tried)
-            .cloned()
-        else {
+        let Some(cfg) = ctx.pick_upstream_for_client(peer.ip(), &tried).cloned() else {
             break;
         };
         tried.push(cfg.health_index);
