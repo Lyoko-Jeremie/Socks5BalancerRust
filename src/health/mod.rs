@@ -156,18 +156,28 @@ impl HealthRegistry {
     }
 
     /// 记录一次下游活动（接入了新连接），唤醒处于 `sleepTime` 空闲暂停的探测任务。
+    ///
+    /// 用 `notify_one`（而不是 `notify_waiters`）：前者会把许可存下来，即使此刻没有任务
+    /// 在等待，下一次 `notified()` 也会立刻返回，不会丢失唤醒；这样休眠循环里就不需要
+    /// 再靠 1s 轮询兜底。
     pub fn note_activity(&self) {
         if self.cfg.sleep_time.is_none() {
             return;
         }
         self.last_activity_ms
             .store(self.now_ms(), Ordering::Relaxed);
-        self.activity_notify.notify_waiters();
+        self.activity_notify.notify_one();
     }
 
-    /// 是否已进入 `sleepTime` 空闲暂停（最近 `sleepTime` 内无新连接）。
+    /// 是否已进入 `sleepTime` 空闲休眠（最近 `sleepTime` 内无任何新连接）。
     ///
-    /// 空闲时暂停常规探测以省流量；DOWN 后端的退避探测不暂停（调用方用 `is_available` 判断）。
+    /// 休眠期间**所有自动探测都暂停**（TCP 周期探测、readiness 周期探测、addition 加速
+    /// 探测），对齐 C++：C++ 的 tcp/connect/addition 三个定时器都以
+    /// `now - lastConnectComeTime <= sleepTime` 为门控，超过即整轮跳过。
+    ///
+    /// 这样做的原因不是省流量，而是避免"长时间无人使用"时后端链路上持续出现单调、有规律
+    /// 的探测流量，被链路状态检测/防火墙判为异常通信而把后端拉黑。
+    /// 恢复条件：新连接到来（[`Self::note_activity`]）或控制面人工探测（[`Self::probe_now`]）。
     fn idle_sleeping(&self) -> bool {
         let Some(sleep) = self.cfg.sleep_time else {
             return false;
@@ -220,16 +230,28 @@ impl HealthRegistry {
     ///
     /// 通过 `Notify` 唤醒正在等待下次探测的探测任务；返回 false 表示下标越界
     /// 或健康检查已被 `disableConnectTest` 禁用。
+    ///
+    /// 人工探测**视为一次下游活动**：会绕过 `sleepTime` 空闲休眠并唤醒休眠中的探测任务。
     pub fn probe_now(&self, idx: usize) -> bool {
         if !self.cfg.enabled {
             return false;
         }
+        self.last_activity_ms
+            .store(self.now_ms(), Ordering::Relaxed);
+        self.activity_notify.notify_one();
+        self.arm_probe(idx)
+    }
+
+    /// 为某个上游安排"立刻探测一次"（不刷新活动时间，因而不算下游活动）。
+    ///
+    /// `additionCheckPeriod` 加速探测用它：若这里也刷新 `last_activity_ms`，
+    /// "全池 DOWN 且长时间无人使用"的场景会每 10s 被自己刷新一次，永远进不了
+    /// `sleepTime` 休眠，后端就会被持续的规律探测流量打黑——正是要避免的情况。
+    fn arm_probe(&self, idx: usize) -> bool {
         let Some(entry) = self.entries.get(idx) else {
             return false;
         };
         let now = self.now_ms();
-        // 人工探测视为一次活动：绕过 sleepTime 空闲暂停
-        self.last_activity_ms.store(now, Ordering::Relaxed);
         entry.tcp_next_probe_ms.store(now, Ordering::Release);
         entry.tls_next_probe_ms.store(now, Ordering::Release);
         entry.probe_notify.notify_one();
@@ -246,6 +268,15 @@ impl HealthRegistry {
     /// 此时上游可用性完全由人工启停决定，避免"失败后再无探测恢复"的永久 DOWN。
     pub fn mark_degraded(&self, idx: usize, reason: &str) {
         if !self.cfg.enabled {
+            return;
+        }
+        // `connectFailMarkDegraded=false`：数据面失败只累加 relayErrors（调用方负责），
+        // 不改变可用性——可用性完全交给周期探测判定。
+        if !self.cfg.connect_fail_mark_degraded {
+            debug!(
+                idx,
+                reason, "数据面失败（connectFailMarkDegraded=false，不标记不可用）"
+            );
             return;
         }
         let Some(entry) = self.entries.get(idx) else {
@@ -440,13 +471,13 @@ impl HealthRegistry {
                 if !wait_until(&reg, idx, true, &cancel).await {
                     return;
                 }
-                // sleepTime：空闲（最近 sleepTime 无新连接）且该上游健康 → 暂停常规探测
-                //（DOWN 的后端不暂停，继续按退避探测以尽快恢复）
-                if reg.idle_sleeping() && reg.is_available(idx) {
+                // sleepTime：空闲休眠期间暂停**全部**自动探测（对齐 C++：DOWN 后端的
+                // 退避重探同样暂停），避免无人使用时仍在后端链路上留下有规律的探测流量。
+                // 新连接（note_activity）或控制面人工探测（probe_now）会唤醒并恢复。
+                if reg.idle_sleeping() {
                     tokio::select! {
                         _ = cancel.cancelled() => return,
                         _ = reg.activity_notify.notified() => continue,
-                        _ = tokio::time::sleep(Duration::from_millis(1_000)) => continue,
                     }
                 }
                 let addr = reg.entries[idx].addr();
@@ -479,12 +510,11 @@ impl HealthRegistry {
                 if !wait_until(&reg, idx, false, &cancel).await {
                     return;
                 }
-                // sleepTime：空闲且该上游健康 → 暂停 readiness 探测
-                if reg.idle_sleeping() && reg.is_available(idx) {
+                // sleepTime：空闲休眠期间暂停 readiness 探测（与 TCP 探测一致）。
+                if reg.idle_sleeping() {
                     tokio::select! {
                         _ = cancel.cancelled() => return,
                         _ = reg.activity_notify.notified() => continue,
-                        _ = tokio::time::sleep(Duration::from_millis(1_000)) => continue,
                     }
                 }
                 if !reg.entries[idx].liveness.load(Ordering::Relaxed) {
@@ -534,7 +564,11 @@ impl HealthRegistry {
         });
     }
 
-    /// `additionCheckPeriod`：全池不可用时按该周期额外触发一次全池立即探测。
+    /// `additionCheckPeriod`：全池不可用且**不在空闲休眠中**时，按该周期额外触发一次全池探测。
+    ///
+    /// 对齐 C++ `UpstreamPool.cpp:419-423`：`isAllDown && now - lastConnectComeTime <= sleepTime`
+    /// 才追加探测。休眠期间必须停——否则"全池 DOWN 且无人使用"会变成持续规律探测，
+    /// 正好触发链路检测防火墙的黑名单。
     fn spawn_addition_checker(self: &Arc<Self>, cancel: CancellationToken) {
         let Some(period) = self.cfg.addition_check_period else {
             return;
@@ -543,15 +577,20 @@ impl HealthRegistry {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(period);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            ticker.tick().await; // 跳过第一次立即触发
+            ticker.tick().await; // 跳过第一次立即触发（首轮在 period 之后，与 C++ 的延迟启动一致）
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = ticker.tick() => {
-                        if !reg.entries.is_empty() && reg.available_count() == 0 {
+                        if !reg.idle_sleeping()
+                            && !reg.entries.is_empty()
+                            && reg.available_count() == 0
+                        {
                             debug!(count = reg.entries.len(), "全池不可用：按 additionCheckPeriod 加速探测");
                             for i in 0..reg.entries.len() {
-                                reg.probe_now(i);
+                                // 用 arm_probe 而不是 probe_now：加速探测不能刷新活动时间，
+                                // 否则会自己阻止进入 sleepTime 休眠。
+                                reg.arm_probe(i);
                             }
                         }
                     }
@@ -620,6 +659,7 @@ mod tests {
             tls: None,
             sleep_time: None,
             addition_check_period: None,
+            connect_fail_mark_degraded: true,
         }
     }
 
@@ -652,6 +692,42 @@ mod tests {
         assert!(!reg.probe_now(0), "禁用时不应安排探测");
         reg.mark_degraded(0, "测试");
         assert!(reg.is_available(0), "禁用健康检查时数据面失败不应标记降级");
+    }
+
+    #[test]
+    fn connect_fail_mark_degraded_为_false_时数据面失败不降级() {
+        let mut c = cfg();
+        c.connect_fail_mark_degraded = false;
+        let reg = HealthRegistry::new(&[upstream("a", 1)], c);
+        reg.mark_degraded(0, "connect failed");
+        assert!(
+            reg.is_available(0),
+            "connectFailMarkDegraded=false 时数据面失败不应改变可用性"
+        );
+        assert_eq!(reg.snapshot()[0].failures, 0, "也不应累加失败计数");
+    }
+
+    #[test]
+    fn 加速探测不刷新活动时间因而不会阻止休眠() {
+        let mut c = cfg();
+        c.sleep_time = Some(Duration::from_millis(50));
+        let reg = HealthRegistry::new(&[upstream("a", 1)], c);
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(reg.idle_sleeping());
+        // additionCheckPeriod 内部走 arm_probe：不应刷新 last_activity
+        for i in 0..3 {
+            let before = reg.last_activity_ms.load(Ordering::Relaxed);
+            assert!(reg.arm_probe(0), "arm_probe 应成功（idx={i}）");
+            assert_eq!(
+                reg.last_activity_ms.load(Ordering::Relaxed),
+                before,
+                "加速探测不能刷新活动时间"
+            );
+        }
+        assert!(reg.idle_sleeping(), "arm_probe 之后仍应处于休眠");
+        // 人工探测则算活动，会退出休眠
+        assert!(reg.probe_now(0));
+        assert!(!reg.idle_sleeping(), "probe_now 应视为活动并退出休眠");
     }
 
     #[test]
@@ -784,5 +860,64 @@ mod tests {
         assert!(reg.is_available(0), "重新监听后应恢复可用");
         cancel.cancel();
         drop(listener);
+    }
+
+    /// 端到端验证 `sleepTime`：空闲后探测任务真的停了，新连接到来后恢复。
+    ///
+    /// 用 accept 计数观测探测：TCP 探活 = 一次 connect，目标 listener 每接受一次即 +1。
+    #[tokio::test]
+    async fn 休眠期间停止探测_新连接后恢复() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicU64::new(0));
+        let acc = Arc::clone(&accepts);
+        let acceptor = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((_s, _)) => {
+                        acc.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let up = Upstream {
+            name: "sleep-target".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            addr: Arc::new(Mutex::new(addr)),
+            auth_user: None,
+            auth_pwd: None,
+            health_index: 0,
+            enabled: true,
+        };
+        let mut c = cfg();
+        c.period = Duration::from_millis(50);
+        c.timeout = Duration::from_millis(20);
+        c.sleep_time = Some(Duration::from_millis(50));
+        let reg = HealthRegistry::new(&[up], c);
+        let cancel = CancellationToken::new();
+        reg.spawn_probes(cancel.clone());
+
+        // 启动后先跑探测，随后 50ms 无连接 → 进入休眠
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(reg.idle_sleeping(), "启动 120ms 后应已进入休眠");
+        let a1 = accepts.load(Ordering::Relaxed);
+        assert!(a1 >= 1, "启动后应至少探测过一次，实际 {a1}");
+
+        // 休眠期：不应再有探测
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let a2 = accepts.load(Ordering::Relaxed);
+        assert_eq!(a2, a1, "休眠期间不应继续探测（{a1} → {a2}）");
+
+        // 新连接到来 → 立即恢复常规探测
+        reg.note_activity();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let a3 = accepts.load(Ordering::Relaxed);
+        assert!(a3 > a2, "新连接后应恢复探测（{a2} → {a3}）");
+
+        cancel.cancel();
+        acceptor.abort();
     }
 }

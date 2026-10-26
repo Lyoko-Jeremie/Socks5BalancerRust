@@ -34,6 +34,18 @@ pub const DEFAULT_MAX_BLOCKING_THREADS: usize = 2;
 pub const DEFAULT_THREAD_STACK_SIZE: usize = 512 * 1024;
 /// worker 线程数硬上限，防止手滑把机器打爆。
 pub const MAX_WORKER_THREADS: usize = 256;
+/// `sleepTime` 默认值：1800000ms = 30min（对齐 C++ `ConfigLoader.cpp:226`）。
+///
+/// 语义：**最近该时长内没有任何新连接**就进入空闲休眠，暂停全部自动探测。目的是避免
+/// 长时间无人使用时，周期探测在后端链路上留下单调、有规律的流量，被链路状态检测/防火墙
+/// 判为异常通信而拉黑后端（C++ README "Full configuration" 与作者说明）。
+pub const DEFAULT_SLEEP_TIME_MS: u64 = 30 * 60 * 1000;
+/// `additionCheckPeriod` 默认值：10000ms = 10s（对齐 C++ `ConfigLoader.cpp:239`）。
+/// 全池不可用且不在空闲休眠时，按该周期强制探测全池。
+pub const DEFAULT_ADDITION_CHECK_PERIOD_MS: u64 = 10 * 1000;
+/// `tcpCheckStart` / `connectCheckStart` 默认值：1000ms（对齐 C++）。
+/// 启动后等待该时长再做首轮探测，给"后端与本程序同时启动、后端起得更慢"的场景留窗口。
+pub const DEFAULT_CHECK_START_MS: u64 = 1_000;
 
 /// 配置错误。
 #[derive(Debug, thiserror::Error)]
@@ -86,6 +98,15 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+/// `disableSocks4` 的默认值：与 C++ 一致（默认 **true**，即默认禁用 SOCKS4/4a）。
+///
+/// 用途：C++ 作者默认关闭 SOCKS4，是因为不少陈旧客户端对 SOCKS4a 的实现并不正确
+/// （域名长度/结尾 NUL 处理、USERID 截断等），放开会带来难排查的异常请求。需要兼容旧
+/// 客户端时必须显式写 `"disableSocks4": false`（Rust 版保留了完整的 SOCKS4/4a 支持）。
+fn default_true() -> bool {
+    true
+}
+
 /// 一个监听目标（host + port）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListenAddr {
@@ -135,9 +156,11 @@ impl RawUpstream {
     }
 }
 
-/// C++ 的 `internalBehavior`（整节在 C++ 中未被解析）。
+/// C++ 的 `internalBehavior`（整节在 C++ `ConfigLoader.cpp` 中从未被解析，属死配置）。
 ///
-/// 仅用于兼容解析与 `connectTimeout` 兜底；其余字段保留定义以免旧配置"静默丢字段"。
+/// Rust 侧只把其中的 `connectTimeout` 作为顶层 `connectTimeout` 缺省时的兜底
+/// （见 `from_value`）；其余字段仅保留定义，让旧配置"不丢字段"且能在启动时明确提示忽略，
+/// 因此这里豁免 `dead_code`。
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
@@ -164,7 +187,6 @@ pub struct AuthUser {
 /// 健康检查原始配置（`healthCheck` 节，字段与 docs/07 ADR-002 对齐）。
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // max_probe_concurrency / connect_fail_mark_degraded 在 M1.5（TLS 探测）启用
 pub struct RawHealthConfig {
     #[serde(default)]
     pub tcp: Option<RawPeriodicProbe>,
@@ -179,9 +201,11 @@ pub struct RawHealthConfig {
     pub down_backoff: Option<RawBackoff>,
     #[serde(default)]
     pub probe_jitter: Option<f64>,
-    /// M1.5（TLS 探测）使用；M1.4 仅解析。
+    /// readiness 探测并发上限（默认 4）。
     #[serde(default)]
     pub max_probe_concurrency: Option<usize>,
+    /// 数据面 connect/握手失败是否立即把上游标为不可用（默认 true，ADR-002 #3）。
+    /// 置 false 时数据面失败只记日志/`relayErrors`，不改变可用性（仅靠周期探测判定）。
     #[serde(default)]
     pub connect_fail_mark_degraded: Option<bool>,
 }
@@ -198,10 +222,9 @@ pub struct RawPeriodicProbe {
     pub start_delay: Option<u64>,
 }
 
-/// 探测目标（M1.5 使用：TLS + HTTP readiness 探测）。
+/// 探测目标（TLS + HTTP readiness 探测）。
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // 字段在 M1.5（TLS/HTTP 探测）启用
 pub struct RawProbeTarget {
     #[serde(default)]
     pub host: Option<String>,
@@ -253,7 +276,8 @@ pub struct TlsProbeConfig {
     pub http_path: String,
     /// User-Agent。
     pub user_agent: String,
-    /// 期望状态码；为空表示接受 2xx/3xx。
+    /// 期望状态码；**为空表示不校验**（只要完成一次 HTTP 往返即视为成功，对齐 C++
+    /// `ConnectTestHttps` 的"只看能否完成往返、不看状态码"语义）。
     pub expect_status: Vec<u16>,
     /// 自定义信任根（PEM 文件）；None 表示使用操作系统根证书。
     pub ca_file: Option<std::path::PathBuf>,
@@ -285,11 +309,23 @@ pub struct HealthConfig {
     pub backoff_jitter: f64,
     /// TLS + HTTP readiness 探测；None 表示只做 TCP liveness。
     pub tls: Option<TlsProbeConfig>,
-    /// `sleepTime`：最近该时长内无新连接则暂停常规探测（DOWN 后端的退避探测继续）；
-    /// None/0 表示不启用。
+    /// `sleepTime`（默认 1800000ms = 30min，对齐 C++）：**最近该时长内无任何新连接**
+    /// 就进入空闲休眠，**暂停全部自动探测**（TCP 周期探测、readiness 周期探测、
+    /// `additionCheckPeriod` 加速探测都停）。
+    ///
+    /// 目的（C++ README "Full configuration" + 作者说明）：长时间完全没人用时，周期探测
+    /// 会在后端链路上留下**单调且有规律**的请求，容易被链路状态检测/防火墙判为异常通信
+    /// 而拉黑后端。休眠期间只在**新连接到来**或**控制面 `check_upstream`** 时恢复探测。
+    ///
+    /// `None`/0 表示不启用休眠（始终周期探测）。
     pub sleep_time: Option<Duration>,
-    /// `additionCheckPeriod`：全池不可用时额外加速探测的周期；None 表示不启用。
+    /// `additionCheckPeriod`（默认 10000ms，对齐 C++）：**全池不可用**且不在
+    /// `sleepTime` 休眠中时，按该周期额外强制探测全池，把恢复窗口从"一个探测周期"
+    /// 压到"约一个 additionCheckPeriod"。`None`/0 表示不启用加速。
     pub addition_check_period: Option<Duration>,
+    /// 数据面 connect/握手失败是否立即把上游标为不可用（默认 true，ADR-002 #3）。
+    /// `connectFailMarkDegraded=false` 时数据面失败不影响可用性，只累加 `relayErrors`。
+    pub connect_fail_mark_degraded: bool,
 }
 
 /// 连接监测原始配置（`connectionTracking` 节）。
@@ -336,11 +372,10 @@ impl Default for ConnTrackingConfig {
 
 /// 原始配置：字段名与 C++ `config.json` 对齐。
 ///
-/// 标注 `allow(dead_code)` 的原因：其中一部分字段（探测周期、控制面等）在 M0 只做兼容解析，
-/// M1–M3 才会真正使用；保留定义可保证旧配置字段有明确归属，也避免 serde 静默丢弃。
+/// 所有字段都会被 `from_value` 读取或映射（含旧字段兼容映射），因此不再需要
+/// `allow(dead_code)`——一旦某个字段被误改成"只解析不生效"，编译器会立刻报出来。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 pub struct RawConfig {
     #[serde(default = "default_listen_host")]
     pub listen_host: String,
@@ -394,7 +429,9 @@ pub struct RawConfig {
     /// 纯 TCP 透传（M0 唯一模式；M1 起为 false 时启用首包识别）。
     #[serde(default)]
     pub tradition_tcp_relay: bool,
-    #[serde(default)]
+    /// 禁用 SOCKS4/4a 入站。默认 **true**（对齐 C++ `ConfigLoader.cpp:242`：默认禁用，
+    /// 避免陈旧的不正确实现客户端触发的异常请求）。
+    #[serde(default = "default_true")]
     pub disable_socks4: bool,
     /// 禁用 HTTP 正向代理（absolute-form）；CONNECT 不受影响。默认 false。
     #[serde(default)]
@@ -906,7 +943,13 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
         return Err(err("upstream 列表为空，至少需要一个上游"));
     }
     if !upstreams.iter().any(|u| u.enabled) {
-        return Err(err("所有上游都被禁用（disable=true），没有可用上游"));
+        // 允许以"全禁用"状态启动（对齐 docs/13 §5.2：上游保留在池中 enabled=false，
+        // 运维可经控制面 `enable_upstream` 启用），不再直接启动失败。
+        // 该状态下新连接一律拒绝（SOCKS5 REP 0x01 / HTTP 502），不会黑洞。
+        notes.push(
+            "所有上游都被禁用（disable=true）：服务正常启动但拒绝新连接，请用控制面 enable_upstream 启用"
+                .into(),
+        );
     }
     if let Some(u) = upstreams
         .iter()
@@ -957,11 +1000,19 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
     // ===== 上游选择规则（M1.3）=====
     let select_rule = match raw.upstream_select_rule.as_deref() {
         None => SelectRule::Random,
-        Some(s) => SelectRule::parse(s).ok_or_else(|| {
-            err(format!(
-                "upstreamSelectRule={s:?} 非法，允许值: loop/random/one_by_one/change_by_time/force_only_one"
-            ))
-        })?,
+        Some(s) => {
+            if s.trim().eq_ignore_ascii_case("inherit") {
+                notes.push(
+                    "upstreamSelectRule=\"inherit\"：Rust 无\"继承上层规则\"语义，按 random 处理；按维度强制上游请用控制面 set_rule(scope=client|listen)"
+                        .into(),
+                );
+            }
+            SelectRule::parse(s).ok_or_else(|| {
+                err(format!(
+                    "upstreamSelectRule={s:?} 非法，允许值: loop/random/one_by_one/change_by_time/force_only_one/inherit"
+                ))
+            })?
+        }
     };
     let server_change_time =
         Duration::from_millis(raw.server_change_time.filter(|v| *v > 0).unwrap_or(60_000));
@@ -996,28 +1047,53 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
         }
     }
 
-    // ===== sleepTime / additionCheckPeriod（旧字段，现已生效）=====
+    // ===== sleepTime / additionCheckPeriod（对齐 C++ README "Full configuration"）=====
+    // C++ 默认：sleepTime=1800000ms(30min)、additionCheckPeriod=10000ms。
+    //
+    // sleepTime 不是"省流量"这么简单：长时间完全没人用时，5s 一轮的周期探测会在后端链路
+    // 上留下单调、有规律的请求，容易被链路状态检测/防火墙视为异常通信并把后端拉黑。
+    // 因此这里对齐 C++：进入休眠后**全部自动探测都暂停**（TCP、readiness、addition 加速
+    // 探测），只有"新连接到来"或控制面 `check_upstream` 才恢复。
+    // 显式写 `"sleepTime": 0` 可关闭休眠（始终周期探测）。
     let mut health = health;
     if health.enabled {
-        if let Some(ms) = raw.sleep_time.filter(|v| *v > 0) {
-            if ms > 86_400_000 {
-                return Err(err("sleepTime 过大（>86400000ms）"));
-            }
-            health.sleep_time = Some(Duration::from_millis(ms));
-            notes.push(format!(
-                "sleepTime={ms}ms：无新连接时暂停常规探测（DOWN 后端仍按退避重探）"
-            ));
+        let sleep_ms = raw.sleep_time.unwrap_or(DEFAULT_SLEEP_TIME_MS);
+        if sleep_ms > 86_400_000 {
+            return Err(err("sleepTime 过大（>86400000ms）"));
         }
-        if let Some(ms) = raw.addition_check_period.filter(|v| *v > 0) {
-            if ms < 1_000 {
+        if sleep_ms > 0 {
+            health.sleep_time = Some(Duration::from_millis(sleep_ms));
+            notes.push(format!(
+                "sleepTime={sleep_ms}ms：最近该时长内无新连接则暂停全部自动探测（新连接或 check_upstream 恢复；显式 0 关闭）"
+            ));
+        } else {
+            notes.push("sleepTime=0：不启用空闲休眠，始终周期探测".into());
+        }
+
+        let addition_ms = raw
+            .addition_check_period
+            .unwrap_or(DEFAULT_ADDITION_CHECK_PERIOD_MS);
+        if addition_ms > 0 {
+            if addition_ms < 1_000 {
                 return Err(err("additionCheckPeriod 不能小于 1000ms"));
             }
-            if ms > 3_600_000 {
+            if addition_ms > 3_600_000 {
                 return Err(err("additionCheckPeriod 过大（>3600000ms）"));
             }
-            health.addition_check_period = Some(Duration::from_millis(ms));
-            notes.push(format!("additionCheckPeriod={ms}ms：全池不可用时加速探测"));
+            health.addition_check_period = Some(Duration::from_millis(addition_ms));
+            notes.push(format!(
+                "additionCheckPeriod={addition_ms}ms：全池不可用时加速探测（休眠中不启用）"
+            ));
+        } else {
+            notes.push("additionCheckPeriod=0：全池不可用时不加速探测".into());
         }
+    }
+
+    if !health.connect_fail_mark_degraded {
+        notes.push(
+            "healthCheck.connectFailMarkDegraded=false：数据面失败只计数，不立即标记上游不可用"
+                .into(),
+        );
     }
 
     // ===== 客户端认证（ADR-004）=====
@@ -1135,8 +1211,16 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
         detail_limit: max_connections.max(1),
         ..ConnTrackingConfig::default()
     };
+    // 旧字段 `disableConnectionTracker`（C++：关闭连接分析）映射到 `connectionTracking.enabled`。
+    // 优先级：新字段 `connectionTracking.enabled` > 旧字段 > 默认（启用）。
     if let Some(v) = tracking_raw.enabled {
         conn_tracking.enabled = v;
+    } else if raw.disable_connection_tracker {
+        conn_tracking.enabled = false;
+        notes.push(
+            "disableConnectionTracker=true：已映射为 connectionTracking.enabled=false（不记录连接监测）"
+                .into(),
+        );
     }
     if let Some(v) = tracking_raw.detail {
         conn_tracking.detail = v;
@@ -1249,6 +1333,8 @@ fn build_health_config(
             tls: None,
             sleep_time: None,
             addition_check_period: None,
+            // 禁用探测时不使用降级开关（`mark_degraded` 先判 enabled）
+            connect_fail_mark_degraded: true,
         });
     }
 
@@ -1263,6 +1349,10 @@ fn build_health_config(
     let period_ms = tcp.period.filter(|v| *v > 0).unwrap_or(DEFAULT_PERIOD_MS);
     let timeout_ms = tcp.timeout.filter(|v| *v > 0).unwrap_or(DEFAULT_TIMEOUT_MS);
     let start_delay_ms = tcp.start_delay.unwrap_or(DEFAULT_START_DELAY_MS);
+    // 首次探测延迟（C++ `tcpCheckStart`）：给"后端与本程序同时启动、后端起得更慢"留出窗口。
+    if start_delay_ms > 3_600_000 {
+        return Err(err("healthCheck.tcp.startDelay 过大（>3600000ms）"));
+    }
     if period_ms < 100 {
         return Err(err("healthCheck.tcp.period 不能小于 100ms"));
     }
@@ -1323,6 +1413,10 @@ fn build_health_config(
             .timeout
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_TLS_TIMEOUT_MS);
+        let connect_start_delay_ms = connect.start_delay.unwrap_or(DEFAULT_START_DELAY_MS);
+        if connect_start_delay_ms > 3_600_000 {
+            return Err(err("healthCheck.connect.startDelay 过大（>3600000ms）"));
+        }
         if http_period_ms < 1_000 {
             return Err(err("healthCheck.connect.period 不能小于 1000ms"));
         }
@@ -1333,7 +1427,7 @@ fn build_health_config(
         Some(TlsProbeConfig {
             period: Duration::from_millis(http_period_ms),
             timeout: Duration::from_millis(http_timeout_ms),
-            start_delay: Duration::from_millis(connect.start_delay.unwrap_or(1_000)),
+            start_delay: Duration::from_millis(connect_start_delay_ms),
             host,
             port,
             sni: target
@@ -1376,6 +1470,7 @@ fn build_health_config(
         // 由 `from_value` 根据 RawConfig 的旧字段填充
         sleep_time: None,
         addition_check_period: None,
+        connect_fail_mark_degraded: raw.connect_fail_mark_degraded.unwrap_or(true),
     })
 }
 
@@ -1483,9 +1578,18 @@ mod tests {
     }
 
     #[test]
-    fn 全部上游禁用_报错() {
+    fn 全部上游禁用_允许启动并提示() {
         let text = r#"{"listenPort":5000,"upstream":[{"host":"a","port":1,"disable":1}]}"#;
-        assert!(load_str(text).is_err());
+        // 对齐 docs/13 §5.2：全禁用不再启动失败，而是保留在池中（enabled=false），
+        // 由控制面 enable_upstream 启用；运行期新连接会被拒绝。
+        let c = load_str(text).unwrap();
+        assert_eq!(c.upstreams.len(), 1);
+        assert!(!c.upstreams[0].enabled);
+        assert!(
+            c.notes.iter().any(|n| n.contains("enable_upstream")),
+            "应提示用控制面启用: {:?}",
+            c.notes
+        );
     }
 
     #[test]
@@ -1806,6 +1910,105 @@ mod tests {
         );
         assert!(c.notes.iter().any(|n| n.contains("sleepTime")));
         assert!(c.notes.iter().any(|n| n.contains("additionCheckPeriod")));
+    }
+
+    #[test]
+    fn 默认值对齐_cpp_检查时序() {
+        let c = load_str(minimal()).unwrap();
+        // sleepTime / additionCheckPeriod / xxxCheckStart 的默认值必须与 C++ README
+        // "Full configuration" 一致，否则迁移后探测节奏会静默变化。
+        assert_eq!(
+            c.health.sleep_time,
+            Some(Duration::from_millis(DEFAULT_SLEEP_TIME_MS)),
+            "sleepTime 默认应为 30min（C++ 默认 1800000ms）"
+        );
+        assert_eq!(
+            c.health.addition_check_period,
+            Some(Duration::from_millis(DEFAULT_ADDITION_CHECK_PERIOD_MS)),
+            "additionCheckPeriod 默认应为 10s（C++ 默认 10000ms）"
+        );
+        assert_eq!(
+            c.health.start_delay,
+            Duration::from_millis(DEFAULT_CHECK_START_MS),
+            "tcpCheckStart 默认应为 1s（C++ 默认 1000ms）"
+        );
+        assert!(
+            c.disable_socks4,
+            "disableSocks4 默认应为 true（对齐 C++，拦掉实现不正确的陈旧客户端）"
+        );
+        assert!(
+            c.health.connect_fail_mark_degraded,
+            "connectFailMarkDegraded 默认应为 true（ADR-002 #3）"
+        );
+    }
+
+    #[test]
+    fn sleep_time_为_0_关闭空闲休眠() {
+        let text = r#"{"listenPort":5000,"sleepTime":0,"upstream":[{"host":"a","port":1}]}"#;
+        let c = load_str(text).unwrap();
+        assert_eq!(c.health.sleep_time, None, "sleepTime=0 应表示始终周期探测");
+    }
+
+    #[test]
+    fn disable_connection_tracker_映射为关闭连接监测() {
+        let text = r#"{"listenPort":5000,"disableConnectionTracker":true,"upstream":[{"host":"a","port":1}]}"#;
+        let c = load_str(text).unwrap();
+        assert!(!c.conn_tracking.enabled, "旧字段应映射为关闭连接监测");
+        assert!(
+            c.notes
+                .iter()
+                .any(|n| n.contains("disableConnectionTracker"))
+        );
+        // 新字段优先
+        let text = r#"{"listenPort":5000,"disableConnectionTracker":true,
+            "connectionTracking":{"enabled":true},
+            "upstream":[{"host":"a","port":1}]}"#;
+        assert!(
+            load_str(text).unwrap().conn_tracking.enabled,
+            "connectionTracking.enabled 应优先于旧字段"
+        );
+    }
+
+    #[test]
+    fn connect_fail_mark_degraded_可关闭() {
+        let text = r#"{"listenPort":5000,
+            "healthCheck":{"connectFailMarkDegraded":false},
+            "upstream":[{"host":"a","port":1}]}"#;
+        let c = load_str(text).unwrap();
+        assert!(!c.health.connect_fail_mark_degraded);
+    }
+
+    #[test]
+    fn inherit_规则降级为_random() {
+        let text = r#"{"listenPort":5000,"upstreamSelectRule":"inherit",
+            "upstream":[{"host":"a","port":1}]}"#;
+        let c = load_str(text).unwrap();
+        assert!(
+            matches!(c.select_rule, SelectRule::Random),
+            "inherit 应按 random 处理，避免 C++ 配置迁移启动失败"
+        );
+        assert!(c.notes.iter().any(|n| n.contains("inherit")));
+    }
+
+    #[test]
+    fn 旧字段_check_start_映射到_start_delay() {
+        let text = r#"{"listenPort":5000,
+            "tcpCheckStart":2500,
+            "connectCheckStart":3000,
+            "testRemoteHost":"example.com",
+            "testRemotePort":443,
+            "upstream":[{"host":"a","port":1}]}"#;
+        let c = load_str(text).unwrap();
+        assert_eq!(
+            c.health.start_delay,
+            Duration::from_millis(2_500),
+            "tcpCheckStart 应映射到 TCP 首探延迟"
+        );
+        assert_eq!(
+            c.health.tls.expect("应启用 TLS 探测").start_delay,
+            Duration::from_millis(3_000),
+            "connectCheckStart 应映射到 readiness 首探延迟"
+        );
     }
 
     #[test]

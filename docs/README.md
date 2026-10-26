@@ -42,7 +42,9 @@
 阅读顺序建议：**01 → 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09 → 10 → 11 → 12 → 13**。
 只想快速决策：读本文 §3/§4/§5；准备动手写代码：读 **07（决策）+ 02 §8 + 06 §7**。
 
-> **当前进度（2026-10-26）**：**M0 ✅；M1（M1.1–M1.5）✅；M2 ✅；M3 ✅；M4 内存基线 ✅；M5 交付物 ✅（待 Linux 实测回填）**。已实现：SOCKS5 入站 0x00/0x02（RFC1929、CONNECT、错误码回传）、**SOCKS4 USERID 与 HTTP Basic 入站认证**、上游 SOCKS5 握手（含上游认证）、5 条选路规则 + **每客户端 hint 粘性**、**retryTimes 数据面失败切换**、fail-fast 健康检查（DOWN 指数退避 + 数据面降级 + 快速重探 + **sleepTime 空闲暂停 + additionCheckPeriod 全池加速 + 探测 RTT**）、TLS + HTTP readiness 探测（**expectStatus 空=不校验**）、混合端口（SOCKS5 / SOCKS4-4a / HTTP CONNECT / HTTP forward）、**DNS TTL 刷新（dnsTtl）**、**Linux per-core listener（SO_REUSEPORT）**、精简控制面（4 基础端点 + 2 连接监测端点、运行期启停/改规则/立即探测、**连接监测默认明细**（`/api/v1/connections`、`/summary`）与 `close_conn`/`close_all`、独立监控监听、无鉴权仅回环、响应不含密码）。端到端验收：协议 10/10、健康检查 6/6、TLS readiness 9/9、混合协议 9/9、控制面 19/19；单元测试 **105** 个全绿；**内存实测：`bufferSize=2048` 下 10K 空闲连接推算 ≈ 98.5 MB（Windows 口径；Linux 预计 ~69 MB；连接监测明细默认开启再 +1.5–2 MB，严格 100MB 口径可 `connectionTracking.detail=false`）**。交付物：Dockerfile（含 `.dockerignore`）、systemd 单元、生产配置、`.github/workflows/ci.yml`（Linux/Windows 双平台 CI + 编码检查）、`fuzz/`（SOCKS5/HTTP/SOCKS4 解析）、Linux C10K/1K 压测与 24h 长稳脚本。**下一步：Linux C10K/1K 实测、24h 长稳、用实测回填 12 号文档**。详见 [13-m5-deployment.md](13-m5-deployment.md)。
+> **当前进度（2026-10-26）**：**M0 ✅；M1（M1.1–M1.5）✅；M2 ✅；M3 ✅；M4 内存基线 ✅；M5 交付物 ✅（待 Linux 实测回填）**。已实现：SOCKS5 入站 0x00/0x02（RFC1929、CONNECT、错误码回传）、**SOCKS4 USERID 与 HTTP Basic 入站认证**、上游 SOCKS5 握手（含上游认证）、5 条选路规则 + **每客户端 hint 粘性**、**retryTimes 数据面失败切换**、fail-fast 健康检查（DOWN 指数退避 + 数据面降级 + 快速重探 + **sleepTime 空闲休眠（默认 30min，休眠期暂停全部自动探测，防规律流量被防火墙拉黑）** + **additionCheckPeriod 全池加速（默认 10s，休眠中不启用）** + **tcpCheckStart/connectCheckStart 启动延迟（默认 1s）** + 探测 RTT）、TLS + HTTP readiness 探测（**expectStatus 空=不校验**）、混合端口（SOCKS5 / SOCKS4-4a / HTTP CONNECT / HTTP forward）、**DNS TTL 刷新（dnsTtl）**、**Linux per-core listener（SO_REUSEPORT）**、**`listenHost:"::"` 双栈**、**TCP 半关闭传播（客户端 SHUT_WR 后反向数据继续转发到 EOF）**、**上游全禁用仍可启动（控制面 enable_upstream 救活）**、`upstreamSelectRule="inherit"` 兼容降级、精简控制面（4 基础端点 + 2 连接监测端点、运行期启停/改规则/立即探测、**连接监测默认明细**（`/api/v1/connections`、`/summary`）与 `close_conn`/`close_all`、独立监控监听、无鉴权仅回环、响应不含密码）。端到端验收：协议 10/10、健康检查 6/6、TLS readiness 9/9、混合协议 9/9、控制面 19/19；单元测试 **118** 个全绿（105 + 第一档新增 13）；**内存实测：`bufferSize=2048` 下 10K 空闲连接推算 ≈ 98.5 MB（Windows 口径；Linux 预计 ~69 MB；连接监测明细默认开启再 +1.5–2 MB，严格 100MB 口径可 `connectionTracking.detail=false`）**。交付物：Dockerfile（含 `.dockerignore`）、systemd 单元、生产配置、`.github/workflows/ci.yml`（Linux/Windows 双平台 CI + 编码检查）、`fuzz/`（SOCKS5/HTTP/SOCKS4 解析）、Linux C10K/1K 压测与 24h 长稳脚本。**下一步：Linux C10K/1K 实测、24h 长稳、用实测回填 12 号文档**。详见 [13-m5-deployment.md](13-m5-deployment.md)。
+
+> **2026-10-26 第一档修复**（本日第二轮）：① 健康检查时序对齐 C++ README "Full configuration"：`sleepTime`（默认 1800000ms）在空闲时**暂停全部自动探测**（含 DOWN 退避与 addition 加速），`additionCheckPeriod`（默认 10000ms）仅在全池不可用且未休眠时生效，`tcpCheckStart`/`connectCheckStart` 默认 1000ms，`disableSocks4` 默认 `true`；② 修掉 `connectFailMarkDegraded` 死字段、`disableConnectionTracker` 静默忽略、全上游禁用导致启动失败、`inherit` 规则启动报错；③ 修正 TCP 半关闭截断（C++ 缺陷 R-1）与 `listenHost:"::"` 的 IPv4 不可达；④ 清理 `.idea` 入库、启动文案 M0/M1 残留，修正 09/11/12/13 号文档与 CI 编码检查的过期/矛盾表述。
 
 > **2026-10-26 修订**：用户已就 7 项关键取舍作出决策（控制面精简不鉴权、健康检查 fail-fast 不重试且异常后端降频、线程数可配置、SOCKS5 仅 0x00/0x02、双向 8K 预分配、TLS 探测对齐 C++、优先成熟库），已固化为 [07-decisions.md](07-decisions.md)，并同步修订 01/02/04/05/06 的"Rust 建议"部分。C++ 现状分析部分不变。
 
@@ -162,7 +164,9 @@
 
 ## 8. 编码与工程约定（Rust 侧）
 
-- 全部源码、配置、文档 **UTF-8（无 BOM）**，换行 LF；
+- 全部源码、配置、文档 **UTF-8（无 BOM）**，换行 LF；**唯一例外**：`scripts/*.ps1` 必须带 UTF-8 BOM
+  （Windows PowerShell 5.1 在无 BOM 时会把中文读成乱码），换行仍要求 LF——这一例外由 CI 的
+  encoding job 显式校验（见 `.github/workflows/ci.yml`）；
 - 注释用中文，标识符/API 名保留英文；
 - 跨平台：Windows + Linux 必须同时通过 CI（已提供 `.github/workflows/ci.yml`：双平台 `fmt`/`clippy`/`test`，Linux 追加 release 构建与 `scripts/ci-linux.sh` 冒烟，另有独立的 UTF-8 无 BOM / LF 编码检查 job）；
 - 优先使用成熟 crate（见 [06](06-rust-port-assessment.md) §5.2）；

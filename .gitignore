@@ -1,3 +1,4 @@
 /target
 .analysis
-
+# IDE 配置不入库（提交 c47b743 声称"撤销误提交的 .idea"但只删了一行，这里补全）
+.idea/

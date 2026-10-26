@@ -98,7 +98,9 @@ C++ 版健康检查的问题（详见 [04](04-control-monitor.md) §3）：
    - **只看能否完成一次 HTTP 往返**，默认不校验状态码（对齐 C++ `ConnectTestHttps` 的判定）；如需严格可用 `expectStatus` 配置。
 8. **单写者（未完全实现）**：实现中健康探测器任务写健康状态，数据面连接失败直接调用 `mark_degraded`（1s 后快速重探确认），未走"只上报事件"的 mpsc 路径；行为等价（及时摘除），但并发写路径比理想方案多一处（原子操作，无数据竞争）。
 9. **全池不可用**：新连接立即拒绝（RST/关闭）并计入 `rejected_total`，**不黑洞**（C++ 会接受连接后永久挂起，见 04 §4.5）。
-10. **`sleepTime` 保留**：最近 `sleepTime` 内无新连接则暂停常规探测（省流量），但 `down` 后端的退避探测继续（否则无法恢复）。
+10. **`sleepTime` 保留且默认生效（1800000ms）**：最近 `sleepTime` 内无新连接就进入空闲休眠，**暂停全部自动探测**（TCP 周期探测、readiness 周期探测、`additionCheckPeriod` 加速探测都停）；新连接或控制面 `check_upstream` 恢复。目的不是省流量，而是防止长时间无人使用时，有规律的周期探测被链路状态检测/防火墙判为异常通信而拉黑后端（C++ README "Full configuration" 与作者说明）。显式 `sleepTime: 0` 关闭休眠。注意：`additionCheckPeriod` 的加速探测**不能**刷新"最近连接时间"，否则全池 DOWN 且无人使用时会自己阻止进入休眠。
+11. **`additionCheckPeriod` 保留且默认生效（10000ms）**：仅在全池不可用**且不在 `sleepTime` 休眠中**时加速探测（对齐 C++ `UpstreamPool.cpp:419-423`）。
+12. **`tcpCheckStart` / `connectCheckStart` 默认 1000ms**：启动后延迟首轮探测，给"后端与本程序同时启动、后端起得更慢"留窗口；同时启动期乐观判定（liveness/readiness 初值 true），避免一启动就把所有后端判死。
 
 ### 后果
 - 坏后端在**一个探测周期 + 一次连接失败**内被摘除，不再等 5 分钟。
@@ -321,14 +323,21 @@ C++ 版 `ConnectTestHttps`（712 行）是"最能证明上游真的能出网"的
     "connectFailMarkDegraded": true // 数据面 connect 失败即降级（快速切换）
   },
 
+  // ===== 检查时序的旧字段（保留；默认值与 C++ README "Full configuration" 一致）=====
+  // 它们是 healthCheck.tcp/connect.* 的同义旧字段，新字段优先。
+  "tcpCheckStart": 1000,          // = healthCheck.tcp.startDelay（启动后首轮探测延迟）
+  "connectCheckStart": 1000,      // = healthCheck.connect.startDelay
+  "additionCheckPeriod": 10000,   // 全池不可用且未休眠时加速探测
+  "sleepTime": 1800000,           // 30min 无新连接 → 暂停全部自动探测（0 = 关闭休眠）
+  "disableConnectionTracker": false, // 旧字段：true = 关闭连接监测
+
   // ===== SOCKS5 入站 =====
-  "socks5": {
-    "enableNoAuth": true,
-    "enableUserPass": true,       // 需 AuthClientInfo 非空才生效
-    "allowCommand": ["connect"]   // 仅 connect；bind/udp 固定 0x07
-  },
-  "disableSocks4": false,         // 保留：SOCKS4/4a 仍支持（ADR-004 只约束 SOCKS5 方法）
-  "disableHttp": false            // 可选：是否接受 HTTP CONNECT
+  // 注意：这里曾计划 `socks5: { enableNoAuth, enableUserPass, allowCommand }` 三开关，
+  // **实际未落地**——入站行为固定按 ADR-004：方法只接受 0x00/0x02，CMD 只接 CONNECT
+  // （BIND/UDP 回 0x07）。若将来要开放，再引入该节并同步迁移说明。
+  "disableSocks4": true,          // 默认 true（对齐 C++）：默认禁用 SOCKS4/4a，
+                                  // 避免实现不正确的陈旧客户端；需要兼容时显式写 false
+  "disableHttpForward": false     // 禁用 HTTP absolute-form 正向代理；CONNECT 不受影响
 }
 ```
 
@@ -337,14 +346,18 @@ C++ 版 `ConnectTestHttps`（712 行）是"最能证明上游真的能出网"的
 | 旧字段（C++ config.json） | 新语义 |
 |---|---|
 | `threadNum` | 最大 worker 线程数（`min(核数, threadNum)`） |
-| `tcpCheckPeriod` / `tcpCheckStart` | `healthCheck.tcp.period/startDelay` |
-| `connectCheckPeriod` / `connectCheckStart` | `healthCheck.connect.period/startDelay` |
-| `additionCheckPeriod` | 保留：全池不可用时的加速探测周期（默认 10000） |
-| `sleepTime` | 保留：无连接时暂停常规探测的窗口 |
+| `tcpCheckPeriod` / `tcpCheckStart` | `healthCheck.tcp.period/startDelay`（`startDelay` 默认 1000ms，启动后首轮探测延迟） |
+| `connectCheckPeriod` / `connectCheckStart` | `healthCheck.connect.period/startDelay`（`startDelay` 默认 1000ms） |
+| `additionCheckPeriod` | 保留并**默认生效（10000ms）**：全池不可用**且不在 `sleepTime` 休眠中**时加速探测 |
+| `sleepTime` | 保留并**默认生效（1800000ms）**：最近该时长内无新连接即**暂停全部自动探测**（防规律流量被防火墙拉黑）；显式 `0` 关闭 |
+| `serverChangeTime` | 保留（`change_by_time` 周期）；Rust 默认 **60000ms**（C++ 为 5000ms，见迁移差异） |
+| `stateServerPort` | 保留；Rust 默认 **5110**（C++ 为 5010，避免与本机其它实例冲突） |
+| `disableConnectionTracker` | 映射为 `connectionTracking.enabled=false`（`connectionTracking.enabled` 优先） |
+| `disableSocks4` | 保留；**默认 true**（对齐 C++，默认禁用 SOCKS4/4a） |
 | `testRemoteHost` / `testRemotePort` | `healthCheck.target.host/port`（若新旧同时存在，新字段优先） |
 | `disableConnectTest` | `true` 时等价 `healthCheck=false`（仅保留手动禁用判定） |
 | `connectTimeout` | 上游 connect 超时（**Rust 必须真正使用**） |
-| `internalBehavior.*` | **不再解析**（C++ 死配置），文档标注废弃 |
+| `internalBehavior.*` | 仅其 `connectTimeout` 在顶层缺省时作兜底；其余字段忽略并提示 |
 
 > **兼容策略**：旧字段全部可读；新字段优先；两者冲突时打 warning 日志。
 

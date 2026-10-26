@@ -60,6 +60,8 @@ curl --proxy socks5h://127.0.0.1:5000 https://example.com
 ```
 
 同一端口 5000 同时支持：SOCKS5、SOCKS4/4a、HTTP CONNECT、HTTP 正向代理（按首包自动识别）。
+> **SOCKS4/4a 默认是关闭的**（`disableSocks4` 默认 `true`，与 C++ 版一致，用于拦掉实现不正确的
+> 陈旧客户端）；需要时在配置里显式写 `"disableSocks4": false`。
 
 ## 本地自测（不依赖真实上游）
 
@@ -127,17 +129,28 @@ curl -X POST -H "Content-Type: application/json" \
 | `firstPacketTimeout` | `15000` | 下游首包超时（毫秒），防哑连接 |
 | `handshakeTimeout` | `10000` | 协议握手超时（毫秒） |
 | `traditionTcpRelay` | `false` | `true` = 纯 TCP 透传（不解析协议） |
-| `disableSocks4` | `false` | 禁用 SOCKS4/4a 入站 |
+| `disableSocks4` | `true` | 禁用 SOCKS4/4a 入站。**默认 `true`（对齐 C++）**：拦掉实现不正确的陈旧客户端；需要 SOCKS4 时显式写 `false` |
 | `disableHttpForward` | `false` | 禁用 HTTP 正向代理（absolute-form）；此时回 `501 + Allow: CONNECT`，CONNECT 不受影响 |
 | `stateServerHost/Port` | `127.0.0.1` / `5110` | 控制面地址；`0` 表示禁用 |
 | `monitorServerHost/Port` | 未配置（复用控制面） | 监控端点独立监听（只读，不含 `/control` 写命令）；不配或 `monitorServerPort=0` 时与控制面共用监听 |
 | `connectionTracking` | 启用且明细开启 | 连接监测：`enabled`/`detail`/`detailLimit`/`clientTopLimit`；`detail=false` 只保留三维度计数（`/connections` 为空） |
-| `healthCheck.tcp` | period 5000 / timeout 2000 | TCP 探活周期与超时（一次失败即 DOWN） |
+| `disableConnectionTracker` | `false` | 旧字段：`true` 等价 `connectionTracking.enabled=false` |
+| `healthCheck.tcp` | period 5000 / timeout 2000 / startDelay 1000 | TCP 探活周期、超时与**首轮延迟**（一次失败即 DOWN） |
+| `healthCheck.connect` | period 300000 / timeout 11000 / startDelay 1000 | TLS/HTTP readiness 探测（需配 `healthCheck.target`） |
+| `healthCheck.connectFailMarkDegraded` | `true` | 数据面 connect/握手失败是否立即标记该上游不可用（`false` = 只计数，交给周期探测判定） |
 | `healthCheck.target` | 未配置 | TLS/HTTP readiness 目标（如 `{"host":"www.example.com","port":443}`），不配则只做 TCP |
-| `sleepTime` | 未配置 | 最近该时长（毫秒）无新连接则暂停常规探测；DOWN 后端仍按退避重探 |
-| `additionCheckPeriod` | 未配置 | 全池不可用时按该周期（毫秒）加速探测 |
+| `sleepTime` | `1800000` | **30 分钟内无新连接 → 暂停全部自动探测**（TCP/readiness/全池加速探测都停），防止长时间无人使用时后端链路上出现规律探测流量被防火墙拉黑；新连接或 `check_upstream` 立即恢复；**写 `0` 关闭休眠** |
+| `additionCheckPeriod` | `10000` | 全池不可用且未休眠时按该周期加速探测（把恢复窗口压到一个周期内）；`0` 关闭 |
+| `tcpCheckStart` / `connectCheckStart` | `1000` / `1000` | 旧字段：启动后首轮探测延迟（等价 `healthCheck.tcp.startDelay` / `healthCheck.connect.startDelay`） |
 
-> 完整字段：`config.example.json`（开发）与 `deploy/config.example.json`（生产）。
+> **关于自动检查的时序（迁移/上线前必读）**：默认节奏是"启动后 1s 首探、之后每 5s 一轮 TCP 探活、
+> 每 5min 一轮 TLS/HTTP 探测；**30 分钟没有任何新连接就全部安静下来**"，与 C++ 版一致。
+> 如果后端与本程序同时启动、后端起得更慢，`tcpCheckStart`/`connectCheckStart` 与启动期乐观判定
+> （启动瞬间先视为可用）会避免"一启动就全判死"；万一全池被判死，`additionCheckPeriod` 会每 10s
+> 加速重探，后端起来后自动恢复。
+
+> 示例配置：`config.example.json`（开发，含常用字段）与 `deploy/config.example.json`（生产，含 TLS 探测/连接监测）；
+> **完整字段字典**见 [docs/13 §5](docs/13-m5-deployment.md) 与 `src/config.rs`（未知字段会在启动时告警）。
 
 ## 连接监测（简要）
 

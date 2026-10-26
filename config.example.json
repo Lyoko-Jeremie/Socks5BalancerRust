@@ -7,6 +7,8 @@
   ],
   "retryTimes": 3,
   "connectTimeout": 2000,
+  "firstPacketTimeout": 15000,
+  "handshakeTimeout": 10000,
 
   "threadNum": 0,
   "workerThreads": 0,
@@ -21,6 +23,8 @@
 
   "traditionTcpRelay": true,
   "disableSocks4": false,
+  "disableHttpForward": false,
+  "disableConnectionTracker": false,
 
   "stateServerHost": "127.0.0.1",
   "stateServerPort": 5110,
@@ -29,6 +33,15 @@
   "upstreamSelectRule": "loop",
   "serverChangeTime": 60000,
   "sleepTime": 1800000,
+  "additionCheckPeriod": 10000,
+  "dnsTtl": 60000,
+
+  "connectionTracking": {
+    "enabled": true,
+    "detail": true,
+    "detailLimit": 10000,
+    "clientTopLimit": 100
+  },
 
   "healthCheck": {
     "tcp": { "period": 5000, "timeout": 2000, "startDelay": 1000 },

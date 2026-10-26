@@ -1,15 +1,14 @@
-//! Socks5BalancerRust —— M0 骨架。
+//! Socks5BalancerRust —— 多上游 SOCKS 代理负载均衡器（二进制入口）。
 //!
-//! 阶段目标（docs/06 §10）：
+//! 当前能力（阶段与验收状态见 docs/06 §10）：
 //! - 配置解析（兼容 C++ `config.json`，支持新字段）与校验；
 //! - `tracing` 异步日志；
 //! - tokio runtime，worker/blocking/栈大小全部可配（ADR-003）；
-//! - 多监听（每目标解析出的全部地址）；
-//! - 纯 TCP 双向透传（双向缓冲预分配，ADR-005）；
-//! - 优雅关闭（SIGINT/SIGTERM → 取消 → 收尾）。
-//!
-//! M1 起将在此基础上加入：SOCKS5 首包识别/0x00/0x02 协商、5 条选路规则、
-//! 健康检查（fail-fast + DOWN 退避）、TLS 探测等（见 docs/07-decisions.md）。
+//! - 多监听（每目标解析出的全部地址，`::` 支持双栈）；
+//! - 混合端口按首包分派：SOCKS5 / SOCKS4 / SOCKS4a / HTTP CONNECT 与 absolute-form；
+//! - 上游 SOCKS5 池与选路规则、健康检查（TCP 探活 + fail-fast + DOWN 退避 + TLS 探测）；
+//! - 纯 TCP 透传模式（`traditionTcpRelay=true`）；
+//! - 控制面/监控面只读端点、连接监测、优雅关闭（含 TCP 半关闭传播）。
 
 // 模块定义在库 crate（src/lib.rs）中，二进制只做装配与启动
 use socks5_balancer_rust::{app, config, conn, control, health, logging, net, stats, upstream};
@@ -35,7 +34,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 #[command(
     name = "Socks5BalancerRust",
     version,
-    about = "多上游 SOCKS5 代理 TCP 负载均衡器（Rust 移植 · M0：纯 TCP 透传骨架）"
+    about = "多上游 SOCKS 代理负载均衡器（SOCKS5 / SOCKS4 / SOCKS4a / HTTP CONNECT，Rust 移植）"
 )]
 struct Cli {
     /// 配置文件路径
@@ -62,18 +61,39 @@ fn main() -> ExitCode {
         warn!("配置提示: {note}");
     }
     if !cfg.tradition_tcp_relay {
-        info!("入站模式：SOCKS5 终结（支持 0x00 无认证 / 0x02 用户名密码，ADR-004）");
+        info!(
+            "入站模式：混合端口按首包分派（SOCKS5 / SOCKS4 / SOCKS4a / HTTP CONNECT 与 absolute-form）"
+        );
+        info!("SOCKS5 支持 0x00 无认证 / 0x02 用户名密码（ADR-004）");
         if cfg.auth.is_empty() {
             info!("未配置 AuthClientInfo：客户端将协商为 0x00 无认证");
         } else {
-            info!(users = cfg.auth.len(), "已启用客户端用户名密码认证（0x02）");
+            info!(
+                users = cfg.auth.len(),
+                "已启用客户端认证（SOCKS5 0x02 / SOCKS4 userid / HTTP Basic）"
+            );
         }
-        warn!("M1 仅支持 SOCKS5 入站；SOCKS4/4a 与 HTTP CONNECT 将在 M2 实现");
+        if cfg.disable_socks4 {
+            info!("SOCKS4/4a 已禁用（disableSocks4=true）");
+        }
+        if cfg.disable_http_forward {
+            info!("HTTP absolute-form 正向代理已禁用（disableHttpForward=true），CONNECT 不受影响");
+        }
     } else {
         info!("入站模式：纯 TCP 透传（traditionTcpRelay=true），不做协议解析");
     }
 
     let workers = config::effective_worker_threads(&cfg.thread);
+    // ADR-003：`workerThreads` 允许超过核数（特殊场景），但超订阅无收益，启动时明确告警。
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if workers > cores {
+        warn!(
+            workers,
+            cores, "worker 线程数超过可用核数（ADR-003：超订阅无收益，仅用于特殊场景）"
+        );
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .max_blocking_threads(cfg.thread.max_blocking_threads)
@@ -89,7 +109,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match runtime.block_on(run(cfg, workers)) {
+    match runtime.block_on(run(cfg, workers, cores)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!("运行期错误: {e}");
@@ -98,10 +118,15 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run(cfg: config::Config, workers: usize) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    cfg: config::Config,
+    workers: usize,
+    cores: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Arc::new(cfg);
     info!(
         workers,
+        available_cores = cores,
         max_blocking_threads = cfg.thread.max_blocking_threads,
         thread_stack_kb = cfg.thread.stack_size / 1024,
         buffer_size = cfg.buffer_size,

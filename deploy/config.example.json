@@ -37,6 +37,10 @@
   "upstreamSelectRule": "random",
   "serverChangeTime": 60000,
 
+  "sleepTime": 1800000,
+  "additionCheckPeriod": 10000,
+  "dnsTtl": 60000,
+
   "upstream": [
     {
       "name": "proxy-a",

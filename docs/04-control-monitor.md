@@ -1479,8 +1479,8 @@ loop {
 | 并发 | `Semaphore(maxProbeConcurrency)`（默认 4）限制在途探测 | 无并发限制，M 个 TLS 握手齐发 |
 | 判定语义 | `liveness`（TCP 建连）与 `readiness`（经上游到目标完成一次 TLS+HTTP 往返）分开记录；`available = liveness && readiness && !manual_disabled`（沿用 C++） | `isOffline` / `lastConnectFailed` 混用，恢复要求两者都成功 |
 | 单写者 | 只有探测器 task 写健康状态；数据面只上报"本次连接失败"事件（`mpsc` / 原子计数，`connectFailMarkDegraded`），**不直接改状态** | 探测回调 + 数据面 + 控制 API 三处写（§8.8 CC-1） |
-| 全池不可用 | 新连接**立即拒绝**（RST/关闭）并计入 `rejected_total`，**不黑洞**；`additionCheckPeriod`（默认 10000ms）仍保留为全池不可用时的加速探测周期 | 接受连接后永久挂起（§4.5） |
-| `sleepTime` | 保留：最近 `sleepTime` 内无新连接则暂停**常规**探测（省流量），但 `down` 后端的**退避探测继续**（否则无法恢复） | 保留字段，语义相同 |
+| 全池不可用 | 新连接**立即拒绝**（RST/关闭）并计入 `rejected_total`，**不黑洞**；`additionCheckPeriod`（默认 10000ms，**默认生效**）在"全池不可用 **且不在 `sleepTime` 休眠中**"时按该周期加速探测一轮全池 | 接受连接后永久挂起（§4.5） |
+| `sleepTime` | **默认 1800000ms（30min，对齐 C++）**：最近 `sleepTime` 内无新连接就进入空闲休眠，**暂停全部自动探测**——TCP 周期探测、readiness 周期探测、`additionCheckPeriod` 加速探测都停（对齐 C++ 三个定时器共同的 `now - lastConnectComeTime <= sleepTime` 门控）。恢复条件：新连接到来或控制面 `check_upstream`。**显式 `0` 关闭休眠**。目的不是省流量，而是避免长时间无人使用时后端链路上出现单调、有规律的探测流量，被链路状态检测/防火墙判为异常通信而拉黑后端（C++ README "Full configuration" 与作者说明） | C++ 同样语义（冻结 `lastConnectComeTime`，三个定时器全部门控）；Rust 早期实现曾让 `down` 后端在休眠期继续退避探测、且 `addition` 不受门控，已改为**全停** |
 
 要点：
 

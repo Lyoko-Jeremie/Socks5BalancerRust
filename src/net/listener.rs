@@ -34,50 +34,65 @@ pub async fn bind_all(
     socket_send_buffer: usize,
     replicas: usize,
 ) -> io::Result<Vec<(TcpListener, SocketAddr)>> {
-    let mut out: Vec<(TcpListener, SocketAddr)> = Vec::new();
-    let mut last_err: Option<io::Error> = None;
-    let mut seen: Vec<SocketAddr> = Vec::new();
     let replicas = replicas.max(1);
 
+    // 第一阶段：解析全部监听目标并去重。双栈决策需要"同一端口是否存在 IPv4 监听"的
+    // 全局信息（docs/05 §5.2.1、§10.5），必须在绑定前一次性拿全，否则先绑定的 `::`
+    // 双栈 socket 会抢占后续 IPv4 地址的同端口绑定。
+    let mut addrs: Vec<SocketAddr> = Vec::new();
+    let mut last_err: Option<io::Error> = None;
     for t in targets {
-        let addrs = match tokio::net::lookup_host((t.host.as_str(), t.port)).await {
-            Ok(it) => it.collect::<Vec<_>>(),
+        match tokio::net::lookup_host((t.host.as_str(), t.port)).await {
+            Ok(it) => {
+                let mut resolved = 0usize;
+                for addr in it {
+                    resolved += 1;
+                    // 同一目标解析出的重复地址只处理一次（避免与 replicas 去重逻辑冲突）
+                    if !addrs.contains(&addr) {
+                        addrs.push(addr);
+                    }
+                }
+                if resolved == 0 {
+                    warn!(target = %t, "监听地址解析结果为空");
+                }
+            }
             Err(e) => {
                 warn!(target = %t, error = %e, "监听地址解析失败");
                 last_err = Some(e);
-                continue;
             }
-        };
-        if addrs.is_empty() {
-            warn!(target = %t, "监听地址解析结果为空");
-            continue;
         }
-        for addr in addrs {
-            // 同一目标解析出的重复地址只处理一次（避免与 replicas 去重逻辑冲突）
-            if seen.contains(&addr) {
-                continue;
-            }
-            seen.push(addr);
-            for i in 0..replicas {
-                match bind_one(addr, socket_recv_buffer, socket_send_buffer) {
-                    Ok(listener) => {
-                        let local = listener.local_addr()?;
-                        out.push((listener, local));
+    }
+
+    // 同端口存在 IPv4 监听时，IPv6 必须 v6-only，否则双栈 socket 会抢占该端口。
+    let v4_ports: Vec<u16> = addrs
+        .iter()
+        .filter(|a| a.is_ipv4())
+        .map(|a| a.port())
+        .collect();
+
+    // 第二阶段：逐个地址绑定（每个地址 replicas 个副本）。
+    let mut out: Vec<(TcpListener, SocketAddr)> = Vec::new();
+    for addr in addrs {
+        let only_v6 = v6_only_for(addr, &v4_ports);
+        for i in 0..replicas {
+            match bind_one(addr, only_v6, socket_recv_buffer, socket_send_buffer) {
+                Ok(listener) => {
+                    let local = listener.local_addr()?;
+                    out.push((listener, local));
+                }
+                Err(e) => {
+                    if i == 0 {
+                        warn!(%addr, error = %e, "绑定失败");
+                        last_err = Some(e);
+                    } else {
+                        debug!(
+                            %addr,
+                            replicas = i,
+                            error = %e,
+                            "per-core listener 副本绑定失败，已降级"
+                        );
                     }
-                    Err(e) => {
-                        if i == 0 {
-                            warn!(%addr, error = %e, "绑定失败");
-                            last_err = Some(e);
-                        } else {
-                            debug!(
-                                %addr,
-                                replicas = i,
-                                error = %e,
-                                "per-core listener 副本绑定失败，已降级"
-                            );
-                        }
-                        break;
-                    }
+                    break;
                 }
             }
         }
@@ -91,8 +106,19 @@ pub async fn bind_all(
     Ok(out)
 }
 
+/// IPv6 监听是否必须限制为 v6-only。
+///
+/// 规则（docs/05 §5.2.1、§10.5，对齐 C++ `listenHost: "::"` 的双栈行为）：
+/// - 同端口**没有** IPv4 监听 → 启用双栈（`set_only_v6(false)`），否则 IPv4 客户端无法接入；
+/// - 同端口**存在** IPv4 监听 → 必须 `set_only_v6(true)`，避免双栈 socket 抢占该端口而让
+///   后绑定的 IPv4 listener 失败（Windows 上表现为 `WSAEADDRINUSE`）。
+fn v6_only_for(addr: SocketAddr, v4_ports: &[u16]) -> bool {
+    addr.is_ipv6() && v4_ports.contains(&addr.port())
+}
+
 fn bind_one(
     addr: SocketAddr,
+    only_v6: bool,
     socket_recv_buffer: usize,
     socket_send_buffer: usize,
 ) -> io::Result<TcpListener> {
@@ -115,9 +141,10 @@ fn bind_one(
             debug!(error = %e, "SO_REUSEPORT 设置失败（忽略）");
         }
     }
-    // IPv6 只监听 v6，避免与同端口的 v4 绑定冲突（等价于 C++ 分别 bind 两个 endpoint）。
+    // IPv6：同端口无 IPv4 监听时启用双栈（见 `v6_only_for`），否则 v6-only 避免端口冲突。
+    // Windows/Linux 的 `IPV6_V6ONLY` 默认值不同，这里始终显式设置，跨平台行为一致。
     if addr.is_ipv6() {
-        let _ = sock.set_only_v6(true);
+        let _ = sock.set_only_v6(only_v6);
     }
     // 显式 socket 缓冲（0 = 用系统默认）。注意：Linux 上 accepted socket 会继承 listener 的缓冲设置，
     // Windows 不继承；M1 会在 accepted 连接上再设置一次。
@@ -268,5 +295,26 @@ mod tests {
         assert!(is_fd_exhausted(&e));
         let e = io::Error::from_raw_os_error(9); // EBADF 不是耗尽
         assert!(!is_fd_exhausted(&e));
+    }
+
+    #[test]
+    fn 双栈仅在无同端口_ipv4_监听时启用() {
+        let v6_any: SocketAddr = "[::]:5000".parse().unwrap();
+        let v4_any: SocketAddr = "0.0.0.0:5000".parse().unwrap();
+        let v6_loopback: SocketAddr = "[::1]:5000".parse().unwrap();
+        let v4_loopback: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // 同端口没有 IPv4 监听 → 启用双栈（v6-only = false），IPv4 客户端仍可接入
+        assert!(!v6_only_for(v6_any, &[]));
+        // 同端口存在 IPv4 监听 → 必须 v6-only，避免抢占端口
+        assert!(v6_only_for(v6_any, &[5000]));
+        // IPv4 监听的端口不同 → 双栈无冲突
+        assert!(!v6_only_for(v6_any, &[6000]));
+        // IPv4 地址本身永远不需要 v6-only
+        assert!(!v6_only_for(v4_any, &[5000]));
+        assert!(!v6_only_for(v4_loopback, &[5000]));
+        // 具体（非通配）IPv6 地址同样按端口决策
+        assert!(v6_only_for(v6_loopback, &[v4_loopback.port()]));
+        assert!(!v6_only_for(v6_loopback, &[]));
     }
 }

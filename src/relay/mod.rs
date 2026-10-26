@@ -683,10 +683,39 @@ async fn relay_streams<D, U>(
     D: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
+    let stats = Arc::clone(&ctx.stats);
+    relay_bidirectional(downstream, upstream, bufs, stats, meta, token, peer).await;
+}
+
+/// 双向字节搬运核心（与 `AppCtx` 解耦，便于用 `duplex` 单测半关闭时序）。
+///
+/// # 半关闭传播（docs/03 §9.2、§11.5 F5；修正 C++ 缺陷 R-1）
+///
+/// `pump` 读到 EOF 时只 `shutdown` 本方向写端（发 FIN）后返回 `Ok`。因此**第一个方向
+/// 结束不能关闭整条连接**：必须继续把另一个方向驱动到它自己的 EOF/错误，否则该方向上
+/// 尚未到达的数据会被截断（客户端 `shutdown(SHUT_WR)` 后仍应收到上游完整响应）。
+/// 结束规则：
+/// - 单方向 `Ok`（正常 EOF）→ 该方向写端已发 FIN，继续驱动另一方向（仅 trace，不计数）；
+/// - 任一方向 `Err` → 取消连接级 token，立即结束另一方向（debug + `relay_errors`）；
+/// - 外部取消 token → 两个方向都尽快返回 `Ok`（优雅关闭，不计数）。
+///
+/// 内存约束：不为每方向 `spawn` 独立 task（10K 连接会翻倍到 20K task，破坏 docs/12
+/// 的 98.5MB/10K 基线），这里用 `tokio::pin!` + `select!` 的 `if !done` 条件分支：
+/// 既能在同一 task 内同时驱动两个方向，又保证已完成的 future 不会被二次 poll。
+async fn relay_bidirectional<D, U>(
+    downstream: D,
+    upstream: U,
+    bufs: Buffers,
+    stats: Arc<Stats>,
+    meta: Option<Arc<ConnMeta>>,
+    token: CancellationToken,
+    peer: SocketAddr,
+) where
+    D: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
     let (down_r, down_w) = tokio::io::split(downstream);
     let (up_r, up_w) = tokio::io::split(upstream);
-
-    let stats = Arc::clone(&ctx.stats);
 
     let up_flow = pump(
         down_r,
@@ -704,21 +733,46 @@ async fn relay_streams<D, U>(
         Direction::UpToDown,
         Arc::clone(&stats),
         meta,
-        token,
+        token.clone(),
     );
+    tokio::pin!(up_flow, down_flow);
 
-    // 任一方向结束（EOF/错误/取消）即关闭整条连接。
-    let (direction, result) = tokio::select! {
-        r = up_flow => ("down->up", r),
-        r = down_flow => ("up->down", r),
-    };
+    // 两个方向各自是否已结束：已结束的 future 绝不能再 poll（重复 poll 已完成 future 会 panic）。
+    let mut up_done = false;
+    let mut down_done = false;
+    // 异常方向计数：只有 Err 才计入 relay_errors，正常 EOF 只 trace。
+    let mut errors: u64 = 0;
 
-    match result {
-        Ok(()) => trace!(%peer, direction, "转发结束"),
-        Err(e) => {
-            stats.relay_errors.fetch_add(1, Ordering::Relaxed);
-            debug!(%peer, direction, error = %e, "转发异常结束");
+    while !up_done || !down_done {
+        tokio::select! {
+            biased;
+            r = &mut up_flow, if !up_done => {
+                up_done = true;
+                match r {
+                    Ok(()) => trace!(%peer, direction = "down->up", "方向结束（半关闭），继续转发反向数据"),
+                    Err(e) => {
+                        errors += 1;
+                        debug!(%peer, direction = "down->up", error = %e, "转发异常，立即取消反向转发");
+                        token.cancel();
+                    }
+                }
+            }
+            r = &mut down_flow, if !down_done => {
+                down_done = true;
+                match r {
+                    Ok(()) => trace!(%peer, direction = "up->down", "方向结束（半关闭），继续转发反向数据"),
+                    Err(e) => {
+                        errors += 1;
+                        debug!(%peer, direction = "up->down", error = %e, "转发异常，立即取消反向转发");
+                        token.cancel();
+                    }
+                }
+            }
         }
+    }
+
+    if errors > 0 {
+        stats.relay_errors.fetch_add(errors, Ordering::Relaxed);
     }
 }
 
@@ -834,6 +888,179 @@ mod tests {
         source2.write_all(b"x").await.unwrap();
         cancel2.cancel();
         task2.await.unwrap().unwrap();
+    }
+
+    /// 外部取消（优雅关闭）→ 两个方向都尽快结束，且不计入 relay_errors。
+    #[tokio::test]
+    async fn 外部取消结束双向转发() {
+        use std::time::Duration;
+        use tokio::io::duplex;
+
+        // 两侧对端保持存活，确保方向在取消前阻塞在 read 上（而不是先读到 EOF）。
+        let (_client, down_relay) = duplex(1024);
+        let (up_relay, _server) = duplex(1024);
+
+        let stats = Stats::new();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(relay_bidirectional(
+            down_relay,
+            up_relay,
+            Buffers::alloc(64),
+            Arc::clone(&stats),
+            None,
+            cancel.clone(),
+            "127.0.0.1:3".parse().unwrap(),
+        ));
+        // 让两个 pump 进入阻塞读后再触发全局取消（等价 SIGINT 后的 cancel）
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("外部取消后转发任务未结束")
+            .unwrap();
+        assert_eq!(
+            stats.relay_errors.load(Ordering::Relaxed),
+            0,
+            "外部取消是正常关闭，不应计入 relay_errors"
+        );
+    }
+
+    /// 半关闭传播：客户端 `shutdown(SHUT_WR)` 后，反向数据必须继续完整转发（docs/03 §11.5 F5）。
+    #[tokio::test]
+    async fn 半关闭后反向数据完整转发() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+        // downstream：client <-> relay；upstream：relay <-> server
+        let (mut client, down_relay) = duplex(1024);
+        let (up_relay, mut server) = duplex(1024);
+
+        let stats = Stats::new();
+        let task = tokio::spawn(relay_bidirectional(
+            down_relay,
+            up_relay,
+            Buffers::alloc(64),
+            Arc::clone(&stats),
+            None,
+            CancellationToken::new(),
+            "127.0.0.1:1".parse().unwrap(),
+        ));
+
+        // 客户端发请求后半关闭写端（等价 shutdown(SHUT_WR)）
+        client.write_all(b"request").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        // 上游先收到完整请求，随后读到 FIN（半关闭已向上游传播）
+        let mut req = [0u8; 7];
+        server.read_exact(&mut req).await.unwrap();
+        assert_eq!(&req, b"request");
+        let mut probe = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), server.read(&mut probe))
+                .await
+                .expect("等待上游 FIN 超时")
+                .unwrap(),
+            0,
+            "客户端半关闭应传播为上游 EOF"
+        );
+
+        // 客户端已半关闭，但反向（上游->客户端）数据仍必须完整到达
+        server.write_all(b"response-body").await.unwrap();
+        server.shutdown().await.unwrap();
+        let mut resp = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut resp))
+            .await
+            .expect("半关闭后未收到反向数据（剩余数据被截断）")
+            .unwrap();
+        assert_eq!(resp, b"response-body");
+
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("转发任务未结束")
+            .unwrap();
+        assert_eq!(
+            stats.relay_errors.load(Ordering::Relaxed),
+            0,
+            "正常 EOF 不应计入 relay_errors"
+        );
+        assert_eq!(stats.bytes_down_to_up.load(Ordering::Relaxed), 7);
+        assert_eq!(stats.bytes_up_to_down.load(Ordering::Relaxed), 13);
+    }
+
+    /// 任一方向写错误 → 立即取消另一方向并关闭连接；错误计入 relay_errors。
+    #[tokio::test]
+    async fn 单方向写错误立即关闭另一方向() {
+        use std::io;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf, duplex};
+
+        /// 读端永远 pending、写端立即 BrokenPipe 的下游流（模拟已被 RST 的对端）。
+        struct BrokenDownstream;
+
+        impl AsyncRead for BrokenDownstream {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        impl AsyncWrite for BrokenDownstream {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let (up_relay, mut server) = duplex(1024);
+        let stats = Stats::new();
+        let task = tokio::spawn(relay_bidirectional(
+            BrokenDownstream,
+            up_relay,
+            Buffers::alloc(64),
+            Arc::clone(&stats),
+            None,
+            CancellationToken::new(),
+            "127.0.0.1:2".parse().unwrap(),
+        ));
+
+        // 上游发数据 → up->down 写下游时立即 BrokenPipe → 取消仍在读的 down->up
+        server.write_all(b"boom").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("写错误后转发任务未在超时内结束（另一方向未被取消）")
+            .unwrap();
+        assert_eq!(
+            stats.relay_errors.load(Ordering::Relaxed),
+            1,
+            "写错误应计入 relay_errors"
+        );
+
+        // 转发任务结束后连接已关闭：上游对端读到 EOF
+        let mut probe = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), server.read(&mut probe))
+                .await
+                .expect("等待上游 EOF 超时")
+                .unwrap(),
+            0,
+            "连接关闭后上游应读到 EOF"
+        );
     }
 
     #[test]

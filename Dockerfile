@@ -26,6 +26,7 @@ RUN mkdir -p src examples \
     && printf 'fn main() {}\n' > src/main.rs \
     && printf '' > examples/echo_upstream.rs \
     && printf '' > examples/flood.rs \
+    && printf '' > examples/flood_socks5.rs \
     && printf '' > examples/mock_socks5_upstream.rs \
     && printf '' > examples/socks5_client.rs \
     && printf '' > examples/tls_echo_server.rs \

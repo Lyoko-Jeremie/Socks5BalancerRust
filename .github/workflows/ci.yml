@@ -3,7 +3,7 @@
 # 目标（对应 docs/README §8 工程约定）：
 # - 跨平台是硬约束：Windows 与 Linux 必须同时通过同一组检查；
 # - 一条流水线覆盖 格式 → 静态检查 → 单测 →（Linux）release 构建 → 端到端冒烟；
-# - 独立的 encoding job 守护"UTF-8（无 BOM）+ LF"落库约定。
+# - 独立的 encoding job 守护"UTF-8 + LF"落库约定（.ps1 必须带 BOM，其它文件禁 BOM）。
 #
 # 说明：
 # - fuzz 目标需要 nightly + cargo-fuzz，不在本工作流运行（见 fuzz/README.md）；
@@ -58,8 +58,8 @@ jobs:
       - name: 静态检查（cargo clippy --all-targets -- -D warnings）
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: 单元测试（cargo test）
-        run: cargo test
+      - name: 单元测试（cargo test --all-targets）
+        run: cargo test --all-targets
 
       # ---- 以下仅 Linux：release 构建 + 端到端冒烟（Windows 无法用 bash 脚本） ----
       - name: release 构建（cargo build --release --bins --examples）
@@ -73,8 +73,8 @@ jobs:
   # ===== 独立 job：落库编码与换行检查 =====
   #
   # 规则：
-  # - .rs/.md/.json/.sh：UTF-8 无 BOM、仅 LF；
-  # - .ps1：允许（且要求）UTF-8 BOM —— Windows PowerShell 5.1 无 BOM 时中文会乱码，
+  # - .rs/.md/.json/.sh/.yml/.toml：UTF-8 无 BOM、仅 LF；
+  # - .ps1：必须带 UTF-8 BOM（缺 BOM 即失败）—— Windows PowerShell 5.1 无 BOM 时中文会乱码，
   #   见 docs/08 §6 与 .gitattributes；换行仍要求 LF（.gitattributes 仅控制检出为 CRLF）。
   # - 检查对象是 git 对象（HEAD:path），不是工作区文件：避免 .gitattributes 的
   #   eol=crlf 检出策略干扰"提交内容是否为 LF"的判断。
@@ -96,7 +96,7 @@ jobs:
 
           while IFS= read -r -d '' path; do
             case "$path" in
-              *.rs | *.md | *.json | *.sh | *.ps1) ;;
+              *.rs | *.md | *.json | *.sh | *.ps1 | *.yml | *.toml) ;;
               *) continue ;;
             esac
             checked=$((checked + 1))
@@ -111,16 +111,23 @@ jobs:
               continue
             fi
 
-            # 2) UTF-8 BOM：.ps1 例外（PowerShell 5.1 需要），其它一律禁止
+            # 2) UTF-8 BOM：.ps1 必须带 BOM（PowerShell 5.1 依赖它识别 UTF-8），其它一律禁止
+            has_bom=0
             case "$blob" in
-              $'\xef\xbb\xbf'*)
-                case "$path" in
-                  *.ps1) ;;
-                  *)
-                    echo "::error file=$path::含 UTF-8 BOM（项目约定：无 BOM）"
-                    fail=$((fail + 1))
-                    ;;
-                esac
+              $'\xef\xbb\xbf'*) has_bom=1 ;;
+            esac
+            case "$path" in
+              *.ps1)
+                if [ "$has_bom" -eq 0 ]; then
+                  echo "::error file=$path::缺少 UTF-8 BOM（PowerShell 5.1 要求 .ps1 带 BOM）"
+                  fail=$((fail + 1))
+                fi
+                ;;
+              *)
+                if [ "$has_bom" -eq 1 ]; then
+                  echo "::error file=$path::含 UTF-8 BOM（项目约定：无 BOM）"
+                  fail=$((fail + 1))
+                fi
                 ;;
             esac
 
@@ -133,7 +140,7 @@ jobs:
             esac
           done < <(git ls-files -z)
 
-          echo "已检查 $checked 个受控文件（.rs/.md/.json/.sh/.ps1）"
+          echo "已检查 $checked 个受控文件（.rs/.md/.json/.sh/.ps1/.yml/.toml）"
           if [ "$fail" -ne 0 ]; then
             echo "编码约定检查失败：$fail 项，见上方 ::error 注释" >&2
             exit 1

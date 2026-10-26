@@ -54,7 +54,7 @@
 - `configs/m1-inbound-noauth.json` / `m1-inbound-auth.json` / `m1-health.json`
 - `scripts/m1-smoke.ps1`：10 项端到端检查（正向链路 + 失败路径 + 协议边界）
 - `scripts/m1-health.ps1`：6 项健康检查检查（在线 → DOWN → 恢复）
-- 单元测试 **48 个**（M0 18 → M1 48）
+- 单元测试 **53 个**（M1.5 收尾口径：M0 18 → M1.4 48 → M1.5 53；M2–M5 累积后当前全仓 **105 passed**）
 
 ---
 
@@ -107,7 +107,7 @@
 
 | 项 | 结果 |
 |---|---|
-| `cargo test` | ✅ 53 passed / 0 failed |
+| `cargo test` | ✅ 53 passed / 0 failed（M1.5 收尾时口径；当前全仓 105 passed） |
 | `cargo clippy --all-targets -- -D warnings` | ✅ |
 | `cargo fmt --check` | ✅ |
 | 源码编码 | ✅ 全部 UTF-8 无 BOM（脚本除外，需 BOM） |

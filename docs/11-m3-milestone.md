@@ -20,7 +20,7 @@
 | 响应大小上限 | ✅ | `stateMaxResponseBytes`（默认 65536；超限回 500） |
 | 请求体上限 | ✅ | ≤64 KB（超出回 413） |
 | 不移植 EmbedWebServer / 旧 `/op` | ✅ | 只服务 4 端点，其它 404 |
-| `close_conn` / `close_all` / `reload_config` | ⏳ 未实现 | 需要连接表或热重载（07 U5 未决），未知命令回 `ok:false`+说明 |
+| `close_conn` / `close_all` / `reload_config` | ⏳ 未实现（M3 时点） | 需要连接表或热重载（07 U5 未决），M3 验收时未知命令回 `ok:false`+说明；其中 `close_conn`/`close_all` 已在 M3 之后实现（见 §7），`reload_config` 仍未实现 |
 
 **M3 结论：完成并通过 19/19 端到端验收；控制面保持"精简 + 无鉴权 + 默认回环"的安全默认。**
 
@@ -99,7 +99,7 @@
 | `enable_upstream` / `disable_upstream` | `index` 或 `name` | `UpstreamSelector` 人工启停掩码；被禁用上游不会被选择（即使健康） |
 | `set_rule` | `rule` | `SelectRule` 原子切换（loop/random/one_by_one/change_by_time/force_only_one） |
 
-未实现：`close_conn` / `close_all`（需要连接表）、`reload_config`（热重载未裁决）→ 返回 `{"ok":false,"detail":"不支持的命令…"}`。
+M3 时未实现：`close_conn` / `close_all`（需要连接表）、`reload_config`（热重载未裁决）→ 返回 `{"ok":false,"detail":"不支持的命令…"}`。其中 `close_conn` / `close_all` 已在 M3 之后补齐（连接表 `ConnRegistry`，见 §7 与 README），`reload_config` 仍未实现。
 
 ### 4.3 安全默认（ADR-001）
 
@@ -122,7 +122,7 @@
 
 ## 5. 已知限制
 
-1. **无连接表**：`close_conn` / `close_all` 未实现；M4 若需要可按连接注册表补（会增加每连接一点内存）。
+1. **连接表（M3 时无）**：`close_conn` / `close_all` 在 M3 时未实现；M3 之后的补丁已引入连接注册表 `ConnRegistry`（默认明细约 100–150 B/连接）并补齐这两个命令（见 §7）。
 2. **无热重载**：`reload_config` 未实现（07 U5 未决）。
 3. **RTT 已提供**：`upstreams.rttMs` 是最近一次探测的耗时（TCP 连接 / HTTP 往返）；暂无延迟直方图与按客户端延迟采样。
 4. **状态非快照缓存**：`/status` 每次实时聚合（读原子 + 构造 JSON）；10K 连接下开销可忽略，M4 压测时验证。
@@ -151,8 +151,10 @@ curl -X POST -H "Content-Type: application/json" -d '{"cmd":"set_rule","args":{"
 
 ## 7. 下一步（M3 之后）
 
-M3 之后的 M4/M5 与后续补丁已完成，剩余项如下：
+M3 之后的 M4/M5 与后续补丁已完成，当前状态（截至 2026-10-26）如下：
 
-- ✅ 已补齐：RTT（`/api/v1/upstreams.rttMs`）、DNS TTL（`dnsTtl`）、per-core listener、hint 粘性、retryTimes 失败切换、SOCKS4/HTTP 入站认证、`sleepTime`/`additionCheckPeriod`、`set_rule` 的 scope/target 维度覆盖（global/client/listen）、**连接监测**（默认明细 + 三维度摘要 + `close_conn`/`close_all` + 独立监控监听）、CI workflow、fuzz harness、SOCKS5 专项压测客户端。
+- ✅ 已完成：RTT（`/api/v1/upstreams.rttMs`）、DNS TTL（`dnsTtl`）、per-core listener、hint 粘性、retryTimes 失败切换、SOCKS4/HTTP 入站认证、`sleepTime`/`additionCheckPeriod`、`set_rule` 的 scope/target 维度覆盖（global/client/listen）、**连接监测**（默认明细 + 三维度摘要 + 独立监控监听）、**`close_conn` / `close_all`**（连接表 `ConnRegistry` 已落地，见 `src/conn.rs`、`src/control/mod.rs`；依赖 `connectionTracking.detail=true`，README 有 curl 用法）、CI workflow、fuzz harness、SOCKS5 专项压测客户端。
 - ⏳ 待执行（需 Linux 环境）：C10K / 1K/s、24h 长稳、2 核与吞吐验收、与 C++ 的字节级对比。
-- ❌ 不做（已登记）：`close_conn` / `close_all`（无连接表）、`reload_config`（U5）、HTTP keep-alive 逐请求改写、`slowImpl`。
+- ❌ 不做（已登记）：`reload_config`（07 U5 未裁决）、HTTP keep-alive 逐请求改写、`slowImpl`。
+
+> 说明：本文 §1、§3、§4.2、§5 保留 M3 时点的记录——`close_conn` / `close_all` 在 M3 验收时还是"未知命令"，连接表与中断能力是 M3 之后的补丁才落地的；`reload_config` 至今未实现。

@@ -3,7 +3,7 @@
 > 日期：2026-10-26
 > 对应计划：[06-rust-port-assessment.md](06-rust-port-assessment.md) §10 的 **M4**
 > 决策依据：[07-decisions.md](07-decisions.md) ADR-005（缓冲与内存模型）、ADR-003（线程）
-> 脚本：`scripts/m4-memory.ps1`（Windows 实测）、`scripts/loadtest-linux.sh`（Linux C10K/1K）
+> 脚本：`scripts/m4-memory.ps1`（Windows 实测）、`scripts/loadtest-linux.sh`（Linux C10K / 1K/s / SOCKS5 协议口径）
 
 ---
 
@@ -94,22 +94,40 @@
 
 ## 5. 待 Linux 实测（脚本已就绪）
 
-`scripts/loadtest-linux.sh`：
+`scripts/loadtest-linux.sh`（默认 `MODE=both`，一次跑完 C10K / 1K/s / SOCKS5 协议三个口径）：
 
 ```bash
 cargo build --release --bins --examples
-ulimit -n 65535
+ulimit -n 65535                                   # 脚本会检查，<65535 时警告
 sudo sysctl -w net.ipv4.ip_local_port_range="10240 65535"
-./scripts/loadtest-linux.sh                       # bufferSize=2048，C10K + 1K/s
+
+./scripts/loadtest-linux.sh                       # MODE=both：C10K + 1K/s + 协议口径（默认 bufferSize=2048）
 BUFFER_SIZE=8192 ./scripts/loadtest-linux.sh      # 8K 性能口径
+MODE=c10k ./scripts/loadtest-linux.sh             # 只跑 C10K 空闲口径
+MODE=rate ./scripts/loadtest-linux.sh             # 只跑 1K/s 建连口径
+MODE=proto ./scripts/loadtest-linux.sh            # 只跑真实 SOCKS5 协议口径
 ```
 
-输出 `target/m4-logs/linux-*.txt`：峰值 RSS、CPU 秒数、每连接增量、flood 成功率。
+脚本会自动拉起拓扑：`echo_upstream`（6100）+ `mock_socks5_upstream`（6200，alice:secret）+ balancer（5700，
+上游指向 mock，配置写到 `target/m4-logs/linux-<bufferSize>.json`）；参数可用环境变量覆盖
+（`CONNS`/`HOLD`、`RATE_CONNS`/`RATE_HOLD`/`RATE_INTERVAL_MS`、`PROTO_QPS`/`PROTO_DURATION`/`PROTO_CONCURRENCY`）。
+
+输出文件（均位于 `target/m4-logs/`，三个口径互不覆盖）：
+
+- `linux-c10k-<bufferSize>.txt`：10,000 条空闲连接保持 60s；峰值 RSS、CPU 秒数、空闲 RSS、每连接增量、flood 成功率；
+- `linux-rate-<bufferSize>.txt`：~1000 次/秒持续建连（30,000 条、每条保持 10s）；峰值 RSS、CPU 秒数、空闲 RSS、flood 成功率；
+- `linux-proto-<bufferSize>.txt`：真实 SOCKS5 握手 + CONNECT 回显（1000 QPS × 60s）；额外输出 `success_rate`、`handshake_p99_ms`、`actual_qps`。
+
 需在 Linux 环境（或 Docker + `--network host`）执行，Windows 无法完成 C10K。
+
+**注意：上述文件目前一个都未生成——C10K / 1K/s / 24h 长稳 / 2 核与吞吐验收全部未实测，M4 验收尚未完成。**
 
 ---
 
 ## 6. 已知限制
+
+以下限制意味着 **M4 验收尚未完成**：C10K、1K/s、24h 长稳、2 核与吞吐、与 C++ 字节级对比均未实测；
+本文 §2/§3 只是 Windows 内存实测与推算，§4 的 100MB 判定是推算值而非压测结论。
 
 1. **C10K / 1K/s 未在本机实测**：Windows 动态端口 ~16,384，1000 连接即接近上限；
    C10K 必须 Linux。
@@ -122,7 +140,7 @@ BUFFER_SIZE=8192 ./scripts/loadtest-linux.sh      # 8K 性能口径
 
 ## 7. 下一步
 
-1. 在 Linux 上跑 `loadtest-linux.sh`，用实测值回填本文 §3/§4（并把 ADR-005 的固定开销改为平台相关）。
-2. M4 剩余：24h 长稳、`bufferSize` 自适应（按 `maxConnections` 选 2K/4K/8K）评估。
+1. **M4 验收未完成**：在 Linux 上跑 `loadtest-linux.sh`（C10K / 1K/s / 协议三口径），用实测值回填本文 §3/§4（并把 ADR-005 的固定开销改为平台相关）。
+2. M4 剩余：24h 长稳（`scripts/soak-linux.sh`）、2 核与吞吐验收、`bufferSize` 自适应（按 `maxConnections` 选 2K/4K/8K）评估。
 3. M5：Dockerfile/systemd/迁移说明。
-4. Linux CI：已提供 `.github/workflows/ci.yml`（Linux/Windows 双平台，含 `cargo test` 与 `scripts/ci-linux.sh` 冒烟），首次运行结果待回填。
+4. Linux CI：已提供 `.github/workflows/ci.yml`（Linux/Windows 双平台，含 `cargo test --all-targets` 与 `scripts/ci-linux.sh` 冒烟），首次运行结果待回填。

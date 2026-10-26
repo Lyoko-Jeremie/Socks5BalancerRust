@@ -65,6 +65,11 @@ impl SelectRule {
             "one_by_one" | "onebyone" => Some(Self::OneByOne),
             "change_by_time" | "changebytime" => Some(Self::ChangeByTime),
             "force_only_one" | "forceonlyone" => Some(Self::ForceOnlyOne),
+            // C++ 的 `inherit` 表示"继承上层规则"（全局配置用它 = 交给按 client/listen 的
+            // 维度规则）。Rust 版没有"继承"概念：维度覆盖由控制面
+            // `set_rule(scope=client|listen, target, index)` 实现，因此这里按 random 处理，
+            // 由 config 层打印提示。这样 C++ 旧配置迁移不会启动失败。
+            "inherit" => Some(Self::Random),
             _ => None,
         }
     }
