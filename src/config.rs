@@ -461,6 +461,256 @@ pub struct Config {
     pub notes: Vec<String>,
 }
 
+// ===== 字段兼容与拼写检查（ADR-002、docs/07 §5.2）=====
+
+/// 顶层已知字段（与 `RawConfig` 的 serde 名称保持一致）。
+const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
+    "listenHost",
+    "listenPort",
+    "multiListen",
+    "upstream",
+    "retryTimes",
+    "connectTimeout",
+    "firstPacketTimeout",
+    "handshakeTimeout",
+    "threadNum",
+    "workerThreads",
+    "maxBlockingThreads",
+    "threadStackSize",
+    "bufferSize",
+    "maxConnections",
+    "socketRecvBuffer",
+    "socketSendBuffer",
+    "logLevel",
+    "traditionTcpRelay",
+    "disableSocks4",
+    "stateServerHost",
+    "stateServerPort",
+    "stateMaxResponseBytes",
+    "authClientInfo",
+    "AuthClientInfo",
+    "internalBehavior",
+    "embedWebServerConfig",
+    "EmbedWebServerConfig",
+    "healthCheck",
+    "upstreamSelectRule",
+    "serverChangeTime",
+    "sleepTime",
+    "disableConnectTest",
+    "disableConnectionTracker",
+    "tcpCheckPeriod",
+    "tcpCheckStart",
+    "connectCheckPeriod",
+    "connectCheckStart",
+    "additionCheckPeriod",
+    "testRemoteHost",
+    "testRemotePort",
+];
+
+/// `upstream[]` 条目的已知字段。
+const KNOWN_UPSTREAM_KEYS: &[&str] = &[
+    "name", "host", "port", "authUser", "authPwd", "slowImpl", "disable",
+];
+/// `healthCheck` 节的已知字段。
+const KNOWN_HEALTH_KEYS: &[&str] = &[
+    "tcp",
+    "connect",
+    "target",
+    "failFast",
+    "downBackoff",
+    "probeJitter",
+    "maxProbeConcurrency",
+    "connectFailMarkDegraded",
+];
+/// `healthCheck.tcp` / `healthCheck.connect` 的已知字段。
+const KNOWN_PERIODIC_KEYS: &[&str] = &["period", "timeout", "startDelay"];
+/// `healthCheck.target` 的已知字段。
+const KNOWN_TARGET_KEYS: &[&str] = &[
+    "host",
+    "port",
+    "sni",
+    "httpPath",
+    "userAgent",
+    "expectStatus",
+    "caFile",
+];
+/// `healthCheck.downBackoff` 的已知字段。
+const KNOWN_BACKOFF_KEYS: &[&str] = &["initial", "multiplier", "max", "jitter"];
+/// `internalBehavior` 的已知字段（C++ 中除 connectTimeout 外均为死配置）。
+const KNOWN_INTERNAL_KEYS: &[&str] = &[
+    "connectTimeout",
+    "socksTestTimeout",
+    "momentLocale",
+    "statisticalTimerPeriod",
+];
+/// `multiListen[]` 的已知字段。
+const KNOWN_LISTEN_KEYS: &[&str] = &["host", "port"];
+/// `authClientInfo[]` 的已知字段。
+const KNOWN_AUTH_KEYS: &[&str] = &["user", "pwd"];
+
+/// 记录 `value` 对象中本版本不认识的字段（防止 `enabled`/`threadStackSizeKb` 之类拼写错误被静默忽略）。
+///
+/// serde 默认忽略未知字段；这里显式告警，避免"配置写了但完全不生效"的排查黑洞。
+fn note_unknown_keys(
+    value: &serde_json::Value,
+    known: &[&str],
+    path: &str,
+    notes: &mut Vec<String>,
+) {
+    let Some(obj) = value.as_object() else {
+        return;
+    };
+    let mut unknown: Vec<&str> = obj
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !known.contains(k))
+        .collect();
+    if unknown.is_empty() {
+        return;
+    }
+    unknown.sort_unstable();
+    notes.push(format!(
+        "{path} 中的字段本版本不识别，已忽略（请检查拼写或对照文档）: {}",
+        unknown.join(", ")
+    ));
+}
+
+/// 扫描整份配置的未知字段（顶层 + 已知子结构）。
+fn scan_unknown_keys(value: &serde_json::Value, notes: &mut Vec<String>) {
+    note_unknown_keys(value, KNOWN_TOP_LEVEL_KEYS, "配置", notes);
+
+    if let Some(arr) = value.get("upstream").and_then(serde_json::Value::as_array) {
+        for (i, item) in arr.iter().enumerate() {
+            note_unknown_keys(item, KNOWN_UPSTREAM_KEYS, &format!("upstream[{i}]"), notes);
+        }
+    }
+    if let Some(arr) = value
+        .get("multiListen")
+        .and_then(serde_json::Value::as_array)
+    {
+        for (i, item) in arr.iter().enumerate() {
+            note_unknown_keys(item, KNOWN_LISTEN_KEYS, &format!("multiListen[{i}]"), notes);
+        }
+    }
+    for key in ["authClientInfo", "AuthClientInfo"] {
+        if let Some(arr) = value.get(key).and_then(serde_json::Value::as_array) {
+            for (i, item) in arr.iter().enumerate() {
+                note_unknown_keys(item, KNOWN_AUTH_KEYS, &format!("{key}[{i}]"), notes);
+            }
+        }
+    }
+    if let Some(h) = value.get("healthCheck") {
+        note_unknown_keys(h, KNOWN_HEALTH_KEYS, "healthCheck", notes);
+        for (key, known) in [
+            ("tcp", KNOWN_PERIODIC_KEYS),
+            ("connect", KNOWN_PERIODIC_KEYS),
+            ("target", KNOWN_TARGET_KEYS),
+            ("downBackoff", KNOWN_BACKOFF_KEYS),
+        ] {
+            if let Some(sub) = h.get(key) {
+                note_unknown_keys(sub, known, &format!("healthCheck.{key}"), notes);
+            }
+        }
+    }
+    if let Some(ib) = value.get("internalBehavior") {
+        note_unknown_keys(ib, KNOWN_INTERNAL_KEYS, "internalBehavior", notes);
+    }
+}
+
+/// 把 C++ 旧探测字段映射进 `healthCheck`（ADR-002；docs/07 §5.2 兼容映射表）。
+///
+/// 规则：**新字段优先**；旧字段只在对应新字段缺省时生效；两者都配置时打印提示。
+fn legacy_health_config(raw: &RawConfig, notes: &mut Vec<String>) -> RawHealthConfig {
+    let mut h = raw.health_check.clone().unwrap_or_default();
+    let mut mapped: Vec<&str> = Vec::new();
+
+    // tcpCheckPeriod / tcpCheckStart → healthCheck.tcp.{period,startDelay}
+    if raw.tcp_check_period.is_some() || raw.tcp_check_start.is_some() {
+        let tcp = h.tcp.get_or_insert_with(RawPeriodicProbe::default);
+        if let Some(v) = raw.tcp_check_period.filter(|v| *v > 0) {
+            if tcp.period.is_none() {
+                tcp.period = Some(v);
+                mapped.push("tcpCheckPeriod");
+            } else {
+                notes.push("tcpCheckPeriod 与 healthCheck.tcp.period 同时配置，新字段优先".into());
+            }
+        }
+        if let Some(v) = raw.tcp_check_start {
+            if tcp.start_delay.is_none() {
+                tcp.start_delay = Some(v);
+                mapped.push("tcpCheckStart");
+            } else {
+                notes.push("tcpCheckStart 与 healthCheck.tcp.startDelay 同时配置，新字段优先".into());
+            }
+        }
+    }
+
+    // connectCheckPeriod / connectCheckStart → healthCheck.connect.{period,startDelay}
+    if raw.connect_check_period.is_some() || raw.connect_check_start.is_some() {
+        let connect = h.connect.get_or_insert_with(RawPeriodicProbe::default);
+        if let Some(v) = raw.connect_check_period.filter(|v| *v > 0) {
+            if connect.period.is_none() {
+                connect.period = Some(v);
+                mapped.push("connectCheckPeriod");
+            } else {
+                notes.push(
+                    "connectCheckPeriod 与 healthCheck.connect.period 同时配置，新字段优先".into(),
+                );
+            }
+        }
+        if let Some(v) = raw.connect_check_start {
+            if connect.start_delay.is_none() {
+                connect.start_delay = Some(v);
+                mapped.push("connectCheckStart");
+            } else {
+                notes.push(
+                    "connectCheckStart 与 healthCheck.connect.startDelay 同时配置，新字段优先"
+                        .into(),
+                );
+            }
+        }
+    }
+
+    // testRemoteHost / testRemotePort → healthCheck.target.{host,port}
+    if raw.test_remote_host.is_some() || raw.test_remote_port.is_some() {
+        let target = h.target.get_or_insert_with(RawProbeTarget::default);
+        if let Some(host) = raw
+            .test_remote_host
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            let has_new = target
+                .host
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_some();
+            if has_new {
+                notes.push("testRemoteHost 与 healthCheck.target.host 同时配置，新字段优先".into());
+            } else {
+                target.host = Some(host.trim().to_string());
+                mapped.push("testRemoteHost");
+            }
+        }
+        if let Some(port) = raw.test_remote_port.filter(|v| *v > 0) {
+            if target.port.is_none() {
+                target.port = Some(port);
+                mapped.push("testRemotePort");
+            } else {
+                notes.push("testRemotePort 与 healthCheck.target.port 同时配置，新字段优先".into());
+            }
+        }
+    }
+
+    if !mapped.is_empty() {
+        notes.push(format!(
+            "已按旧版字段映射到 healthCheck: {}（建议改用 healthCheck.* 新字段）",
+            mapped.join(", ")
+        ));
+    }
+    h
+}
+
 /// 从文件加载配置。
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
     let bytes = fs::read(path)?;
@@ -481,6 +731,9 @@ pub fn load_str(text: &str) -> Result<Config, ConfigError> {
 pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
     let mut notes = Vec::new();
 
+    // 先做"未知字段"告警（serde 会静默忽略；拼错的字段往往意味着配置完全不生效）。
+    scan_unknown_keys(&value, &mut notes);
+
     // 先做"被忽略配置"的探测（serde 会静默忽略未知字段，这里显式告知运维）。
     if value.get("internalBehavior").is_some() {
         notes.push(
@@ -495,17 +748,8 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
     if value.get("EmbedWebServerConfig").is_some() || value.get("embedWebServerConfig").is_some() {
         notes.push("EmbedWebServerConfig 已解析但 Rust 版不实现内嵌 Web 服务器（ADR-001）".into());
     }
-    if value.get("healthCheck").is_some() {
-        notes.push("healthCheck 已启用：TCP 探活 + fail-fast + DOWN 指数退避（M1.4）".into());
-    }
     if value.get("upstreamSelectRule").is_some() || value.get("serverChangeTime").is_some() {
         notes.push("upstreamSelectRule/serverChangeTime 已启用（M1.3）".into());
-    }
-    if value.get("testRemoteHost").is_some() || value.get("disableConnectTest").is_some() {
-        notes.push(
-            "旧版探测字段（testRemoteHost/tcpCheck*/connectCheck*）已忽略，请改用 healthCheck 节"
-                .into(),
-        );
     }
 
     let raw: RawConfig = serde_json::from_value(value)?;
@@ -636,7 +880,8 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
         Duration::from_millis(raw.server_change_time.filter(|v| *v > 0).unwrap_or(60_000));
 
     // ===== 健康检查（ADR-002：fail-fast，不重试/不防抖）=====
-    let health_raw = raw.health_check.clone().unwrap_or_default();
+    // 旧版探测字段先按 ADR 映射进 healthCheck（新字段优先），再构建有效配置。
+    let health_raw = legacy_health_config(&raw, &mut notes);
     if health_raw.connect.is_some() || health_raw.target.is_some() {
         notes.push("healthCheck.connect/target 已启用：TLS + HTTP readiness 探测（M1.5）".into());
     }
@@ -1191,5 +1436,72 @@ mod tests {
         let c = load_str(minimal()).unwrap();
         assert!(c.health.tls.is_none());
         assert_eq!(c.health.period, Duration::from_millis(5_000));
+    }
+
+    #[test]
+    fn 未知字段会告警() {
+        let text = r#"{
+            "listenPort": 5000,
+            "threadStackSizeKb": 512,
+            "upstream": [ { "host": "127.0.0.1", "port": 6100, "enabled": false } ]
+        }"#;
+        let c = load_str(text).unwrap();
+        assert!(
+            c.notes.iter().any(|n| n.contains("threadStackSizeKb")),
+            "notes={:?}",
+            c.notes
+        );
+        assert!(
+            c.notes.iter().any(|n| n.contains("enabled")),
+            "notes={:?}",
+            c.notes
+        );
+    }
+
+    #[test]
+    fn 旧探测字段映射到_health_check() {
+        let text = r#"{
+            "listenPort": 5000,
+            "tcpCheckPeriod": 7000,
+            "tcpCheckStart": 100,
+            "connectCheckPeriod": 120000,
+            "testRemoteHost": "probe.example.com",
+            "testRemotePort": 8443,
+            "upstream": [ { "host": "127.0.0.1", "port": 6100 } ]
+        }"#;
+        let c = load_str(text).unwrap();
+        assert_eq!(c.health.period, Duration::from_millis(7_000));
+        assert_eq!(c.health.start_delay, Duration::from_millis(100));
+        let tls = c.health.tls.expect("旧字段应启用 TLS 探测");
+        assert_eq!(tls.host, "probe.example.com");
+        assert_eq!(tls.port, 8443);
+        assert_eq!(tls.period, Duration::from_millis(120_000));
+        assert!(
+            c.notes.iter().any(|n| n.contains("映射")),
+            "notes={:?}",
+            c.notes
+        );
+    }
+
+    #[test]
+    fn 新字段优先于旧探测字段() {
+        let text = r#"{
+            "listenPort": 5000,
+            "tcpCheckPeriod": 7000,
+            "testRemoteHost": "old.example.com",
+            "healthCheck": {
+                "tcp": { "period": 3000 },
+                "target": { "host": "new.example.com", "port": 443 }
+            },
+            "upstream": [ { "host": "127.0.0.1", "port": 6100 } ]
+        }"#;
+        let c = load_str(text).unwrap();
+        assert_eq!(c.health.period, Duration::from_millis(3_000));
+        assert_eq!(c.health.tls.expect("应启用 TLS 探测").host, "new.example.com");
+        assert!(
+            c.notes.iter().any(|n| n.contains("新字段优先")),
+            "notes={:?}",
+            c.notes
+        );
     }
 }
