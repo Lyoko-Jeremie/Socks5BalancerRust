@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
 # M4 / C10K 压测（Linux 专用；Windows 单机动态端口约 16K，见 scripts/m4-memory.ps1）
 #
-# 覆盖两个口径：
-#   1) C10K 空闲：建立 10000 条空闲连接并保持 60s，采样 RSS / CPU / 句柄
-#   2) 1K/s 建连：以 ~1000 次/秒的速率持续建连（30000 条、每条保持 10s）
+# 覆盖三个口径（各场景日志分开，互不覆盖）：
+#   1) C10K 空闲（纯 TCP 透传内存口径）：建立 10000 条空闲连接并保持 60s，采样 RSS / CPU / 句柄
+#   2) 1K/s 建连（纯 TCP 透传内存口径）：以 ~1000 次/秒的速率持续建连（30000 条、每条保持 10s）
+#   3) 协议口径（真实 SOCKS5）：echo_upstream(6100) + mock_socks5_upstream(6200) +
+#      balancer(5700，上游指向 mock)，以 1000 QPS 持续 60s 跑 examples/flood_socks5，
+#      记录成功率与握手 p99；同一次压测内采样 balancer RSS/CPU
 #
 # 用法：
-#   ./scripts/loadtest-linux.sh                # 默认 bufferSize=2048 + C10K + 1K/s
+#   ./scripts/loadtest-linux.sh                # 默认 bufferSize=2048 + C10K + 1K/s + 协议口径
 #   BUFFER_SIZE=8192 ./scripts/loadtest-linux.sh
 #   MODE=c10k ./scripts/loadtest-linux.sh      # 只跑 C10K
 #   MODE=rate ./scripts/loadtest-linux.sh      # 只跑 1K/s
+#   MODE=proto ./scripts/loadtest-linux.sh     # 只跑真实 SOCKS5 协议口径
 #
 # 前置：
 #   - 已 cargo build --release --bins --examples
 #   - ulimit -n 至少 65535（脚本会检查并提示）
 #   - 本机可用临时端口充足：net.ipv4.ip_local_port_range 建议 "10240 65535"
 #
-# 输出：target/m4-logs/linux-<mode>.txt（RSS/CPU 采样与结论）
+# 输出（均位于 target/m4-logs/，文件互不覆盖）：
+#   linux-c10k-<bufferSize>.txt   C10K 空闲场景采样与结论
+#   linux-rate-<bufferSize>.txt   1K/s 建连场景采样与结论
+#   linux-proto-<bufferSize>.txt  真实 SOCKS5 协议口径采样、成功率与 p99
 
 set -euo pipefail
 
@@ -33,13 +40,17 @@ HOLD="${HOLD:-60}"
 RATE_CONNS="${RATE_CONNS:-30000}"
 RATE_HOLD="${RATE_HOLD:-10}"
 RATE_INTERVAL_MS="${RATE_INTERVAL_MS:-1}"   # ~1000 次/秒
+PROTO_QPS="${PROTO_QPS:-1000}"              # 协议口径目标 QPS
+PROTO_DURATION="${PROTO_DURATION:-60}"      # 协议口径持续秒数
+PROTO_CONCURRENCY="${PROTO_CONCURRENCY:-64}" # 协议口径最大在途连接数
 
 BIN="$ROOT/target/release/Socks5BalancerRust"
 ECHO_BIN="$ROOT/target/release/examples/echo_upstream"
 MOCK_BIN="$ROOT/target/release/examples/mock_socks5_upstream"
 FLOOD_BIN="$ROOT/target/release/examples/flood"
+FLOOD_SOCKS5_BIN="$ROOT/target/release/examples/flood_socks5"
 
-for f in "$BIN" "$ECHO_BIN" "$MOCK_BIN" "$FLOOD_BIN"; do
+for f in "$BIN" "$ECHO_BIN" "$MOCK_BIN" "$FLOOD_BIN" "$FLOOD_SOCKS5_BIN"; do
     if [[ ! -x "$f" ]]; then
         echo "缺少 $f，请先：cargo build --release --bins --examples" >&2
         exit 1
@@ -177,11 +188,45 @@ run_rate() {
     echo "flood: $(tail -1 "$LOGS/flood-rate.out")" | tee -a "$out"
 }
 
+run_proto() {
+    # 协议口径：真实 SOCKS5 建连 → 握手 → CONNECT(echo:6100) → ping 回显 → RST 关闭。
+    # 上游是 mock_socks5_upstream(6200)，因此 balancer 的「入站握手 + 上游建连/认证 + 双向转发」
+    # 全链路都被覆盖，不是纯 TCP 空闲连接口径。
+    local out="$LOGS/linux-proto-$BUFFER_SIZE.txt"
+    : >"$out"
+    echo "== 协议口径（真实 SOCKS5）：目标 ${PROTO_QPS} QPS，持续 ${PROTO_DURATION}s，并发=${PROTO_CONCURRENCY} ==" | tee -a "$out"
+    local idle
+    idle=$(rss_mb "$BAL_PID")
+    "$FLOOD_SOCKS5_BIN" 127.0.0.1:"$LISTEN_PORT" 127.0.0.1:6100 \
+        "$PROTO_CONCURRENCY" "$PROTO_QPS" "$PROTO_DURATION" >"$LOGS/flood-proto.out" 2>&1 &
+    local flood_pid=$!
+    PIDS+=($flood_pid)
+    sample_while "$BAL_PID" "$PROTO_DURATION" "$out"
+    wait "$flood_pid" 2>/dev/null || true
+    echo "idleRssMB=$idle" | tee -a "$out"
+    local line success_rate p99 actual_qps
+    line="$(tail -1 "$LOGS/flood-proto.out" 2>/dev/null || true)"
+    echo "flood_socks5: $line" | tee -a "$out"
+    success_rate="$(printf '%s' "$line" | grep -o 'success_rate=[0-9.]*%' || true)"
+    p99="$(printf '%s' "$line" | grep -o 'handshake_p99_ms=[0-9.]*' || true)"
+    actual_qps="$(printf '%s' "$line" | grep -o 'actual_qps=[0-9.]*' || true)"
+    # 统一成 key=value 便于 grep 汇总；缺字段时显式标 NA，避免误读。
+    echo "summary ${success_rate:-success_rate=NA} ${p99:-handshake_p99_ms=NA} ${actual_qps:-actual_qps=NA}" | tee -a "$out"
+    if [[ -z "$success_rate" ]]; then
+        echo "flood_socks5 未输出汇总行（见 $LOGS/flood-proto.out）" >&2
+        return 1
+    fi
+    if [[ "$success_rate" != "success_rate=100.00%" ]]; then
+        echo "警告：协议口径成功率不足 100%：$success_rate（见 $LOGS/flood-proto.out）" >&2
+    fi
+}
+
 start_topology
 case "$MODE" in
     c10k) run_c10k ;;
     rate) run_rate ;;
-    both) run_c10k; run_rate ;;
-    *) echo "未知 MODE=$MODE（c10k / rate / both）" >&2; exit 1 ;;
+    proto) run_proto ;;
+    both) run_c10k; run_rate; run_proto ;;
+    *) echo "未知 MODE=$MODE（c10k / rate / proto / both）" >&2; exit 1 ;;
 esac
 echo "完成，报告见 $LOGS/"
