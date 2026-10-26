@@ -20,10 +20,10 @@
 | HTTP absolute-form 正向代理 | ✅ | curl 经代理成功；目标收到 origin-form `/m2-forward` |
 | 非 absolute-form / 非法请求 | ✅ | 回 `400 Bad Request`（C++ 分支A 会塞进隧道，属缺陷 H-1） |
 | `disableSocks4` 配置生效 | ✅ | 禁用后回 `00 5B` |
-| `slowImpl` 握手兼容 | ⏳ 未做 | 见 §5 已知限制；不影响标准客户端 |
-| HTTP keep-alive 多请求逐条改写 | ⏳ 未做 | 首个请求改写后双向透传（见 §5） |
+| `slowImpl` 握手兼容 | ❌ 不做（已知限制） | C++ 的慢实现兼容模式；标准客户端不受影响，见 §5 |
+| HTTP keep-alive 多请求逐条改写 | ❌ 不做（已知限制） | 首个请求改写后双向透传（见 §5） |
 
-**M2 结论：完成并通过 9/9 端到端验收；`slowImpl` 与 keep-alive 逐请求改写留待后续。**
+**M2 结论：完成并通过 9/9 端到端验收；`slowImpl` 与 keep-alive 逐请求改写正式登记为"不做"（已知限制）。**
 
 ---
 
@@ -111,8 +111,8 @@ Tunnel { target: TargetAddr, prefix: Vec<u8>, reply: Reply }
 
 ## 5. 已知限制
 
-1. **HTTP keep-alive 多请求**：只有首个请求被解析/改写，之后双向透传。若客户端在同一代理连接上复用 keep-alive，第二个请求仍是 absolute-form，目标可能拒绝。C++ 同样不支持（逐请求改写需在每轮响应后重新解析，M4 再评估）。
-2. **`slowImpl` 未实现**：C++ 的"慢实现"兼容模式（分片写/等待）针对个别不标准上游；标准客户端不受影响。
+1. **HTTP keep-alive 多请求（正式登记"不做"）**：只有首个请求被解析/改写，之后双向透传。若客户端在同一代理连接上复用 keep-alive，第二个请求仍是 absolute-form，目标可能拒绝。C++ 同样不支持（逐请求改写需在每轮响应后重新解析，收益低、复杂度高）。
+2. **`slowImpl`（正式登记"不做"）**：C++ 的"慢实现"兼容模式（分片写/等待）针对个别不标准上游；标准客户端不受影响。若遇到非常规上游，建议先在 C++ 版验证。
 3. **HTTP/2 / HTTP/3 不支持**：仅 HTTP/1.x 明文代理；HTTPS 请走 CONNECT。
 4. **WebSocket**：`Upgrade` 请求在 forward 路径会被原样转发，之后双向透传（天然支持）；但 keep-alive 限制同样适用。
 5. **`disableSocks4` 语义**：禁用时直接回 5B（C++ 会尝试按 HTTP 解析并最终断开）；对客户端更友好。
