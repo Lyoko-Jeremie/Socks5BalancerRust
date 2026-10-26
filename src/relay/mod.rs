@@ -79,12 +79,7 @@ pub async fn handle_connection(
     guard: ActiveGuard,
 ) {
     if ctx.cfg.tradition_tcp_relay {
-        let Some(upstream_cfg) = ctx.pick_upstream().cloned() else {
-            ctx.stats.rejected.fetch_add(1, Ordering::Relaxed);
-            debug!(%peer, "无可用上游，关闭连接");
-            return;
-        };
-        handle_tradition(ctx, downstream, upstream_cfg, peer, local, bufs, guard).await;
+        handle_tradition(ctx, downstream, peer, local, bufs, guard).await;
     } else {
         handle_smart(ctx, downstream, peer, local, bufs, guard).await;
     }
@@ -94,17 +89,15 @@ pub async fn handle_connection(
 async fn handle_tradition(
     ctx: Arc<AppCtx>,
     downstream: TcpStream,
-    upstream_cfg: Upstream,
     peer: SocketAddr,
     local: SocketAddr,
     bufs: Buffers,
     _guard: ActiveGuard,
 ) {
-    let upstream = match connect_upstream(&ctx, &upstream_cfg, peer).await {
-        Some(s) => s,
-        None => return,
-    };
-    trace!(%peer, %local, upstream = %upstream_cfg.name, addr = %upstream_cfg.addr, "开始透传");
+    // ADR-002 #3：建连失败立即切下一个可用上游（最多 retryTimes+1 次）。
+    let Some((upstream_cfg, upstream)) = connect_upstream_with_retry(&ctx, peer).await else {
+        return;
+    };    trace!(%peer, %local, upstream = %upstream_cfg.name, addr = %upstream_cfg.addr, "开始透传");
     relay_streams(ctx, downstream, upstream, bufs, peer, "tradition").await;
 }
 
@@ -298,74 +291,106 @@ async fn establish(
     local: SocketAddr,
     bufs: Buffers,
 ) {
-    // 1) 选上游
-    let Some(upstream_cfg) = ctx.pick_upstream().cloned() else {
-        ctx.stats.rejected.fetch_add(1, Ordering::Relaxed);
-        let _ = write_failure(&mut downstream, tunnel.reply, socks5::REP_GENERAL_FAILURE).await;
-        debug!(
-            %peer,
-            available = ctx.health.available_count(),
-            total = ctx.health.len(),
-            "所有上游不可用，拒绝请求"
-        );
-        drain_and_close(downstream).await;
-        return;
-    };
+    // 1) 选择上游并建立到上游的连接（ADR-002 #3：失败立即切下一个可用后端）
+    //    最多尝试 `retryTimes + 1` 个不同上游；目标侧错误（如 ConnectionRefused）也会换一个
+    //    出口重试，因为不同上游的出口网络可能不同。
+    let max_attempts = ctx.cfg.retry_times.saturating_add(1).max(1);
+    let mut tried: Vec<usize> = Vec::with_capacity(max_attempts);
+    let mut last_rep = socks5::REP_GENERAL_FAILURE;
+    let mut established = None;
+    let mut up_name = String::new();
 
-    // 2) 连接上游 TCP（失败时已 mark_degraded）
-    let Some(upstream_raw) = connect_upstream(&ctx, &upstream_cfg, peer).await else {
-        let _ = write_failure(&mut downstream, tunnel.reply, socks5::REP_HOST_UNREACHABLE).await;
-        return;
-    };
+    for _ in 0..max_attempts {
+        let Some(upstream_cfg) = ctx.pick_upstream_excluding(&tried).cloned() else {
+            break;
+        };
+        tried.push(upstream_cfg.health_index);
 
-    // 3) 以上游 SOCKS5 客户端身份握手（含上游认证；域名交给上游解析）
-    let up_target = to_socks_target(&tunnel.target);
-    let up_name = upstream_cfg.name.clone();
-    let creds = upstream_cfg
-        .auth_user
-        .as_deref()
-        .filter(|u| !u.trim().is_empty())
-        .map(|u| {
-            (
-                u.to_string(),
-                upstream_cfg.auth_pwd.clone().unwrap_or_default(),
-            )
-        });
+        // 连接上游 TCP（失败时已 mark_degraded）
+        let Some(upstream_raw) = connect_upstream(&ctx, &upstream_cfg, peer).await else {
+            last_rep = socks5::REP_HOST_UNREACHABLE;
+            continue;
+        };
 
-    let handshake_fut = async move {
-        match creds {
-            Some((user, pwd)) => {
-                Socks5Stream::connect_with_password_and_socket(upstream_raw, up_target, &user, &pwd)
+        // 以上游 SOCKS5 客户端身份握手（含上游认证；域名交给上游解析）
+        let up_target = to_socks_target(&tunnel.target);
+        let creds = upstream_cfg
+            .auth_user
+            .as_deref()
+            .filter(|u| !u.trim().is_empty())
+            .map(|u| {
+                (
+                    u.to_string(),
+                    upstream_cfg.auth_pwd.clone().unwrap_or_default(),
+                )
+            });
+        let handshake_fut = async move {
+            match creds {
+                Some((user, pwd)) => {
+                    Socks5Stream::connect_with_password_and_socket(
+                        upstream_raw,
+                        up_target,
+                        &user,
+                        &pwd,
+                    )
                     .await
+                }
+                None => Socks5Stream::connect_with_socket(upstream_raw, up_target).await,
             }
-            None => Socks5Stream::connect_with_socket(upstream_raw, up_target).await,
-        }
-    };
-    let mut upstream = match tokio::time::timeout(ctx.cfg.handshake_timeout, handshake_fut).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => {
-            ctx.stats
-                .upstream_handshake_failed
-                .fetch_add(1, Ordering::Relaxed);
-            if is_upstream_fault(&e) {
+        };
+        match tokio::time::timeout(ctx.cfg.handshake_timeout, handshake_fut).await {
+            Ok(Ok(stream)) => {
+                up_name = upstream_cfg.name.clone();
+                established = Some(stream);
+                break;
+            }
+            Ok(Err(e)) => {
+                ctx.stats
+                    .upstream_handshake_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                if is_upstream_fault(&e) {
+                    ctx.health
+                        .mark_degraded(upstream_cfg.health_index, "上游握手失败");
+                }
+                last_rep = rep_from_upstream_error(&e);
+                debug!(
+                    %peer,
+                    upstream = %upstream_cfg.name,
+                    error = %e,
+                    rep = last_rep,
+                    "上游 SOCKS5 握手失败，尝试下一个上游"
+                );
+            }
+            Err(_) => {
+                ctx.stats
+                    .upstream_handshake_failed
+                    .fetch_add(1, Ordering::Relaxed);
                 ctx.health
-                    .mark_degraded(upstream_cfg.health_index, "上游握手失败");
+                    .mark_degraded(upstream_cfg.health_index, "上游握手超时");
+                last_rep = socks5::REP_TTL_EXPIRED;
+                debug!(%peer, upstream = %upstream_cfg.name, "上游 SOCKS5 握手超时，尝试下一个上游");
             }
-            let rep = rep_from_upstream_error(&e);
-            let _ = write_failure(&mut downstream, tunnel.reply, rep).await;
-            debug!(%peer, upstream = %up_name, error = %e, rep, "上游 SOCKS5 握手失败");
-            return;
         }
-        Err(_) => {
-            ctx.stats
-                .upstream_handshake_failed
-                .fetch_add(1, Ordering::Relaxed);
-            ctx.health
-                .mark_degraded(upstream_cfg.health_index, "上游握手超时");
-            let _ = write_failure(&mut downstream, tunnel.reply, socks5::REP_TTL_EXPIRED).await;
-            debug!(%peer, upstream = %up_name, "上游 SOCKS5 握手超时");
-            return;
+    }
+
+    let Some(mut upstream) = established else {
+        if tried.is_empty() {
+            // 一个可用上游都没有：快速拒绝
+            ctx.stats.rejected.fetch_add(1, Ordering::Relaxed);
+            let _ = write_failure(&mut downstream, tunnel.reply, socks5::REP_GENERAL_FAILURE).await;
+            debug!(
+                %peer,
+                available = ctx.health.available_count(),
+                total = ctx.health.len(),
+                "所有上游不可用，拒绝请求"
+            );
+            drain_and_close(downstream).await;
+        } else {
+            // 尝试过的上游全部失败：回最后一次的具体错误码
+            let _ = write_failure(&mut downstream, tunnel.reply, last_rep).await;
+            debug!(%peer, tried = tried.len(), rep = last_rep, "所有尝试的上游均失败");
         }
+        return;
     };
 
     // 4) 上游成功后，才回复客户端成功
@@ -427,6 +452,35 @@ async fn drain_and_close(mut stream: TcpStream) {
         }
     })
     .await;
+}
+
+/// 纯 TCP 模式：按 `retryTimes` 依次尝试不同上游建立 TCP 连接。
+///
+/// 每次失败都会 `mark_degraded`（由 [`connect_upstream`] 完成），并换下一个可用上游，
+/// 最多尝试 `retryTimes + 1` 个，全部失败返回 `None`。
+async fn connect_upstream_with_retry(
+    ctx: &Arc<AppCtx>,
+    peer: SocketAddr,
+) -> Option<(Upstream, TcpStream)> {
+    let max_attempts = ctx.cfg.retry_times.saturating_add(1).max(1);
+    let mut tried: Vec<usize> = Vec::with_capacity(max_attempts);
+    for _ in 0..max_attempts {
+        let Some(cfg) = ctx.pick_upstream_excluding(&tried).cloned() else {
+            break;
+        };
+        tried.push(cfg.health_index);
+        if let Some(stream) = connect_upstream(ctx, &cfg, peer).await {
+            return Some((cfg, stream));
+        }
+    }
+    if tried.is_empty() {
+        // 一个可用上游都没有：按拒绝统计（与协议路径口径一致）
+        ctx.stats.rejected.fetch_add(1, Ordering::Relaxed);
+        debug!(%peer, "无可用上游，关闭连接");
+    } else {
+        debug!(%peer, tried = tried.len(), "所有尝试的上游均连接失败");
+    }
+    None
 }
 
 /// 连接上游 TCP（带超时），成功后关闭 Nagle；失败时标记上游降级。

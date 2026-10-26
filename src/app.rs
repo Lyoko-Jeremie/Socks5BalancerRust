@@ -44,8 +44,14 @@ impl AppCtx {
         })
     }
 
-    /// 选一个当前可用的上游（健康状态由 M1.4 的注册表提供）。
-    pub fn pick_upstream(&self) -> Option<&crate::upstream::Upstream> {
-        self.selector.next(&|idx| self.health.is_available(idx))
+    /// 选一个可用上游，但跳过 `excluded` 中已尝试过的下标。
+    ///
+    /// 用于数据面建连失败后的快速切换（ADR-002 #3：当前连接立即切下一个可用后端）。
+    pub fn pick_upstream_excluding(
+        &self,
+        excluded: &[usize],
+    ) -> Option<&crate::upstream::Upstream> {
+        self.selector
+            .next_excluding(&|idx| self.health.is_available(idx), excluded)
     }
 }

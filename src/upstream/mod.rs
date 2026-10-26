@@ -170,8 +170,7 @@ impl UpstreamSelector {
     /// 按规则选择一个可用上游；全部不可用返回 `None`（调用方应快速拒绝）。
     ///
     /// 可用 = 人工启用 && `is_available`（健康状态）。
-    pub fn next(&self, is_available: &dyn Fn(usize) -> bool) -> Option<&Upstream> {
-        if self.is_empty() {
+    pub fn next(&self, is_available: &dyn Fn(usize) -> bool) -> Option<&Upstream> {        if self.is_empty() {
             return None;
         }
         let n = self.upstreams.len();
@@ -244,6 +243,21 @@ impl UpstreamSelector {
         };
 
         self.upstreams.get(idx)
+    }
+
+    /// 与 [`Self::next`] 相同，但跳过 `exclude` 中的上游（数据面失败重试时使用）。
+    ///
+    /// 语义：把排除项视为不可用；规则状态推进保持不变。
+    pub fn next_excluding(
+        &self,
+        is_available: &dyn Fn(usize) -> bool,
+        exclude: &[usize],
+    ) -> Option<&Upstream> {
+        if exclude.is_empty() {
+            return self.next(is_available);
+        }
+        let filtered = |i: usize| !exclude.contains(&i) && is_available(i);
+        self.next(&filtered)
     }
 }
 
@@ -418,5 +432,15 @@ mod tests {
     async fn localhost_可解析() {
         let addr = resolve_one("localhost", 8080).await;
         assert!(addr.is_ok(), "localhost 应可解析: {addr:?}");
+    }
+
+    #[test]
+    fn 排除已尝试的上游() {
+        let s = selector(SelectRule::Loop, Duration::from_secs(60));
+        // 排除下标 0（"a"）后应选中其它上游
+        let first = s.next_excluding(&all_available, &[0]).unwrap();
+        assert_ne!(first.name, "a");
+        // 全部排除 → 无可用上游
+        assert!(s.next_excluding(&all_available, &[0, 1, 2]).is_none());
     }
 }
