@@ -108,6 +108,25 @@ function Check([string]$name, [bool]$ok, [string]$detail = "") {
     }
 }
 
+
+function Http-Probe([int]$port, [string]$request, [int]$timeoutMs = 4000) {
+    $c = [System.Net.Sockets.TcpClient]::new("127.0.0.1", $port)
+    try {
+        $c.ReceiveTimeout = $timeoutMs
+        $s = $c.GetStream()
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($request)
+        $s.Write($bytes, 0, $bytes.Length)
+        $buf = New-Object byte[] 512
+        $n = $s.Read($buf, 0, 512)
+        if ($n -le 0) { return "" }
+        return [System.Text.Encoding]::ASCII.GetString($buf, 0, $n)
+    } catch {
+        return ""
+    } finally {
+        $c.Close()
+    }
+}
+
 function Socks-Bind-Probe([int]$port) {
     $c = [System.Net.Sockets.TcpClient]::new("127.0.0.1", $port)
     try {
@@ -209,8 +228,8 @@ try {
     $bind = Socks-Bind-Probe 5100
     Check "BIND 命令回 05 07" ($bind -eq "05-07") ("实际 $bind")
 
-    $closed = Closed-Probe 5100 ([System.Text.Encoding]::ASCII.GetBytes("GET / HTTP/1.1`r`nHost: x`r`n`r`n"))
-    Check "非 SOCKS5 首包被断开" $closed ""
+    $resp = Http-Probe 5100 "GET / HTTP/1.1`r`nHost: x`r`n`r`n"
+    Check "非 SOCKS5 首包按 HTTP 处理并回 400（M2 起）" ($resp -match "HTTP/1\.1 400") ("resp=$resp")
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $closed = Closed-Probe 5100 ([byte[]]@()) 15000

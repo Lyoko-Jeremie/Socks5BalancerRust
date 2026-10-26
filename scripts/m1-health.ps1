@@ -132,7 +132,7 @@ try {
     Check "上游 DOWN 时快速返回错误码" $fastFail ("code=$($r.Code) err=$($r.Err)")
 
     $balLog = Get-Content (Join-Path $logs "bal.out") -Encoding utf8 -Raw
-    Check "日志记录 fail-fast DOWN" ($balLog -match "上游探活失败") ""
+    Check "日志记录 fail-fast DOWN" ($balLog -match "TCP 探活失败|上游探活失败") ""
     Check "日志记录数据面/探测降级" ($balLog -match "标记 DOWN" -or $balLog -match "标记为不可用") ""
 
     Write-Host "== [4/4] 重启上游：退避后应自动恢复 =="
@@ -143,7 +143,7 @@ try {
     $r = Run-Client "127.0.0.1:6100" "after-recover"
     Check "恢复后转发成功" ($r.Code -eq 0 -and $r.Out -match "OK after-recover") ("code=$($r.Code) err=$($r.Err)")
     $balLog = Get-Content (Join-Path $logs "bal.out") -Encoding utf8 -Raw
-    Check "日志记录恢复可用" ($balLog -match "上游恢复可用") ""
+    Check "日志记录恢复可用" ($balLog -match "liveness 恢复|upstream readiness 恢复|上游恢复可用") ""
 
     Write-Host ""
     Write-Host "== 验收结论 =="
