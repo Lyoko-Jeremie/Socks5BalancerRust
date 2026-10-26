@@ -2,7 +2,9 @@
 #
 # 目标（对应 docs/README §8 工程约定「跨平台是硬约束」）：
 # - 每次推送到主分支或打 tag 时，自动构建两平台 release 二进制并上传为 artifact；
-# - 打 v* tag 时，额外把两平台产物发布到 GitHub Release，便于直接分发；
+# - 打 v* tag 时，额外把两平台产物发布到 GitHub Release，便于直接分发
+#   （**2026-10-27 起暂时禁用**：见 release job 的 if；tag 仍会正常构建并产出 artifact，
+#   恢复时把 `if: false` 改回 `if: startsWith(github.ref, 'refs/tags/v')` 即可）；
 # - 构建与 ci.yml 的 lint/test 解耦：CI 只做检查，本工作流只产出可发布产物。
 #
 # 产物命名：Socks5BalancerRust-<Cargo.toml version>-<platform>.<ext>
@@ -109,12 +111,16 @@ jobs:
           compression-level: 0
 
   # ===== 打 tag 时发布 GitHub Release（两个平台产物合并上传） =====
+  # 暂时禁用：`if: false` 使该 job 永远被跳过（显示为 skipped），不产生 Release。
+  # tag 推送仍会执行 build job，产物可在 Actions 页面的 artifact 中下载。
+  # 恢复自动发布：把下面的 `if: false` 改回 `if: startsWith(github.ref, 'refs/tags/v')`。
   release:
     name: release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: false
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # 仅恢复发布后生效；禁用期间不会用到写权限
     permissions:
       contents: write
     steps:
