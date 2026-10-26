@@ -82,6 +82,10 @@ pub struct HealthRegistry {
     cfg: HealthConfig,
     started: Instant,
     entries: Vec<Entry>,
+    /// 最近一次下游活动时间（相对 `started` 的毫秒；`sleepTime` 空闲暂停用）。
+    last_activity_ms: AtomicU64,
+    /// 新连接到来时通知探测任务从"空闲暂停"恢复。
+    activity_notify: tokio::sync::Notify,
     /// readiness 探测并发上限。
     probe_permits: Arc<Semaphore>,
 }
@@ -117,6 +121,8 @@ impl HealthRegistry {
             cfg,
             started: Instant::now(),
             entries,
+            last_activity_ms: AtomicU64::new(0),
+            activity_notify: tokio::sync::Notify::new(),
             probe_permits: Arc::new(Semaphore::new(permits)),
         })
     }
@@ -138,6 +144,31 @@ impl HealthRegistry {
     /// 健康检查是否启用（`disableConnectTest=true` 时为 false）。
     pub fn enabled(&self) -> bool {
         self.cfg.enabled
+    }
+
+    /// 记录一次下游活动（接入了新连接），唤醒处于 `sleepTime` 空闲暂停的探测任务。
+    pub fn note_activity(&self) {
+        if self.cfg.sleep_time.is_none() {
+            return;
+        }
+        self.last_activity_ms
+            .store(self.now_ms(), Ordering::Relaxed);
+        self.activity_notify.notify_waiters();
+    }
+
+    /// 是否已进入 `sleepTime` 空闲暂停（最近 `sleepTime` 内无新连接）。
+    ///
+    /// 空闲时暂停常规探测以省流量；DOWN 后端的退避探测不暂停（调用方用 `is_available` 判断）。
+    fn idle_sleeping(&self) -> bool {
+        let Some(sleep) = self.cfg.sleep_time else {
+            return false;
+        };
+        let sleep_ms = sleep.as_millis() as u64;
+        if sleep_ms == 0 {
+            return false;
+        }
+        let last = self.last_activity_ms.load(Ordering::Relaxed);
+        self.now_ms().saturating_sub(last) >= sleep_ms
     }
 
     /// 上游当前是否可用 = liveness && readiness（供选择器回调使用）。
@@ -188,6 +219,8 @@ impl HealthRegistry {
             return false;
         };
         let now = self.now_ms();
+        // 人工探测视为一次活动：绕过 sleepTime 空闲暂停
+        self.last_activity_ms.store(now, Ordering::Relaxed);
         entry.tcp_next_probe_ms.store(now, Ordering::Release);
         entry.tls_next_probe_ms.store(now, Ordering::Release);
         entry.probe_notify.notify_one();
@@ -371,6 +404,7 @@ impl HealthRegistry {
             info!("健康检查已禁用（disableConnectTest=true）：不启动探测任务");
             return;
         }
+        self.spawn_addition_checker(cancel.clone());
         for idx in 0..self.entries.len() {
             self.spawn_tcp_probe(idx, cancel.clone());
             if self.cfg.tls.is_some() {
@@ -396,6 +430,15 @@ impl HealthRegistry {
             loop {
                 if !wait_until(&reg, idx, true, &cancel).await {
                     return;
+                }
+                // sleepTime：空闲（最近 sleepTime 无新连接）且该上游健康 → 暂停常规探测
+                //（DOWN 的后端不暂停，继续按退避探测以尽快恢复）
+                if reg.idle_sleeping() && reg.is_available(idx) {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        _ = reg.activity_notify.notified() => continue,
+                        _ = tokio::time::sleep(Duration::from_millis(1_000)) => continue,
+                    }
                 }
                 let addr = reg.entries[idx].addr;
                 let started = Instant::now();
@@ -426,6 +469,14 @@ impl HealthRegistry {
             loop {
                 if !wait_until(&reg, idx, false, &cancel).await {
                     return;
+                }
+                // sleepTime：空闲且该上游健康 → 暂停 readiness 探测
+                if reg.idle_sleeping() && reg.is_available(idx) {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        _ = reg.activity_notify.notified() => continue,
+                        _ = tokio::time::sleep(Duration::from_millis(1_000)) => continue,
+                    }
                 }
                 if !reg.entries[idx].liveness.load(Ordering::Relaxed) {
                     // TCP 都不通，无需做 readiness 探测
@@ -469,6 +520,32 @@ impl HealthRegistry {
                     }
                 };
                 reg.record_readiness(idx, ok, rtt_ms);
+            }
+        });
+    }
+
+    /// `additionCheckPeriod`：全池不可用时按该周期额外触发一次全池立即探测。
+    fn spawn_addition_checker(self: &Arc<Self>, cancel: CancellationToken) {
+        let Some(period) = self.cfg.addition_check_period else {
+            return;
+        };
+        let reg = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await; // 跳过第一次立即触发
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = ticker.tick() => {
+                        if !reg.entries.is_empty() && reg.available_count() == 0 {
+                            debug!(count = reg.entries.len(), "全池不可用：按 additionCheckPeriod 加速探测");
+                            for i in 0..reg.entries.len() {
+                                reg.probe_now(i);
+                            }
+                        }
+                    }
+                }
             }
         });
     }
@@ -531,6 +608,8 @@ mod tests {
             probe_jitter: 0.0,
             backoff_jitter: 0.0,
             tls: None,
+            sleep_time: None,
+            addition_check_period: None,
         }
     }
 
@@ -575,6 +654,26 @@ mod tests {
         assert_eq!(reg.snapshot()[0].rtt_ms, 12);
         reg.record_readiness(0, true, 34);
         assert_eq!(reg.snapshot()[0].rtt_ms, 34);
+    }
+
+    #[test]
+    fn sleep_空闲窗口暂停探测() {
+        let mut c = cfg();
+        c.sleep_time = Some(Duration::from_millis(50));
+        let reg = HealthRegistry::new(&[upstream("a", 1)], c);
+        // 启动初期不算空闲（先让首轮探测跑起来）
+        assert!(!reg.idle_sleeping());
+        std::thread::sleep(Duration::from_millis(80));
+        // 超过 sleepTime 无新连接 → 暂停常规探测
+        assert!(reg.idle_sleeping());
+        // 新连接到来 → 恢复
+        reg.note_activity();
+        assert!(!reg.idle_sleeping());
+        // 人工探测也视为活动
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(reg.idle_sleeping());
+        assert!(reg.probe_now(0));
+        assert!(!reg.idle_sleeping());
     }
 
     #[test]

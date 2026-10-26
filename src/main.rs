@@ -154,6 +154,16 @@ async fn run(cfg: config::Config, workers: usize) -> Result<(), Box<dyn std::err
         backoff_multiplier = health.cfg().backoff_multiplier,
         backoff_max_ms = health.cfg().backoff_max.as_millis() as u64,
         probe_jitter = health.cfg().probe_jitter,
+        sleep_time_ms = health
+            .cfg()
+            .sleep_time
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        addition_check_period_ms = health
+            .cfg()
+            .addition_check_period
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
         "健康检查已启用：TCP 探活 + fail-fast + DOWN 指数退避"
     );
     if cfg.health.enabled {

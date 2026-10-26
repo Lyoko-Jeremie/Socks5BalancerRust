@@ -78,6 +78,8 @@ pub async fn handle_connection(
     bufs: Buffers,
     guard: ActiveGuard,
 ) {
+    // sleepTime：记录"有新连接"的活动时间，健康检查会据此暂停/恢复常规探测
+    ctx.health.note_activity();
     if ctx.cfg.tradition_tcp_relay {
         handle_tradition(ctx, downstream, peer, local, bufs, guard).await;
     } else {

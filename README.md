@@ -111,6 +111,8 @@ curl -X POST -H "Content-Type: application/json" \
 | `stateServerHost/Port` | `127.0.0.1` / `5110` | 控制面地址；`0` 表示禁用 |
 | `healthCheck.tcp` | period 5000 / timeout 2000 | TCP 探活周期与超时（一次失败即 DOWN） |
 | `healthCheck.target` | 未配置 | TLS/HTTP readiness 目标（如 `{"host":"www.example.com","port":443}`），不配则只做 TCP |
+| `sleepTime` | 未配置 | 最近该时长（毫秒）无新连接则暂停常规探测；DOWN 后端仍按退避重探 |
+| `additionCheckPeriod` | 未配置 | 全池不可用时按该周期（毫秒）加速探测 |
 
 > 完整字段：`config.example.json`（开发）与 `deploy/config.example.json`（生产）。
 

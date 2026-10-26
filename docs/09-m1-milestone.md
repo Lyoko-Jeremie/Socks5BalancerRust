@@ -152,7 +152,7 @@
 
 1. **外网 TLS 目标可达性取决于部署环境**：本机对部分外网 IPv4/IPv6 的 TLS 数据会被 RST（curl 直连亦不一致），因此验收改用**本地自签 HTTPS 目标**（`examples/tls_echo_server` + `caFile`），保证可复现。生产部署时 `healthCheck.target` 应配置为**从本机可达**的目标。
 2. **每客户端 hint 粘性已补齐**：粘性型规则（`one_by_one`/`change_by_time`）按客户端 IP 复用上次成功的上游；`loop`/`random`/`force_only_one` 保持原规则语义。
-3. **`sleepTime`（长时间无请求暂停探测）未实现**：M1.4 恒探测；按 ADR 可在 M3 控制面做。
+3. **`sleepTime` / `additionCheckPeriod` 已实现**：最近 `sleepTime` 内无新连接时暂停常规探测（DOWN 后端仍按退避重探）；全池不可用时按 `additionCheckPeriod` 加速探测。
 4. **C10K/1K 建连压测未做**：Windows 单机动态端口 16,384 的限制仍在（M0 已记录），需 Linux 或多机验证；M1 的 SOCKS5 握手会额外消耗端口与时间。
 5. **Linux 未实测**：平台差异已用 `cfg` 分隔，CI 待补。
 6. **`slowImpl` 握手兼容未实现**：C++ 的兼容模式（部分上游不标准）计划 M2。

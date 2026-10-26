@@ -285,6 +285,11 @@ pub struct HealthConfig {
     pub backoff_jitter: f64,
     /// TLS + HTTP readiness 探测；None 表示只做 TCP liveness。
     pub tls: Option<TlsProbeConfig>,
+    /// `sleepTime`：最近该时长内无新连接则暂停常规探测（DOWN 后端的退避探测继续）；
+    /// None/0 表示不启用。
+    pub sleep_time: Option<Duration>,
+    /// `additionCheckPeriod`：全池不可用时额外加速探测的周期；None 表示不启用。
+    pub addition_check_period: Option<Duration>,
 }
 
 /// 原始配置：字段名与 C++ `config.json` 对齐。
@@ -890,6 +895,30 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
     }
     let health = build_health_config(&health_raw, raw.disable_connect_test)?;
 
+    // ===== sleepTime / additionCheckPeriod（旧字段，现已生效）=====
+    let mut health = health;
+    if health.enabled {
+        if let Some(ms) = raw.sleep_time.filter(|v| *v > 0) {
+            if ms > 86_400_000 {
+                return Err(err("sleepTime 过大（>86400000ms）"));
+            }
+            health.sleep_time = Some(Duration::from_millis(ms));
+            notes.push(format!(
+                "sleepTime={ms}ms：无新连接时暂停常规探测（DOWN 后端仍按退避重探）"
+            ));
+        }
+        if let Some(ms) = raw.addition_check_period.filter(|v| *v > 0) {
+            if ms < 1_000 {
+                return Err(err("additionCheckPeriod 不能小于 1000ms"));
+            }
+            if ms > 3_600_000 {
+                return Err(err("additionCheckPeriod 过大（>3600000ms）"));
+            }
+            health.addition_check_period = Some(Duration::from_millis(ms));
+            notes.push(format!("additionCheckPeriod={ms}ms：全池不可用时加速探测"));
+        }
+    }
+
     // ===== 客户端认证（ADR-004）=====
     let mut auth: Vec<AuthUser> = Vec::new();
     for (idx, u) in raw.auth_client_info.iter().enumerate() {
@@ -1051,6 +1080,8 @@ fn build_health_config(
             probe_jitter: DEFAULT_JITTER,
             backoff_jitter: DEFAULT_JITTER,
             tls: None,
+            sleep_time: None,
+            addition_check_period: None,
         });
     }
 
@@ -1175,6 +1206,9 @@ fn build_health_config(
         probe_jitter: jitter,
         backoff_jitter,
         tls,
+        // 由 `from_value` 根据 RawConfig 的旧字段填充
+        sleep_time: None,
+        addition_check_period: None,
     })
 }
 
@@ -1509,8 +1543,30 @@ mod tests {
     }
 
     #[test]
-    fn 新字段优先于旧探测字段() {
+    fn sleep_time_与_addition_check_period_生效() {
         let text = r#"{
+            "listenPort": 5000,
+            "sleepTime": 60000,
+            "additionCheckPeriod": 10000,
+            "upstream": [ { "host": "127.0.0.1", "port": 6100 } ]
+        }"#;
+        let c = load_str(text).unwrap();
+        assert_eq!(
+            c.health.sleep_time,
+            Some(Duration::from_millis(60_000)),
+            "sleepTime 应生效"
+        );
+        assert_eq!(
+            c.health.addition_check_period,
+            Some(Duration::from_millis(10_000)),
+            "additionCheckPeriod 应生效"
+        );
+        assert!(c.notes.iter().any(|n| n.contains("sleepTime")));
+        assert!(c.notes.iter().any(|n| n.contains("additionCheckPeriod")));
+    }
+
+    #[test]
+    fn 新字段优先于旧探测字段() {        let text = r#"{
             "listenPort": 5000,
             "tcpCheckPeriod": 7000,
             "testRemoteHost": "old.example.com",

@@ -104,6 +104,7 @@ Rust 版**直接兼容** C++ `config.json` 的主要字段（camelCase），包�
 | 全上游 DOWN | 继续尝试（黑洞） | 立即回 REP 0x01 | 客户端快速失败 |
 | TLS 探测 | `ConnectTestHttps` 默认 `www.google.com:443` | `healthCheck.target` **必配**（不配则只做 TCP）；`expectStatus` 为空时**不校验状态码**（对齐 C++，只看能否完成 HTTP 往返） | 迁移时需显式配置 target |
 | `disableConnectTest` | 跳过全部健康检查，只看人工禁用 | **相同语义**：不探测、数据面失败也不降级 | 一致 |
+| `sleepTime` / `additionCheckPeriod` | 存在 | 已实现：空闲时暂停常规探测 / 全池不可用时加速探测 | 语义对齐 |
 | 控制面 | 十余端点 + 内置前端 | **4 端点**，无前端 | 原有 `/op?xxx`、`/clientInfo` 等调用需改写 |
 | 控制面鉴权 | 无 | 无（同），但响应剔除密码 + 默认回环 | 同 C++ |
 | `slowImpl` | 存在（兼容不标准上游） | **未实现** | 若上游非常规，先验证 |
