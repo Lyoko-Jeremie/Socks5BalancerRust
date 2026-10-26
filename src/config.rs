@@ -292,6 +292,48 @@ pub struct HealthConfig {
     pub addition_check_period: Option<Duration>,
 }
 
+/// 连接监测原始配置（`connectionTracking` 节）。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawConnectionTracking {
+    /// 是否启用连接监测（聚合计数 + 明细注册）。
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 是否登记每连接明细（默认 true，与 C++ 会话表行为接近）。
+    #[serde(default)]
+    pub detail: Option<bool>,
+    /// 明细上限（达到后新连接只计数、不登记明细）。
+    #[serde(default)]
+    pub detail_limit: Option<usize>,
+    /// `/connections/summary` 返回的客户端 Top N。
+    #[serde(default)]
+    pub client_top_limit: Option<usize>,
+}
+
+/// 连接监测有效配置。
+#[derive(Debug, Clone)]
+pub struct ConnTrackingConfig {
+    /// 是否启用连接监测。
+    pub enabled: bool,
+    /// 是否登记每连接明细（关闭时只保留聚合计数）。
+    pub detail: bool,
+    /// 明细上限（达到后新连接只计数、不登记明细）。
+    pub detail_limit: usize,
+    /// 客户端维度 Top N（`/connections/summary`）。
+    pub client_top_limit: usize,
+}
+
+impl Default for ConnTrackingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            detail: true,
+            detail_limit: 10_000,
+            client_top_limit: 200,
+        }
+    }
+}
+
 /// 原始配置：字段名与 C++ `config.json` 对齐。
 ///
 /// 标注 `allow(dead_code)` 的原因：其中一部分字段（探测周期、控制面等）在 M0 只做兼容解析，
@@ -365,6 +407,17 @@ pub struct RawConfig {
     pub state_server_port: Option<u16>,
     #[serde(default)]
     pub state_max_response_bytes: Option<usize>,
+
+    // ===== 监控面（连接监测端点；可选独立监听）=====
+    /// 监控端点独立监听的 host（缺省 127.0.0.1；仅当 monitorServerPort>0 时生效）。
+    #[serde(default)]
+    pub monitor_server_host: Option<String>,
+    /// 监控端点独立监听端口；0/缺省 = 与控制面共用 stateServer 监听。
+    #[serde(default)]
+    pub monitor_server_port: Option<u16>,
+    /// 连接监测配置（默认开启明细）。
+    #[serde(default)]
+    pub connection_tracking: Option<RawConnectionTracking>,
 
     // ===== 认证（ADR-004：SOCKS5 0x00/0x02）=====
     #[serde(default, alias = "AuthClientInfo")]
@@ -475,6 +528,10 @@ pub struct Config {
     pub state_server: Option<ListenTarget>,
     /// 控制面单次响应字节上限（默认 65536）。
     pub state_max_response_bytes: usize,
+    /// 监控面独立监听地址；None 表示监控端点与控制面共用监听。
+    pub monitor_server: Option<ListenTarget>,
+    /// 连接监测配置（默认开启明细）。
+    pub conn_tracking: ConnTrackingConfig,
     /// 解析过程中发现的"被忽略/降级"的配置项说明，启动时以 warning 打印。
     pub notes: Vec<String>,
 }
@@ -506,6 +563,9 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "stateServerHost",
     "stateServerPort",
     "stateMaxResponseBytes",
+    "monitorServerHost",
+    "monitorServerPort",
+    "connectionTracking",
     "authClientInfo",
     "AuthClientInfo",
     "internalBehavior",
@@ -567,6 +627,9 @@ const KNOWN_INTERNAL_KEYS: &[&str] = &[
 const KNOWN_LISTEN_KEYS: &[&str] = &["host", "port"];
 /// `authClientInfo[]` 的已知字段。
 const KNOWN_AUTH_KEYS: &[&str] = &["user", "pwd"];
+/// `connectionTracking` 节的已知字段。
+const KNOWN_TRACKING_KEYS: &[&str] =
+    &["enabled", "detail", "detailLimit", "clientTopLimit"];
 
 /// 记录 `value` 对象中本版本不认识的字段（防止 `enabled`/`threadStackSizeKb` 之类拼写错误被静默忽略）。
 ///
@@ -634,6 +697,9 @@ fn scan_unknown_keys(value: &serde_json::Value, notes: &mut Vec<String>) {
     }
     if let Some(ib) = value.get("internalBehavior") {
         note_unknown_keys(ib, KNOWN_INTERNAL_KEYS, "internalBehavior", notes);
+    }
+    if let Some(t) = value.get("connectionTracking") {
+        note_unknown_keys(t, KNOWN_TRACKING_KEYS, "connectionTracking", notes);
     }
 }
 
@@ -1037,6 +1103,67 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
         .unwrap_or(65_536)
         .min(1024 * 1024);
 
+    // ===== 监控面（可选独立监听；缺省与控制面共用）=====
+    let monitor_server = match raw.monitor_server_port.filter(|p| *p > 0) {
+        None => None,
+        Some(port) => {
+            let bind = ListenTarget {
+                host: raw
+                    .monitor_server_host
+                    .clone()
+                    .filter(|h| !h.trim().is_empty())
+                    .unwrap_or_else(|| "127.0.0.1".to_string()),
+                port,
+            };
+            if !is_loopback_host(&bind.host) {
+                notes.push(format!(
+                    "监控面无鉴权且监听非回环地址 {}：会暴露客户端 IP/连接明细，建议仅回环",
+                    bind
+                ));
+            }
+            if state_server.as_ref() == Some(&bind) {
+                notes.push("monitorServerHost/Port 与控制面相同：监控端点复用控制面监听".into());
+                None
+            } else {
+                Some(bind)
+            }
+        }
+    };
+
+    // ===== 连接监测（默认开启明细，与 C++ 会话表行为接近）=====
+    let tracking_raw = raw.connection_tracking.clone().unwrap_or_default();
+    let mut conn_tracking = ConnTrackingConfig {
+        detail_limit: max_connections.max(1),
+        ..ConnTrackingConfig::default()
+    };
+    if let Some(v) = tracking_raw.enabled {
+        conn_tracking.enabled = v;
+    }
+    if let Some(v) = tracking_raw.detail {
+        conn_tracking.detail = v;
+    }
+    if let Some(v) = tracking_raw.detail_limit.filter(|v| *v > 0) {
+        if v > 1_000_000 {
+            return Err(err("connectionTracking.detailLimit 过大（>1000000）"));
+        }
+        conn_tracking.detail_limit = v;
+    }
+    if let Some(v) = tracking_raw.client_top_limit.filter(|v| *v > 0) {
+        conn_tracking.client_top_limit = v.min(10_000);
+    }
+    if !conn_tracking.enabled {
+        notes.push("connectionTracking.enabled=false：不记录连接监测（/connections 不可用）".into());
+    } else if !conn_tracking.detail {
+        notes.push(
+            "connectionTracking.detail=false：只保留三维度计数，/connections 明细为空".into(),
+        );
+    } else {
+        notes.push(format!(
+            "连接监测：明细开启（上限 {}，客户端 Top {}）",
+            conn_tracking.detail_limit, conn_tracking.client_top_limit
+        ));
+    }
+
     Ok(Config {
         listen,
         upstreams,
@@ -1065,6 +1192,8 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
         disable_http_forward: raw.disable_http_forward,
         state_server,
         state_max_response_bytes,
+        monitor_server,
+        conn_tracking,
         notes,
     })
 }
@@ -1607,6 +1736,53 @@ mod tests {
         );
         let c = load_str(minimal()).unwrap();
         assert!(!c.disable_http_forward, "默认应允许 HTTP 正向代理");
+    }
+
+    #[test]
+    fn 连接监测与监控面配置解析() {
+        // 默认：明细开启，detailLimit = maxConnections，监控面复用控制面
+        let c = load_str(minimal()).unwrap();
+        assert!(c.conn_tracking.enabled);
+        assert!(c.conn_tracking.detail);
+        assert_eq!(c.conn_tracking.detail_limit, c.max_connections);
+        assert!(c.monitor_server.is_none());
+
+        // 自定义明细与独立监控端口
+        let text = r#"{
+            "listenPort": 5000,
+            "maxConnections": 500,
+            "monitorServerHost": "127.0.0.1",
+            "monitorServerPort": 5120,
+            "connectionTracking": {
+                "enabled": true,
+                "detail": false,
+                "detailLimit": 200,
+                "clientTopLimit": 50
+            },
+            "upstream": [ { "host": "127.0.0.1", "port": 6100 } ]
+        }"#;
+        let c = load_str(text).unwrap();
+        assert!(!c.conn_tracking.detail);
+        assert_eq!(c.conn_tracking.detail_limit, 200);
+        assert_eq!(c.conn_tracking.client_top_limit, 50);
+        assert_eq!(c.monitor_server.as_ref().map(|m| m.port), Some(5120));
+
+        // 监控面与控制面同地址 → 合并为共用监听
+        let text = r#"{
+            "listenPort": 5000,
+            "stateServerHost": "127.0.0.1",
+            "stateServerPort": 5110,
+            "monitorServerHost": "127.0.0.1",
+            "monitorServerPort": 5110,
+            "upstream": [ { "host": "127.0.0.1", "port": 6100 } ]
+        }"#;
+        let c = load_str(text).unwrap();
+        assert!(c.monitor_server.is_none());
+        assert!(
+            c.notes.iter().any(|n| n.contains("复用控制面")),
+            "notes={:?}",
+            c.notes
+        );
     }
 
     #[test]

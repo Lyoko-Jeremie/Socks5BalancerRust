@@ -6,6 +6,15 @@
   "stateServerPort": 5110,
   "stateMaxResponseBytes": 65536,
 
+  "monitorServerHost": "127.0.0.1",
+  "monitorServerPort": 5111,
+  "connectionTracking": {
+    "enabled": true,
+    "detail": true,
+    "detailLimit": 20000,
+    "clientTopLimit": 200
+  },
+
   "traditionTcpRelay": false,
   "disableSocks4": false,
   "disableHttpForward": false,
