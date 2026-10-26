@@ -1,0 +1,141 @@
+# Socks5BalancerRust 持续集成（Windows + Linux）
+#
+# 目标（对应 docs/README §8 工程约定）：
+# - 跨平台是硬约束：Windows 与 Linux 必须同时通过同一组检查；
+# - 一条流水线覆盖 格式 → 静态检查 → 单测 →（Linux）release 构建 → 端到端冒烟；
+# - 独立的 encoding job 守护"UTF-8（无 BOM）+ LF"落库约定。
+#
+# 说明：
+# - fuzz 目标需要 nightly + cargo-fuzz，不在本工作流运行（见 fuzz/README.md）；
+# - Linux 上 scripts/ci-linux.sh 内部也会重跑 fmt/clippy/test/build，这里仍分步执行，
+#   好处是 CI 页面能直接定位失败步骤；脚本负责最后的"启动 balancer + 控制面冒烟"。
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的新提交取消仍在跑的旧任务，节省 runner
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # CI 不需要增量缓存，关掉可减少磁盘占用
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # ===== 双平台：格式 / clippy / 单测 =====
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust stable（含 rustfmt/clippy）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: 缓存 cargo 依赖与构建产物
+        uses: Swatinem/rust-cache@v2
+
+      - name: 格式检查（cargo fmt --all -- --check）
+        run: cargo fmt --all -- --check
+
+      - name: 静态检查（cargo clippy --all-targets -- -D warnings）
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 单元测试（cargo test）
+        run: cargo test
+
+      # ---- 以下仅 Linux：release 构建 + 端到端冒烟（Windows 无法用 bash 脚本） ----
+      - name: release 构建（cargo build --release --bins --examples）
+        if: runner.os == 'Linux'
+        run: cargo build --release --bins --examples
+
+      - name: Linux 冒烟（scripts/ci-linux.sh）
+        if: runner.os == 'Linux'
+        run: bash scripts/ci-linux.sh
+
+  # ===== 独立 job：落库编码与换行检查 =====
+  #
+  # 规则：
+  # - .rs/.md/.json/.sh：UTF-8 无 BOM、仅 LF；
+  # - .ps1：允许（且要求）UTF-8 BOM —— Windows PowerShell 5.1 无 BOM 时中文会乱码，
+  #   见 docs/08 §6 与 .gitattributes；换行仍要求 LF（.gitattributes 仅控制检出为 CRLF）。
+  # - 检查对象是 git 对象（HEAD:path），不是工作区文件：避免 .gitattributes 的
+  #   eol=crlf 检出策略干扰"提交内容是否为 LF"的判断。
+  encoding:
+    name: encoding (UTF-8 无 BOM / LF)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 检查受控源文件的编码与换行
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          fail=0
+          checked=0
+
+          while IFS= read -r -d '' path; do
+            case "$path" in
+              *.rs | *.md | *.json | *.sh | *.ps1) ;;
+              *) continue ;;
+            esac
+            checked=$((checked + 1))
+
+            # 读取真正落库的字节（工作区可能因 .gitattributes 被转成 CRLF）
+            blob="$(git cat-file blob "HEAD:$path")"
+
+            # 1) 必须是合法 UTF-8
+            if ! printf '%s' "$blob" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+              echo "::error file=$path::不是合法的 UTF-8"
+              fail=$((fail + 1))
+              continue
+            fi
+
+            # 2) UTF-8 BOM：.ps1 例外（PowerShell 5.1 需要），其它一律禁止
+            case "$blob" in
+              $'\xef\xbb\xbf'*)
+                case "$path" in
+                  *.ps1) ;;
+                  *)
+                    echo "::error file=$path::含 UTF-8 BOM（项目约定：无 BOM）"
+                    fail=$((fail + 1))
+                    ;;
+                esac
+                ;;
+            esac
+
+            # 3) 换行必须全为 LF（出现 CR 即失败）
+            case "$blob" in
+              *$'\r'*)
+                echo "::error file=$path::包含 CR 换行（项目约定：仅 LF）"
+                fail=$((fail + 1))
+                ;;
+            esac
+          done < <(git ls-files -z)
+
+          echo "已检查 $checked 个受控文件（.rs/.md/.json/.sh/.ps1）"
+          if [ "$fail" -ne 0 ]; then
+            echo "编码约定检查失败：$fail 项，见上方 ::error 注释" >&2
+            exit 1
+          fi
+          echo "编码约定检查通过"
