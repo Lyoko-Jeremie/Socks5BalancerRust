@@ -46,6 +46,9 @@ install -m 0640 -o root -g balancer deploy/config.example.json /etc/socks5balanc
 ```bash
 useradd --system --no-create-home --shell /usr/sbin/nologin balancer
 install -m 0644 deploy/socks5balancer.service /etc/systemd/system/
+# 单元里 Documentation=file:/usr/share/doc/socks5balancer/README.md 指向本文件，
+# 必须一并安装，否则 `systemctl status` 的帮助链接是断的
+install -Dm644 README.md /usr/share/doc/socks5balancer/README.md
 systemctl daemon-reload
 systemctl enable --now socks5balancer
 systemctl status socks5balancer
