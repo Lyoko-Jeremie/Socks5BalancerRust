@@ -1,0 +1,81 @@
+{
+  "listenHost": "0.0.0.0",
+  "listenPort": 5000,
+  "multiListen": [],
+  "stateServerHost": "127.0.0.1",
+  "stateServerPort": 5110,
+  "stateMaxResponseBytes": 65536,
+
+  "traditionTcpRelay": false,
+  "disableSocks4": false,
+
+  "bufferSize": 2048,
+  "maxConnections": 10000,
+  "connectTimeout": 2000,
+  "firstPacketTimeout": 15000,
+  "handshakeTimeout": 10000,
+  "retryTimes": 3,
+
+  "threadNum": 0,
+  "workerThreads": 4,
+  "maxBlockingThreads": 2,
+  "threadStackSizeKb": 512,
+  "socketRecvBuffer": 0,
+  "socketSendBuffer": 0,
+
+  "logLevel": "info",
+  "upstreamSelectRule": "random",
+  "serverChangeTime": 60000,
+
+  "upstream": [
+    {
+      "name": "proxy-a",
+      "host": "10.0.0.11",
+      "port": 1080,
+      "enabled": true,
+      "authUser": "",
+      "authPwd": ""
+    },
+    {
+      "name": "proxy-b",
+      "host": "10.0.0.12",
+      "port": 1080,
+      "enabled": true,
+      "authUser": "user",
+      "authPwd": "change-me"
+    }
+  ],
+
+  "authClientInfo": [],
+
+  "healthCheck": {
+    "failFast": true,
+    "probeJitter": 0.2,
+    "maxProbeConcurrency": 4,
+    "tcp": {
+      "period": 5000,
+      "timeout": 2000,
+      "startDelay": 1000
+    },
+    "connect": {
+      "period": 300000,
+      "timeout": 11000,
+      "startDelay": 1000
+    },
+    "target": {
+      "host": "www.example.com",
+      "port": 443,
+      "sni": "",
+      "httpPath": "/",
+      "userAgent": "Socks5BalancerRust-probe/0.1",
+      "expectStatus": [],
+      "caFile": ""
+    },
+    "downBackoff": {
+      "initial": 30000,
+      "multiplier": 2.0,
+      "max": 600000,
+      "jitter": 0.2
+    }
+  }
+}

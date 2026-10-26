@@ -1,0 +1,48 @@
+[Unit]
+Description=Socks5BalancerRust - SOCKS5/HTTP 上游负载均衡代理
+Documentation=file:/usr/share/doc/socks5balancer/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=balancer
+Group=balancer
+ExecStart=/usr/local/bin/Socks5BalancerRust -c /etc/socks5balancer/config.json
+Restart=on-failure
+RestartSec=2s
+# 优雅关闭：进程收到 SIGTERM 后取消任务并在 12s 内收尾
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+
+# 连接数上限（C10K 场景）：systemd 默认 1024，必须提高
+LimitNOFILE=131072
+LimitNPROC=65536
+LimitCORE=0
+
+# 最小权限加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# 允许读取配置、写日志目录
+ReadOnlyPaths=/etc/socks5balancer
+ReadWritePaths=/var/log/socks5balancer
+StateDirectory=socks5balancer
+LogsDirectory=socks5balancer
+
+# 若监听 <1024 端口（如 443）才需要；默认 5000 不需要，按需打开
+#AmbientCapabilities=CAP_NET_BIND_SERVICE
+#CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
