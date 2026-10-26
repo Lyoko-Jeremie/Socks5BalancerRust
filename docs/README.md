@@ -36,11 +36,12 @@
 | 9 | [09-m1-milestone.md](09-m1-milestone.md) | **M1 里程碑报告**：SOCKS5 0x00/0x02、上游握手、5 条选路规则、健康检查（fail-fast + 退避 + 数据面降级）、TLS readiness、验收结果 | ~200 行 |
 | 10 | [10-m2-milestone.md](10-m2-milestone.md) | **M2 里程碑报告**：首包嗅探、SOCKS4/4a、HTTP CONNECT / absolute-form、early data 回放、origin-form 改写、验收结果 | ~180 行 |
 | 11 | [11-m3-milestone.md](11-m3-milestone.md) | **M3 里程碑报告**：精简控制面 4 端点、控制命令、安全默认、全量回归 | ~200 行 |
+| 12 | [12-m4-performance.md](12-m4-performance.md) | **M4 性能与内存基线**：Windows 实测（2048/4096/8192 × 1000 连接）、每连接开销校准、10K/100MB 推算、Linux 压测脚本 | ~150 行 |
 
-阅读顺序建议：**01 → 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09 → 10 → 11**。
+阅读顺序建议：**01 → 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09 → 10 → 11 → 12**。
 只想快速决策：读本文 §3/§4/§5；准备动手写代码：读 **07（决策）+ 02 §8 + 06 §7**。
 
-> **当前进度（2026-10-26）**：**M0 ✅；M1（M1.1–M1.5）✅；M2 ✅；M3 ✅**。已实现：SOCKS5 入站 0x00/0x02（RFC1929、CONNECT、错误码回传）、上游 SOCKS5 握手（含上游认证）、5 条选路规则、fail-fast 健康检查（DOWN 指数退避 + 数据面降级 + 快速重探）、TLS + HTTP readiness 探测（系统根证书 / caFile）、混合端口（SOCKS5 / SOCKS4-4a / HTTP CONNECT / HTTP forward）、**精简控制面（4 端点、运行期启停/改规则/立即探测、无鉴权仅回环、响应不含密码）**。端到端验收：协议 10/10、健康检查 6/6、TLS readiness 9/9、混合协议 9/9、控制面 19/19；单元测试 **75** 个全绿；clippy/fmt 通过。**下一步：C10K/1K 压测（Linux 优先）与 M4 调优**。详见 [11-m3-milestone.md](11-m3-milestone.md)。
+> **当前进度（2026-10-26）**：**M0 ✅；M1（M1.1–M1.5）✅；M2 ✅；M3 ✅；M4 内存基线 ✅（C10K/1K 待 Linux）**。已实现：SOCKS5 入站 0x00/0x02（RFC1929、CONNECT、错误码回传）、上游 SOCKS5 握手（含上游认证）、5 条选路规则、fail-fast 健康检查（DOWN 指数退避 + 数据面降级 + 快速重探）、TLS + HTTP readiness 探测、混合端口（SOCKS5 / SOCKS4-4a / HTTP CONNECT / HTTP forward）、精简控制面（4 端点、运行期启停/改规则/立即探测、无鉴权仅回环、响应不含密码）。端到端验收：协议 10/10、健康检查 6/6、TLS readiness 9/9、混合协议 9/9、控制面 19/19；单元测试 **75** 个全绿；**内存实测：`bufferSize=2048` 下 10K 空闲连接推算 ≈ 98.5 MB（Windows 口径，临界达标；Linux 预计 ~69 MB）**。**下一步：Linux C10K/1K 实测、24h 长稳、M5 交付**。详见 [12-m4-performance.md](12-m4-performance.md)。
 
 > **2026-10-26 修订**：用户已就 7 项关键取舍作出决策（控制面精简不鉴权、健康检查 fail-fast 不重试且异常后端降频、线程数可配置、SOCKS5 仅 0x00/0x02、双向 8K 预分配、TLS 探测对齐 C++、优先成熟库），已固化为 [07-decisions.md](07-decisions.md)，并同步修订 01/02/04/05/06 的"Rust 建议"部分。C++ 现状分析部分不变。
 
