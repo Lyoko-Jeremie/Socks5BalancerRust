@@ -1,6 +1,6 @@
 {
   "listenHost": "127.0.0.1",
-  "listenPort": 5100,
+  "listenPort": 6100,
   "multiListen": [
     { "host": "127.0.0.1", "port": 6610 }
   ],
@@ -15,8 +15,8 @@
   "maxConnections": 10000,
   "logLevel": "info",
   "stateServerHost": "127.0.0.1",
-  "stateServerPort": 5110,
+  "stateServerPort": 6110,
   "upstream": [
-    { "name": "localEcho", "host": "127.0.0.1", "port": 6100 }
+    { "name": "localEcho", "host": "127.0.0.1", "port": 7100 }
   ]
 }
