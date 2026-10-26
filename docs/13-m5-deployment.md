@@ -2,9 +2,9 @@
 
 > 日期：2026-10-26
 > 对应计划：[06-rust-port-assessment.md](06-rust-port-assessment.md) §10 的 **M5**
-> 交付物：`Dockerfile`、`.dockerignore`、`deploy/socks5balancer.service`、`deploy/config.example.json`、
-> `scripts/ci-linux.sh`、`scripts/loadtest-linux.sh`、`.github/workflows/ci.yml`、`fuzz/`
-> 决策依据：[07-decisions.md](07-decisions.md)（ADR-001 控制面、ADR-003 线程、ADR-005 内存）
+> 交付物：`deploy/socks5balancer.service`、`deploy/config.example.json`、
+> `scripts/ci-linux.sh`、`scripts/loadtest-linux.sh`、`scripts/soak-linux.sh`、`.github/workflows/ci.yml`、`fuzz/`
+> 决策依据：[07-decisions.md](07-decisions.md)（ADR-001 控制面、ADR-003 线程、ADR-005 内存、U7 Docker 暂不实现）
 
 ---
 
@@ -12,7 +12,6 @@
 
 | 文件 | 用途 |
 |---|---|
-| `Dockerfile` | 多阶段构建镜像（rust 1-slim 构建 → debian-slim 运行，非 root，`/healthz` 健康检查） |
 | `deploy/socks5balancer.service` | systemd 单元（`LimitNOFILE=131072`、最小权限加固、SIGTERM 优雅关闭） |
 | `deploy/config.example.json` | 生产示例配置（多上游 + TCP/TLS 双探测 + 回环控制面 + 2K 内存口径） |
 | `scripts/ci-linux.sh` | Linux CI：fmt/clippy/test/release + 控制面冒烟 |
@@ -20,8 +19,11 @@
 | `scripts/soak-linux.sh` | Linux 24h 长稳（RSS/fd/连接数采样与增长斜率摘要） |
 | `scripts/m4-memory.ps1` | Windows 内存基线实测 |
 | `.github/workflows/ci.yml` | GitHub Actions CI：Windows/Linux 双平台 `fmt`/`clippy`/`test`，Linux 追加 release 构建与冒烟，另含独立编码检查 job |
-| `.dockerignore` | 裁剪 Docker 构建上下文（排除 `target/`、`.git/`、`docs/` 等） |
 | `fuzz/` | cargo-fuzz 目标（SOCKS5 / HTTP / SOCKS4 解析）；需 nightly，CI 不运行（见 `fuzz/README.md`） |
+
+> **容器化不在本期交付范围**（U7 决策，见 [07](07-decisions.md)）。仓库里仍保留 `Dockerfile` 与
+> `.dockerignore` 供将来参考，但**不作为验收/交付项、未经验证、不承诺可用**；本文件不提供容器部署步骤，
+> 生产部署请用 §2（二进制）或 §3（systemd）。
 
 ---
 
@@ -45,7 +47,7 @@ install -m 0640 -o root -g balancer deploy/config.example.json /etc/socks5balanc
 > （已按 100MB 口径设置 `bufferSize=2048`、`maxConnections=10000`）。
 >
 > **日志**：程序只写 stdout（`tracing`，由 `RUST_LOG`/`logLevel` 控制级别），**不写文件**。
-> systemd 部署下由 journald 收集（`journalctl -u socks5balancer`）；容器部署下用 `docker logs`。
+> systemd 部署下由 journald 收集（`journalctl -u socks5balancer`）。
 > 因此不需要预先创建 `/var/log/socks5balancer`（单元里的 `LogsDirectory=` 由 systemd 按需创建，
 > 仅为将来支持文件日志预留）。
 
@@ -73,29 +75,21 @@ journalctl -u socks5balancer -f
 
 ---
 
-## 4. Docker 部署
+## 4. 容器化部署（暂不实现）
 
-```bash
-docker build -t socks5balancer-rust:local .
-docker run -d --name balancer \
-  -p 5000:5000 \
-  -v "$PWD/deploy/config.example.json:/etc/socks5balancer/config.json:ro" \
-  --ulimit nofile=131072:131072 \
-  --restart unless-stopped \
-  socks5balancer-rust:local
+**本期决策（U7）：暂不实现 Docker 交付。** 生产部署请使用 §2（二进制）或 §3（systemd）。
 
-# 健康检查（镜像内置 HEALTHCHECK 走 /healthz）
-docker inspect --format '{{.State.Health.Status}}' balancer
-```
-
-- **控制面/监控面端口不要直接 `-p` 映射**：`deploy/config.example.json` 里
-  `stateServerHost`/`monitorServerHost` 都是 `127.0.0.1`（容器内回环），Docker 的端口发布
-  转发到容器 `eth0`，宿主访问不到容器回环，映射了也连不上。
-  确实需要从宿主/外网访问时：先把配置改成 `"stateServerHost": "0.0.0.0"`（监控面同理），
-  再显式 `-p 127.0.0.1:5110:5110` 之类的**宿主回环**映射，并注意 ADR-001：控制面**无鉴权**，
-  切勿直接暴露到公网（前面加防火墙或反代鉴权）。
-- 容器内 `bufferSize=2048` + `maxConnections=10000` 时，RSS 预算见 [12](12-m4-performance.md)；
-- 若宿主内核限制容器内端口，请 `--network host` 或调整 `net.ipv4.ip_local_port_range`。
+- 仓库中的 `Dockerfile` 与 `.dockerignore` **保留但不维护**：不参与 CI、未做构建/运行验证、
+  不作为验收项；如将来启用容器化，需要重新验证构建（`--locked` 依赖、运行镜像精简、非 root 用户）、
+  控制面/监控面的回环绑定与端口发布、`HEALTHCHECK` 行为，并在此处补回部署步骤。
+- 若自行基于保留的 Dockerfile 试用，注意此前已识别的两个坑：
+  1. **控制面/监控面端口不要直接 `-p` 映射**：`deploy/config.example.json` 里
+     `stateServerHost`/`monitorServerHost` 都是 `127.0.0.1`（容器内回环），Docker 的端口发布
+     转发到容器 `eth0`，宿主访问不到容器回环，映射了也连不上。确实需要访问时，先把配置改成
+     `"stateServerHost": "0.0.0.0"`（监控面同理），再显式做**宿主回环**映射，并注意 ADR-001：
+     控制面**无鉴权**，切勿直接暴露到公网。
+  2. 容器内 `bufferSize=2048` + `maxConnections=10000` 的 RSS 预算见 [12](12-m4-performance.md)；
+     若宿主内核限制容器内端口，需 `--network host` 或调整 `net.ipv4.ip_local_port_range`。
 
 ---
 
@@ -159,7 +153,7 @@ Rust 版**直接兼容** C++ `config.json` 的主要字段（camelCase），包�
 
 ### 5.4 回滚
 
-Rust 实例停止（`systemctl stop` / `docker stop`）→ 恢复 C++ 实例监听原端口即可；
+Rust 实例停止（`systemctl stop` 或直接结束进程）→ 恢复 C++ 实例监听原端口即可；
 两者配置可共享（Rust 会忽略未知字段并打印提示），回滚无需改配置。
 
 ---
@@ -188,7 +182,7 @@ fs.file-max = 1000000
 
 | 指标 | 来源 | 建议 |
 |---|---|---|
-| 存活 | `GET /healthz` | 容器/K8s liveness 探针 |
+| 存活 | `GET /healthz` | systemd `ExecStart`/外部监控探针；若将来部署在容器/K8s，可作 liveness 探针 |
 | 连接数/字节/错误 | `GET /api/v1/status` → `stats.*` | 1–5s 采集；`relayErrors/protocolErrors` 突增告警 |
 | 上游健康 | `GET /api/v1/upstreams` | `available=false` 持续 >2 周期告警 |
 | 全上游不可用 | `stats.rejected` 增长 + `health.available=0` | 立即告警（服务已不可用） |

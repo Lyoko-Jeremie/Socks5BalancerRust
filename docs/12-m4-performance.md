@@ -118,7 +118,7 @@ MODE=proto ./scripts/loadtest-linux.sh            # 只跑真实 SOCKS5 协议�
 - `linux-rate-<bufferSize>.txt`：~1000 次/秒持续建连（30,000 条、每条保持 10s）；峰值 RSS、CPU 秒数、空闲 RSS、flood 成功率；
 - `linux-proto-<bufferSize>.txt`：真实 SOCKS5 握手 + CONNECT 回显（1000 QPS × 60s）；额外输出 `success_rate`、`handshake_p99_ms`、`actual_qps`。
 
-需在 Linux 环境（或 Docker + `--network host`）执行，Windows 无法完成 C10K。
+需在 Linux 环境（物理机 / 虚拟机 / 等效 Linux 容器，容器需 host 网络）执行，Windows 无法完成 C10K。
 
 **注意：上述文件目前一个都未生成——C10K / 1K/s / 24h 长稳 / 2 核与吞吐验收全部未实测，M4 验收尚未完成。**
 
@@ -142,5 +142,5 @@ MODE=proto ./scripts/loadtest-linux.sh            # 只跑真实 SOCKS5 协议�
 
 1. **M4 验收未完成**：在 Linux 上跑 `loadtest-linux.sh`（C10K / 1K/s / 协议三口径），用实测值回填本文 §3/§4（并把 ADR-005 的固定开销改为平台相关）。
 2. M4 剩余：24h 长稳（`scripts/soak-linux.sh`）、2 核与吞吐验收、`bufferSize` 自适应（按 `maxConnections` 选 2K/4K/8K）评估。
-3. M5：Dockerfile/systemd/迁移说明。
+3. M5：systemd/二进制部署与迁移说明（**Docker 按 U7 暂不实现**，见 [07](07-decisions.md) 与 [13 §4](13-m5-deployment.md)）。
 4. Linux CI：已提供 `.github/workflows/ci.yml`（Linux/Windows 双平台，含 `cargo test --all-targets` 与 `scripts/ci-linux.sh` 冒烟），首次运行结果待回填。

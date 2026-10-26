@@ -170,6 +170,6 @@ curl -X POST -H "Content-Type: application/json" \
 
 ## 更多文档
 
-- 部署（Docker / systemd / 从 C++ 迁移）：[docs/13-m5-deployment.md](docs/13-m5-deployment.md)
+- 部署（systemd / 二进制 / 从 C++ 迁移；**Docker 暂不实现**，见 [13 §4](docs/13-m5-deployment.md)）：[docs/13-m5-deployment.md](docs/13-m5-deployment.md)
 - 完整文档索引与里程碑报告：[docs/README.md](docs/README.md)
 - 内存与压测口径：[docs/12-m4-performance.md](docs/12-m4-performance.md)
