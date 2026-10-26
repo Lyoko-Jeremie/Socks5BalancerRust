@@ -191,6 +191,24 @@ pub async fn write_proxy_auth_required<S: AsyncWrite + Unpin>(stream: &mut S) ->
     stream.flush().await
 }
 
+/// 写 `501 Not Implemented` 响应（HTTP 正向代理被配置禁用时），明确告知客户端改用 CONNECT。
+pub async fn write_not_implemented<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    reason: &str,
+) -> io::Result<()> {
+    let body = format!("{reason}\n");
+    let response = format!(
+        "HTTP/1.1 501 Not Implemented\r\n\
+         Allow: CONNECT\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await
+}
+
 /// 解析请求头（`head` 必须恰好是头部，不含 early data）。
 pub fn parse(head: &[u8]) -> Result<RequestKind, Error> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
@@ -481,6 +499,21 @@ mod tests {
         assert_eq!(decode_base64("YQ==").unwrap(), b"a");
         assert_eq!(decode_base64("").unwrap(), b"");
         assert!(decode_base64("!!").is_none());
+    }
+
+    #[tokio::test]
+    async fn 回_501_带_allow_connect() {
+        use tokio::io::AsyncReadExt;
+        let (mut c, mut s) = tokio::io::duplex(512);
+        write_not_implemented(&mut s, "disabled").await.unwrap();
+        let mut buf = vec![0u8; 512];
+        let n = c.read(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf[..n]);
+        assert!(text.starts_with("HTTP/1.1 501 Not Implemented"), "{text}");
+        assert!(text.contains("Allow: CONNECT"), "{text}");
+        // body = "disabled\n"，长度 9
+        assert!(text.contains("Content-Length: 9"), "{text}");
+        assert!(text.ends_with("disabled\n"), "{text}");
     }
 
     #[tokio::test]

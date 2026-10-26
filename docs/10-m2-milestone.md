@@ -20,6 +20,7 @@
 | HTTP absolute-form 正向代理 | ✅ | curl 经代理成功；目标收到 origin-form `/m2-forward` |
 | 非 absolute-form / 非法请求 | ✅ | 回 `400 Bad Request`（C++ 分支A 会塞进隧道，属缺陷 H-1） |
 | `disableSocks4` 配置生效 | ✅ | 禁用后回 `00 5B` |
+| `disableHttpForward` 配置生效 | ✅ | 禁用后 absolute-form 回 `501 + Allow: CONNECT`，CONNECT 仍可用 |
 | `slowImpl` 握手兼容 | ❌ 不做（已知限制） | C++ 的慢实现兼容模式；标准客户端不受影响，见 §5 |
 | HTTP keep-alive 多请求逐条改写 | ❌ 不做（已知限制） | 首个请求改写后双向透传（见 §5） |
 

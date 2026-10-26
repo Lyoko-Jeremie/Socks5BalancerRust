@@ -354,6 +354,9 @@ pub struct RawConfig {
     pub tradition_tcp_relay: bool,
     #[serde(default)]
     pub disable_socks4: bool,
+    /// 禁用 HTTP 正向代理（absolute-form）；CONNECT 不受影响。默认 false。
+    #[serde(default)]
+    pub disable_http_forward: bool,
 
     // ===== 控制面（M3 生效，M0 仅兼容解析）=====
     #[serde(default)]
@@ -466,6 +469,8 @@ pub struct Config {
     pub health: HealthConfig,
     pub tradition_tcp_relay: bool,
     pub disable_socks4: bool,
+    /// 禁用 HTTP 正向代理（absolute-form）；CONNECT 不受影响。
+    pub disable_http_forward: bool,
     /// 控制面监听地址（M3，ADR-001）；None 表示禁用。
     pub state_server: Option<ListenTarget>,
     /// 控制面单次响应字节上限（默认 65536）。
@@ -497,6 +502,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "logLevel",
     "traditionTcpRelay",
     "disableSocks4",
+    "disableHttpForward",
     "stateServerHost",
     "stateServerPort",
     "stateMaxResponseBytes",
@@ -913,6 +919,18 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
     }
     let health = build_health_config(&health_raw, raw.disable_connect_test)?;
 
+    // ===== HTTP 正向代理开关 =====
+    if raw.disable_http_forward {
+        if raw.tradition_tcp_relay {
+            notes.push("traditionTcpRelay=true 时 disableHttpForward 无效果（不解析协议）".into());
+        } else {
+            notes.push(
+                "disableHttpForward=true：HTTP absolute-form 正向代理将回 501（CONNECT 仍可用）"
+                    .into(),
+            );
+        }
+    }
+
     // ===== sleepTime / additionCheckPeriod（旧字段，现已生效）=====
     let mut health = health;
     if health.enabled {
@@ -1044,6 +1062,7 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
         socket_send_buffer,
         tradition_tcp_relay: raw.tradition_tcp_relay,
         disable_socks4: raw.disable_socks4,
+        disable_http_forward: raw.disable_http_forward,
         state_server,
         state_max_response_bytes,
         notes,
@@ -1570,6 +1589,24 @@ mod tests {
         assert!(load_str(text).is_err(), "dnsTtl 小于 1000ms 应报错");
         let text = r#"{"listenPort":5000,"dnsTtl":0,"upstream":[{"host":"a","port":1}]}"#;
         assert_eq!(load_str(text).unwrap().dns_ttl, None, "0 表示不刷新");
+    }
+
+    #[test]
+    fn disable_http_forward_解析与提示() {
+        let text = r#"{
+            "listenPort": 5000,
+            "disableHttpForward": true,
+            "upstream": [ { "host": "127.0.0.1", "port": 6100 } ]
+        }"#;
+        let c = load_str(text).unwrap();
+        assert!(c.disable_http_forward);
+        assert!(
+            c.notes.iter().any(|n| n.contains("501")),
+            "notes={:?}",
+            c.notes
+        );
+        let c = load_str(minimal()).unwrap();
+        assert!(!c.disable_http_forward, "默认应允许 HTTP 正向代理");
     }
 
     #[test]

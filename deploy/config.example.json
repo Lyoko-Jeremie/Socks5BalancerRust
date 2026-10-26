@@ -8,6 +8,7 @@
 
   "traditionTcpRelay": false,
   "disableSocks4": false,
+  "disableHttpForward": false,
 
   "bufferSize": 2048,
   "maxConnections": 10000,

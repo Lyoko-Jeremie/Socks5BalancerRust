@@ -118,6 +118,7 @@ curl -X POST -H "Content-Type: application/json" \
 | `handshakeTimeout` | `10000` | 协议握手超时（毫秒） |
 | `traditionTcpRelay` | `false` | `true` = 纯 TCP 透传（不解析协议） |
 | `disableSocks4` | `false` | 禁用 SOCKS4/4a 入站 |
+| `disableHttpForward` | `false` | 禁用 HTTP 正向代理（absolute-form）；此时回 `501 + Allow: CONNECT`，CONNECT 不受影响 |
 | `stateServerHost/Port` | `127.0.0.1` / `5110` | 控制面地址；`0` 表示禁用 |
 | `healthCheck.tcp` | period 5000 / timeout 2000 | TCP 探活周期与超时（一次失败即 DOWN） |
 | `healthCheck.target` | 未配置 | TLS/HTTP readiness 目标（如 `{"host":"www.example.com","port":443}`），不配则只做 TCP |

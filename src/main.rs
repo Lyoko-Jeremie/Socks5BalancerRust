@@ -113,6 +113,7 @@ async fn run(cfg: config::Config, workers: usize) -> Result<(), Box<dyn std::err
         retry_times = cfg.retry_times,
         tradition_tcp_relay = cfg.tradition_tcp_relay,
         disable_socks4 = cfg.disable_socks4,
+        disable_http_forward = cfg.disable_http_forward,
         listen_targets = cfg.listen.len(),
         upstreams = cfg.upstreams.iter().filter(|u| u.enabled).count(),
         health_period_ms = cfg.health.period.as_millis() as u64,
