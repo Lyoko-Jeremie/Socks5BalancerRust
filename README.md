@@ -52,7 +52,7 @@ curl http://127.0.0.1:5110/healthz
 # 运行状态（JSON）
 curl http://127.0.0.1:5110/api/v1/status
 
-# 上游健康
+# 上游健康与最近探测 RTT
 curl http://127.0.0.1:5110/api/v1/upstreams
 
 # 用 curl 走代理（socks5h = 域名交给代理解析）
