@@ -95,8 +95,8 @@ docker inspect --format '{{.State.Health.Status}}' balancer
 Rust 版**直接兼容** C++ `config.json` 的主要字段（camelCase），包含：
 `listenHost/listenPort/multiListen`、`upstream[]`（name/host/port/disable/authUser/authPwd；`disable: true` 表示禁用该上游）、
 `authClientInfo[]`、`stateServerHost/Port`、`threadNum`、`logLevel`、
-`upstreamSelectRule`、`serverChangeTime`、`traditionTcpRelay`、`disableSocks4`、
-`bufferSize`、`maxConnections`、`connectTimeout`、`healthCheck.*`。
+`upstreamSelectRule`、`serverChangeTime`、`traditionTcpRelay`、`disableSocks4`、`disableHttpForward`、
+`bufferSize`、`maxConnections`、`connectTimeout`、`healthCheck.*`、`dnsTtl`、`sleepTime`、`additionCheckPeriod`。
 
 启动时会打印"配置提示"，列出被忽略或语义变化的字段。
 
@@ -108,8 +108,10 @@ Rust 版**直接兼容** C++ `config.json` 的主要字段（camelCase），包�
 | 错误应答 | 上游失败后下游常无错误码 | 失败回具体 REP / 5B / 502 | 客户端行为更可预期 |
 | 健康检查 | 连续失败计数 + 防抖 | **fail-fast**（一次失败即 DOWN）+ 指数退避 | 故障切换更快，但探测抖动更敏感（可调 `healthCheck.tcp.period`） |
 | 全上游 DOWN | 继续尝试（黑洞） | 立即回 REP 0x01 | 客户端快速失败 |
-| TLS 探测 | `ConnectTestHttps` 默认 `www.google.com:443` | `healthCheck.target` **必配**（不配则只做 TCP）；`expectStatus` 为空时**不校验状态码**（对齐 C++，只看能否完成 HTTP 往返） | 迁移时需显式配置 target |
+| TLS 探测 | `ConnectTestHttps` 默认 `www.google.com:443` | `healthCheck.target` **可选**（不配则只做 TCP）；`expectStatus` 为空时**不校验状态码**（对齐 C++，只看能否完成 HTTP 往返） | 迁移时可显式配置 target |
 | `disableConnectTest` | 跳过全部健康检查，只看人工禁用 | **相同语义**：不探测、数据面失败也不降级 | 一致 |
+| `disableHttpForward` | 无此开关 | 新增：禁用 HTTP 正向代理（absolute-form 回 `501 + Allow: CONNECT`），CONNECT 不受影响 | 按需开启 |
+| 控制面 `set_rule` | 仅查询串改全局规则 | 支持 `scope`(global/client/listen)+`target`+`index` 维度强制上游，`clear=true` 清除 | 更细粒度 |
 | `sleepTime` / `additionCheckPeriod` | 存在 | 已实现：空闲时暂停常规探测 / 全池不可用时加速探测 | 语义对齐 |
 | 控制面 | 十余端点 + 内置前端 | **4 端点**，无前端 | 原有 `/op?xxx`、`/clientInfo` 等调用需改写 |
 | 控制面鉴权 | 无 | 无（同），但响应剔除密码 + 默认回环 | 同 C++ |
