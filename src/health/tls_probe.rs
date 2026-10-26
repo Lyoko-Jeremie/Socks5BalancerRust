@@ -53,9 +53,9 @@ pub async fn probe(upstream: &Upstream, cfg: &TlsProbeConfig) -> Result<ProbeOut
     let target = tokio_socks::TargetAddr::Domain(cfg.host.clone().into(), cfg.port);
     let stream = match upstream_creds(upstream) {
         Some((user, pwd)) => {
-            Socks5Stream::connect_with_password(upstream.addr, target, &user, &pwd).await?
+            Socks5Stream::connect_with_password(upstream.addr(), target, &user, &pwd).await?
         }
-        None => Socks5Stream::connect(upstream.addr, target).await?,
+        None => Socks5Stream::connect(upstream.addr(), target).await?,
     };
 
     // 2) TLS（默认系统根证书；配置 caFile 时用自定义信任根）

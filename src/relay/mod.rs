@@ -99,7 +99,7 @@ async fn handle_tradition(
     // ADR-002 #3：建连失败立即切下一个可用上游（最多 retryTimes+1 次）。
     let Some((upstream_cfg, upstream)) = connect_upstream_with_retry(&ctx, peer).await else {
         return;
-    };    trace!(%peer, %local, upstream = %upstream_cfg.name, addr = %upstream_cfg.addr, "开始透传");
+    };    trace!(%peer, %local, upstream = %upstream_cfg.name, addr = %upstream_cfg.addr(), "开始透传");
     relay_streams(ctx, downstream, upstream, bufs, peer, "tradition").await;
 }
 
@@ -500,12 +500,9 @@ async fn connect_upstream(
     upstream_cfg: &Upstream,
     peer: SocketAddr,
 ) -> Option<TcpStream> {
-    match tokio::time::timeout(
-        ctx.cfg.connect_timeout,
-        TcpStream::connect(upstream_cfg.addr),
-    )
-    .await
-    {
+    // 每次建连都读当前地址：DNS TTL 刷新可能已更新（不在热路径上，每连接一次）
+    let addr = upstream_cfg.addr();
+    match tokio::time::timeout(ctx.cfg.connect_timeout, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => {
             if let Err(e) = stream.set_nodelay(true) {
                 debug!(%peer, upstream = %upstream_cfg.name, error = %e, "上游 set_nodelay 失败");
@@ -516,7 +513,7 @@ async fn connect_upstream(
             ctx.stats.connect_failed.fetch_add(1, Ordering::Relaxed);
             ctx.health
                 .mark_degraded(upstream_cfg.health_index, "连接上游失败");
-            debug!(%peer, upstream = %upstream_cfg.name, addr = %upstream_cfg.addr, error = %e, "连接上游失败");
+            debug!(%peer, upstream = %upstream_cfg.name, %addr, error = %e, "连接上游失败");
             None
         }
         Err(_) => {
@@ -526,7 +523,7 @@ async fn connect_upstream(
             debug!(
                 %peer,
                 upstream = %upstream_cfg.name,
-                addr = %upstream_cfg.addr,
+                %addr,
                 timeout_ms = ctx.cfg.connect_timeout.as_millis() as u64,
                 "连接上游超时"
             );

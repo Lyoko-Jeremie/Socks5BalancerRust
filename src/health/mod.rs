@@ -14,6 +14,7 @@ pub mod tls_probe;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -32,7 +33,8 @@ const QUICK_RECHECK_MS: u64 = 1_000;
 #[derive(Debug)]
 struct Entry {
     name: String,
-    addr: SocketAddr,
+    /// 上游地址（与 `Upstream` 共享，DNS TTL 刷新会原地更新）。
+    addr: Arc<Mutex<SocketAddr>>,
     auth_user: Option<String>,
     auth_pwd: Option<String>,
     /// TCP liveness。
@@ -55,6 +57,13 @@ struct Entry {
     last_rtt_ms: AtomicU64,
     /// 探测提前唤醒（控制面 `check_upstream`）。
     probe_notify: tokio::sync::Notify,
+}
+
+impl Entry {
+    /// 读取当前上游地址（DNS TTL 刷新后可能变化）。
+    fn addr(&self) -> SocketAddr {
+        *self.addr.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// 健康快照（控制面/日志用；M3 会序列化为 JSON）。
@@ -97,7 +106,7 @@ impl HealthRegistry {
             .iter()
             .map(|u| Entry {
                 name: u.name.clone(),
-                addr: u.addr,
+                addr: Arc::clone(&u.addr),
                 auth_user: u.auth_user.clone(),
                 auth_pwd: u.auth_pwd.clone(),
                 liveness: AtomicBool::new(true),
@@ -194,7 +203,7 @@ impl HealthRegistry {
                 let readiness = e.readiness.load(Ordering::Relaxed);
                 HealthSnapshot {
                     name: e.name.clone(),
-                    addr: e.addr,
+                    addr: e.addr(),
                     available: liveness && readiness,
                     liveness,
                     readiness,
@@ -252,14 +261,14 @@ impl HealthRegistry {
         if was_available {
             warn!(
                 upstream = %entry.name,
-                addr = %entry.addr,
+                addr = %entry.addr(),
                 reason,
                 "数据面失败：标记为不可用，1s 后快速重探"
             );
         } else {
             debug!(
                 upstream = %entry.name,
-                addr = %entry.addr,
+                addr = %entry.addr(),
                 reason,
                 "数据面再次失败（已处于不可用状态）"
             );
@@ -292,7 +301,7 @@ impl HealthRegistry {
             ));
             entry.tcp_next_probe_ms.store(next, Ordering::Release);
             if !was_available {
-                info!(upstream = %entry.name, addr = %entry.addr, "上游 liveness 恢复");
+                info!(upstream = %entry.name, addr = %entry.addr(), "上游 liveness 恢复");
             } else {
                 debug!(upstream = %entry.name, "TCP 探活成功");
             }
@@ -317,7 +326,7 @@ impl HealthRegistry {
         if was_available {
             warn!(
                 upstream = %entry.name,
-                addr = %entry.addr,
+                addr = %entry.addr(),
                 wait_ms,
                 next_backoff_ms = next_backoff,
                 "TCP 探活失败：标记 DOWN（fail-fast），按退避延迟重探"
@@ -360,7 +369,7 @@ impl HealthRegistry {
                 .saturating_add(jittered(period, self.cfg.probe_jitter));
             entry.tls_next_probe_ms.store(next, Ordering::Release);
             if !was_available {
-                info!(upstream = %entry.name, addr = %entry.addr, "上游 readiness 恢复");
+                info!(upstream = %entry.name, addr = %entry.addr(), "上游 readiness 恢复");
             } else {
                 debug!(upstream = %entry.name, "TLS/HTTP 探测成功");
             }
@@ -383,7 +392,7 @@ impl HealthRegistry {
         if was_available {
             warn!(
                 upstream = %entry.name,
-                addr = %entry.addr,
+                addr = %entry.addr(),
                 wait_ms,
                 next_backoff_ms = next_backoff,
                 "readiness 探测失败（TLS/HTTP）：标记不可用，按退避延迟重探"
@@ -440,7 +449,7 @@ impl HealthRegistry {
                         _ = tokio::time::sleep(Duration::from_millis(1_000)) => continue,
                     }
                 }
-                let addr = reg.entries[idx].addr;
+                let addr = reg.entries[idx].addr();
                 let started = Instant::now();
                 let ok = matches!(
                     tokio::time::timeout(reg.cfg.timeout, TcpStream::connect(addr)).await,
@@ -483,11 +492,12 @@ impl HealthRegistry {
                     reg.record_readiness(idx, false, 0);
                     continue;
                 }
+                let current_addr = reg.entries[idx].addr();
                 let upstream = Upstream {
                     name: reg.entries[idx].name.clone(),
-                    host: reg.entries[idx].addr.ip().to_string(),
-                    port: reg.entries[idx].addr.port(),
-                    addr: reg.entries[idx].addr,
+                    host: current_addr.ip().to_string(),
+                    port: current_addr.port(),
+                    addr: Arc::clone(&reg.entries[idx].addr),
                     auth_user: reg.entries[idx].auth_user.clone(),
                     auth_pwd: reg.entries[idx].auth_pwd.clone(),
                     health_index: idx,
@@ -618,7 +628,7 @@ mod tests {
             name: name.to_string(),
             host: "127.0.0.1".to_string(),
             port,
-            addr: SocketAddr::from(([127, 0, 0, 1], port)),
+            addr: Arc::new(Mutex::new(SocketAddr::from(([127, 0, 0, 1], port)))),
             auth_user: None,
             auth_pwd: None,
             health_index: 0,
@@ -755,7 +765,7 @@ mod tests {
             name: "probe-target".to_string(),
             host: "127.0.0.1".to_string(),
             port: addr.port(),
-            addr,
+            addr: Arc::new(Mutex::new(addr)),
             auth_user: None,
             auth_pwd: None,
             health_index: 0,

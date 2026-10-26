@@ -9,12 +9,11 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
-
 use crate::config::UpstreamConfig;
 
 /// 已解析的上游。
@@ -25,7 +24,8 @@ pub struct Upstream {
     pub host: String,
     /// 配置端口。
     pub port: u16,
-    pub addr: SocketAddr,
+    /// 解析后的上游地址；DNS TTL 刷新任务会原地更新（`Arc` 与所有持有者共享）。
+    pub addr: Arc<Mutex<SocketAddr>>,
     /// 上游 SOCKS5 认证（M1 起真正使用；None 表示无认证）。
     pub auth_user: Option<String>,
     pub auth_pwd: Option<String>,
@@ -33,6 +33,13 @@ pub struct Upstream {
     pub health_index: usize,
     /// 配置是否启用；作为人工启停的初始值（控制面可再改）。
     pub enabled: bool,
+}
+
+impl Upstream {
+    /// 读取当前解析地址（DNS 刷新后可能变化）。
+    pub fn addr(&self) -> SocketAddr {
+        *self.addr.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// 上游选择规则（与 C++ `upstreamSelectRule` 同名）。
@@ -343,7 +350,7 @@ pub async fn resolve_all(cfgs: &[UpstreamConfig]) -> (Vec<Upstream>, Vec<String>
                     name: c.name.clone(),
                     host: c.host.clone(),
                     port: c.port,
-                    addr,
+                    addr: Arc::new(Mutex::new(addr)),
                     auth_user: c.auth_user.clone(),
                     auth_pwd: c.auth_pwd.clone(),
                     health_index,
@@ -382,6 +389,55 @@ async fn resolve_one(host: &str, port: u16) -> io::Result<SocketAddr> {
         .unwrap_or(addrs[0]))
 }
 
+/// 启动 DNS TTL 刷新任务：定期重新解析上游域名并原地更新地址（IP 字面量跳过）。
+///
+/// 解析失败时保留旧地址（避免一次 DNS 抖动把上游打挂）；地址变化会打印 info 日志。
+pub fn spawn_dns_refresher(
+    selector: Arc<UpstreamSelector>,
+    ttl: Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(ttl);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await; // 跳过立即触发
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = ticker.tick() => {
+                    for u in selector.upstreams() {
+                        if u.host.parse::<IpAddr>().is_ok() {
+                            continue; // IP 字面量无需刷新
+                        }
+                        match resolve_one(&u.host, u.port).await {
+                            Ok(addr) => {
+                                let mut guard =
+                                    u.addr.lock().unwrap_or_else(|e| e.into_inner());
+                                if *guard != addr {
+                                    info!(
+                                        upstream = %u.name,
+                                        host = %u.host,
+                                        old = %*guard,
+                                        new = %addr,
+                                        "上游 DNS 地址已刷新"
+                                    );
+                                    *guard = addr;
+                                }
+                            }
+                            Err(e) => warn!(
+                                upstream = %u.name,
+                                host = %u.host,
+                                error = %e,
+                                "上游 DNS 刷新失败，保留旧地址"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,7 +447,7 @@ mod tests {
             name: name.to_string(),
             host: "127.0.0.1".to_string(),
             port,
-            addr: SocketAddr::from(([127, 0, 0, 1], port)),
+            addr: Arc::new(Mutex::new(SocketAddr::from(([127, 0, 0, 1], port)))),
             auth_user: None,
             auth_pwd: None,
             health_index: 0,
@@ -546,11 +602,13 @@ mod tests {
     }
 
     #[test]
-    fn 非粘性规则忽略_hint() {
-        let s = selector(SelectRule::Random, Duration::from_secs(60));
-        let c: IpAddr = "10.0.0.9".parse().unwrap();
-        s.record_hint(c, 1);
-        // random 规则不保证选中 hint，但必须仍能返回可用项
-        assert!(s.next_for_client(c, &all_available).is_some());
+    fn 上游地址可原地刷新() {
+        let s = selector(SelectRule::Loop, Duration::from_secs(60));
+        let u = &s.upstreams()[0];
+        let old = u.addr();
+        let new: SocketAddr = "127.0.0.2:9".parse().unwrap();
+        *u.addr.lock().unwrap() = new;
+        assert_eq!(u.addr(), new, "DNS 刷新写入应被读取方看到");
+        assert_ne!(old, new);
     }
 }

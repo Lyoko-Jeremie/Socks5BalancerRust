@@ -378,6 +378,9 @@ pub struct RawConfig {
     pub upstream_select_rule: Option<String>,
     #[serde(default)]
     pub server_change_time: Option<u64>,
+    /// 上游域名 DNS 刷新周期（毫秒）；0/缺省 = 不刷新（沿用启动期解析结果）。
+    #[serde(default)]
+    pub dns_ttl: Option<u64>,
     #[serde(default)]
     pub sleep_time: Option<u64>,
     #[serde(default)]
@@ -457,6 +460,8 @@ pub struct Config {
     pub select_rule: SelectRule,
     /// `change_by_time` 规则的切换周期。
     pub server_change_time: Duration,
+    /// 上游域名 DNS 刷新周期；None 表示不刷新（沿用启动期解析结果）。
+    pub dns_ttl: Option<Duration>,
     /// 健康检查配置（M1.4：TCP 探活 + fail-fast + DOWN 退避）。
     pub health: HealthConfig,
     pub tradition_tcp_relay: bool,
@@ -503,6 +508,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "healthCheck",
     "upstreamSelectRule",
     "serverChangeTime",
+    "dnsTtl",
     "sleepTime",
     "disableConnectTest",
     "disableConnectionTracker",
@@ -886,6 +892,16 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
     };
     let server_change_time =
         Duration::from_millis(raw.server_change_time.filter(|v| *v > 0).unwrap_or(60_000));
+    let dns_ttl = match raw.dns_ttl.filter(|v| *v > 0) {
+        None => None,
+        Some(ms) if ms < 1_000 => {
+            return Err(err("dnsTtl 不能小于 1000ms（0 表示不刷新）"));
+        }
+        Some(ms) if ms > 3_600_000 => {
+            return Err(err("dnsTtl 过大（>3600000ms）"));
+        }
+        Some(ms) => Some(Duration::from_millis(ms)),
+    };
 
     // ===== 健康检查（ADR-002：fail-fast，不重试/不防抖）=====
     // 旧版探测字段先按 ADR 映射进 healthCheck（新字段优先），再构建有效配置。
@@ -1010,6 +1026,7 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
         handshake_timeout: Duration::from_millis(handshake_timeout_ms),
         select_rule,
         server_change_time,
+        dns_ttl,
         health,
         auth,
         buffer_size,
@@ -1540,6 +1557,17 @@ mod tests {
             "notes={:?}",
             c.notes
         );
+    }
+
+    #[test]
+    fn dns_ttl_解析与校验() {
+        let text = r#"{"listenPort":5000,"dnsTtl":60000,"upstream":[{"host":"a","port":1}]}"#;
+        let c = load_str(text).unwrap();
+        assert_eq!(c.dns_ttl, Some(Duration::from_millis(60_000)));
+        let text = r#"{"listenPort":5000,"dnsTtl":500,"upstream":[{"host":"a","port":1}]}"#;
+        assert!(load_str(text).is_err(), "dnsTtl 小于 1000ms 应报错");
+        let text = r#"{"listenPort":5000,"dnsTtl":0,"upstream":[{"host":"a","port":1}]}"#;
+        assert_eq!(load_str(text).unwrap().dns_ttl, None, "0 表示不刷新");
     }
 
     #[test]

@@ -189,6 +189,14 @@ async fn run(cfg: config::Config, workers: usize) -> Result<(), Box<dyn std::err
     if cfg.health.enabled {
         health.spawn_probes(cancel.clone());
     }
+    // 上游域名 DNS TTL 刷新（可选）：IP 字面量不刷新，解析失败保留旧地址
+    if let Some(ttl) = cfg.dns_ttl {
+        upstream::spawn_dns_refresher(Arc::clone(&selector), ttl, cancel.clone());
+        info!(
+            dns_ttl_ms = ttl.as_millis() as u64,
+            "上游域名 DNS 周期刷新已启用"
+        );
+    }
     let ctx = app::AppCtx::new(
         Arc::clone(&cfg),
         selector,

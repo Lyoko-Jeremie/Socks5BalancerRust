@@ -101,6 +101,7 @@ curl -X POST -H "Content-Type: application/json" \
 | `upstream[]` | — | 上游 SOCKS5：`name`/`host`/`port`/`disable`/`authUser`/`authPwd`（`disable: true` 禁用该上游） |
 | `upstreamSelectRule` | `random` | `loop` / `random` / `one_by_one` / `change_by_time` / `force_only_one` |
 | `serverChangeTime` | `60000` | `change_by_time` 的切换周期（毫秒） |
+| `dnsTtl` | 未配置 | 上游域名 DNS 刷新周期（毫秒）；不配则沿用启动期解析结果 |
 | `bufferSize` | `8192` | 每连接双向缓冲；2048/4096/8192（100MB 口径用 2048） |
 | `maxConnections` | `10000` | 最大并发连接数 |
 | `workerThreads` | `0` | 工作线程数；0 = 自动（常用 2–4） |
