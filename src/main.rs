@@ -11,16 +11,8 @@
 //! M1 起将在此基础上加入：SOCKS5 首包识别/0x00/0x02 协商、5 条选路规则、
 //! 健康检查（fail-fast + DOWN 退避）、TLS 探测等（见 docs/07-decisions.md）。
 
-mod app;
-mod config;
-mod control;
-mod handshake;
-mod health;
-mod logging;
-mod net;
-mod relay;
-mod stats;
-mod upstream;
+// 模块定义在库 crate（src/lib.rs）中，二进制只做装配与启动
+use socks5_balancer_rust::{app, config, control, health, logging, net, stats, upstream};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
