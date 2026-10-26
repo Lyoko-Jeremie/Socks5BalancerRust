@@ -188,6 +188,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/m1-tls.ps1
 ## 7. 下一步
 
 1. **M2：SOCKS4/4a、HTTP CONNECT/forward、首包嗅探与回放** ✅*（2026-10-26 完成，见 [10-m2-milestone.md](10-m2-milestone.md)）*
-2. **M3：控制面最小集**（`/healthz`、`/api/v1/status`、`/api/v1/upstreams`、`/api/v1/control`）。
+2. **M3：控制面最小集** ✅*（2026-10-26 完成，见 [11-m3-milestone.md](11-m3-milestone.md)）*
 3. **C10K / 1K 建连压测**（Linux 优先）：连接数上限、RSS、握手 CPU 占用、`bufferSize` 对比。
 4. **Linux CI**：双平台构建/单测/冒烟脚本（bash 版）。
