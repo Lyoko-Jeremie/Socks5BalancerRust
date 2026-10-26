@@ -1,0 +1,140 @@
+# Socks5BalancerRust 发布构建（Windows x86_64 + Linux x86_64）
+#
+# 目标（对应 docs/README §8 工程约定「跨平台是硬约束」）：
+# - 每次推送到主分支或打 tag 时，自动构建两平台 release 二进制并上传为 artifact；
+# - 打 v* tag 时，额外把两平台产物发布到 GitHub Release，便于直接分发；
+# - 构建与 ci.yml 的 lint/test 解耦：CI 只做检查，本工作流只产出可发布产物。
+#
+# 产物命名：Socks5BalancerRust-<Cargo.toml version>-<platform>.<ext>
+# - Linux：tar.gz（保留可执行权限；zip 会丢失 +x）
+# - Windows：zip
+#
+# 依赖说明：libmimalloc-sys / aws-lc-sys 需要 C 工具链与 CMake。
+# GitHub 的 ubuntu-latest / windows-latest 镜像自带 gcc / MSVC / CMake，
+# 无需额外安装；若将来切到自建 runner，需自行准备这些前置。
+name: Build
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+# 同一 ref 的新提交取消仍在跑的旧构建，节省 runner
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 构建产物只用于打包，不需要增量编译
+  CARGO_INCREMENTAL: 0
+
+# 默认最小权限；发布 job 单独提升 contents: write
+permissions:
+  contents: read
+
+jobs:
+  # ===== 双平台：release 构建 + 打包 + 上传 artifact =====
+  build:
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust stable（含目标平台标准库）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 缓存 cargo 依赖与构建产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          # 与 ci.yml 的缓存区分开；release 的 target 目录很大，只缓存 registry，
+          # 避免把同一仓库的缓存配额（10GB）撑爆。
+          key: build-${{ matrix.target }}
+          cache-targets: false
+
+      - name: release 构建（--locked 保证 Cargo.lock 可复现）
+        run: cargo build --release --locked --bins --examples
+
+      - name: 组装产物（Linux）
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 版本号直接取自 Cargo.toml 的 [package] 段，避免依赖额外输出变量。
+          version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          mkdir -p dist release-assets
+          cp target/release/Socks5BalancerRust dist/
+          cp config.example.json dist/
+          cp deploy/socks5balancer.service dist/
+          tar -czf "release-assets/Socks5BalancerRust-${version}-linux-x86_64.tar.gz" -C dist .
+          ls -l release-assets
+
+      - name: 组装产物（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' |
+            Select-Object -First 1).Matches[0].Groups[1].Value
+          if (-not $version) { throw '未能从 Cargo.toml 读取版本号' }
+          New-Item -ItemType Directory -Force -Path dist, release-assets | Out-Null
+          Copy-Item target/release/Socks5BalancerRust.exe dist/
+          Copy-Item config.example.json dist/
+          Compress-Archive -Path dist/* -DestinationPath "release-assets/Socks5BalancerRust-$version-windows-x86_64.zip"
+          Get-ChildItem release-assets | Format-Table Name, Length
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: Socks5BalancerRust-${{ matrix.platform }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+          # 归档本身已压缩，跳过二次压缩可缩短上传时间
+          compression-level: 0
+
+  # ===== 打 tag 时发布 GitHub Release（两个平台产物合并上传） =====
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: 下载两个平台的构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: Socks5BalancerRust-*
+          merge-multiple: true
+
+      - name: 创建或更新 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # 重跑（例如补发产物）时覆盖同名附件
+            gh release upload "$tag" release-assets/* --clobber
+          else
+            gh release create "$tag" --title "$tag" --generate-notes release-assets/*
+          fi
