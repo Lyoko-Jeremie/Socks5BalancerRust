@@ -40,20 +40,22 @@ static GLOBAL: MiMalloc = MiMalloc;
 const MI_OPTION_ARENA_EAGER_COMMIT: std::ffi::c_int = 4;
 const MI_OPTION_PURGE_DELAY: std::ffi::c_int = 15;
 
-/// 应用 mimalloc 的"低 RSS"策略（M4：10K 连接 ≤100MB 口径，见 docs/12 实测）。
+/// 把 mimalloc 的低 RSS 选项设为默认值（M4：10K 连接 ≤100MB 口径，见 docs/12 实测）。
 ///
 /// - `arena_eager_commit=0`：arena 不预先提交物理页，按需提交；
 /// - `purge_delay=0`：空闲页**立即**归还 OS（mimalloc 默认延迟 10ms 且按比例保留，
-///   在高并发短连接场景会让 RSS 长期停在峰值附近）。
+///   高并发短连接场景会让 RSS 长期停在峰值附近）。
 ///
-/// Linux 实测（10,000 空闲连接 60s，bufferSize=2048）：
-/// 默认策略峰值 110.4 MB → 本策略 93.0 MB（空闲基线 20.1 MB → 12.9 MB）。
+/// **必须在 `main` 之前调用**：mimalloc 在首次分配时初始化、arena 在创建时读取
+/// `arena_eager_commit`；实测在 `main` 里设置（读回确实是 0）对已创建的 arena 无效——
+/// Linux 10K 峰值仍是 110 MB，而在初始化前设置能到 93 MB。因此下面用 C 运行时初始化段
+/// （Linux `.init_array` / Windows `.CRT$XCU`）在 `main` 前执行。
 ///
 /// 运维仍可用环境变量 `MIMALLOC_ARENA_EAGER_COMMIT` / `MIMALLOC_PURGE_DELAY` 覆盖：
-/// mimalloc 在初始化时先读环境变量，这里仅在**未显式设置**时套默认值（不覆盖用户选择）。
-fn apply_mimalloc_low_rss_profile() {
+/// mimalloc 初始化时先读环境变量，这里仅在**未显式设置**时套默认值（不覆盖用户选择）。
+fn init_mimalloc_low_rss_defaults() {
     let has_env = |name: &str| std::env::var_os(name).is_some();
-    // SAFETY: `mi_option_set` 是 mimalloc 的 C API，进程启动早期单线程调用，
+    // SAFETY: `mi_option_set` 是 mimalloc 的 C API，在 C 运行时初始化段单线程调用，
     // 选项索引与内置 mimalloc v3 头文件一致（见上方常量注释）。
     unsafe {
         if !has_env("MIMALLOC_ARENA_EAGER_COMMIT") {
@@ -64,6 +66,22 @@ fn apply_mimalloc_low_rss_profile() {
         }
     }
 }
+
+extern "C" fn mimalloc_low_rss_ctor() {
+    init_mimalloc_low_rss_defaults();
+}
+
+/// Linux/Android：ELF `.init_array` 在 `main` 之前由 C 运行时调用。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[used]
+#[unsafe(link_section = ".init_array")]
+static MIMALLOC_LOW_RSS_CTOR: extern "C" fn() = mimalloc_low_rss_ctor;
+
+/// Windows：MSVC CRT 的 `.CRT$XCU` 段在 `main` 之前执行。
+#[cfg(windows)]
+#[used]
+#[unsafe(link_section = ".CRT$XCU")]
+static MIMALLOC_LOW_RSS_CTOR: extern "C" fn() = mimalloc_low_rss_ctor;
 
 /// 命令行参数（与 C++ 版 `-c/--config`、`--help`、`--version` 兼容）。
 #[derive(Parser, Debug)]
@@ -79,8 +97,6 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
-    // 必须在启动早期（分配量还很小、worker 线程尚未创建）应用，见函数注释。
-    apply_mimalloc_low_rss_profile();
     let cli = Cli::parse();
 
     let cfg = match config::load(&cli.config) {

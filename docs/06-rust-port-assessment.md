@@ -260,9 +260,9 @@ release 默认 info；热点禁止格式化；每连接**不允许**逐包日志
 | 2 核限制 | 以上成立 | 同 |
 
 > **实测/验收状态（2026-10-26）**：**Linux 实测已完成 C10K 与 SOCKS5 协议吞吐**（Manjaro/32C/64G）：
-> 10,000 空闲连接 **10000/10000 成功**，峰值 RSS 114.7 MB（默认策略）/ **93.0 MB**
-> （`connectionTracking.detail=false` + mimalloc 低 RSS 策略，已设为程序默认）→ **满足 ≤100MB 硬指标**、
-> 未达本表 ≤80MB 严格线；真实 SOCKS5 1000 QPS × 60s **100% 成功、p99 0.786ms**。
+> 10,000 空闲连接 **10000/10000 成功**，峰值 RSS 改动前 114.7 MB / **当前默认 97.25 MB**
+> （mimalloc 低 RSS 策略已通过 C 运行时初始化段在 `main` 前生效，连接明细保持默认开启）
+> → **满足 ≤100MB 硬指标**、未达本表 ≤80MB 严格线；真实 SOCKS5 1000 QPS × 60s **100% 成功、p99 0.786ms**。
 > Windows 1000 连接推算 10K ≈ 98.5–103.6 MB（仅参考，Windows 上 mimalloc 策略几乎无效果）。
 > **仍未验证**：1K/s 建连（`examples/flood` rate 模式串行，实测仅 469/s）、24h 长稳、2 核与吞吐、
 > fuzz 实跑、与 C++ 字节级对比。详见 [12-m4-performance.md](12-m4-performance.md)。
@@ -277,7 +277,7 @@ release 默认 info；热点禁止格式化；每连接**不允许**逐包日志
 | **M1 核心** ✅*（M1.1–M1.5 完成，见 [09-m1-milestone.md](09-m1-milestone.md)）* | SOCKS5 0x00/0x02 方法协商、上游选择 5 规则、TLS/TCP 健康检查（fail-fast+降频）、超时/背压/连接上限 | 协议端到端 10/10、健康检查 6/6、TLS readiness 9/9；单测 53 全绿；10K/1K 压测待做 |
 | **M2 协议完整** ✅*（2026-10-26 完成，见 [10-m2-milestone.md](10-m2-milestone.md)）* | SOCKS4/4a、HTTP CONNECT/forward、上游认证、TLS 探测对齐（ADR-006） | 混合协议端到端 9/9（SOCKS5 回归 / SOCKS4-4a / BIND / CONNECT / early data / forward 改写 / 400 / disableSocks4）；单测 69 全绿 |
 | **M3 控制面** ✅*（2026-10-26 完成，见 [11-m3-milestone.md](11-m3-milestone.md)）* | 精简 4 端点、无鉴权、统计快照 | 控制面端到端 19/19（含禁用→失败→启用→恢复、规则切换、404、无 CORS、响应无密码）；单测 75 全绿 |
-| **M4 达标** ◐*（Linux C10K 与 SOCKS5 吞吐已实测 2026-10-26，见 [12-m4-performance.md](12-m4-performance.md)；1K/s 工具、24h、2 核/吞吐待做）* | 压测调优、内存校准、24h 长稳 | **Linux 实测**：10K 空闲连接 10000/10000 成功，峰值 RSS 114.7 MB（默认）/ **93.0 MB**（`detail=false` + mimalloc 低 RSS 策略，已设为默认）→ 满足 ≤100MB 硬指标、未达 ≤80MB 严格线；SOCKS5 1000 QPS × 60s 100% 成功、p99 0.786 ms。**未完成**：1K/s（flood rate 模式串行，实测 469/s）、24h 长稳、2 核、吞吐、字节级对比 |
+| **M4 达标** ◐*（Linux C10K 与 SOCKS5 吞吐已实测 2026-10-26，见 [12-m4-performance.md](12-m4-performance.md)；1K/s 工具、24h、2 核/吞吐待做）* | 压测调优、内存校准、24h 长稳 | **Linux 实测**：10K 空闲连接 10000/10000 成功，峰值 RSS 114.7 MB（改动前）/ **97.25 MB**（mimalloc 低 RSS 策略默认生效，明细开启）→ 满足 ≤100MB 硬指标、未达 ≤80MB 严格线；SOCKS5 1000 QPS × 60s 100% 成功、p99 0.786 ms。**未完成**：1K/s（flood rate 模式串行，实测 469/s）、24h 长稳、2 核、吞吐、字节级对比 |
 | **M5 交付** ✅*（2026-10-26 完成，见 [13-m5-deployment.md](13-m5-deployment.md)；容器化按 U7 暂不实现）* | systemd/二进制部署、迁移说明 | systemd 单元（LimitNOFILE/加固）、生产配置、迁移/灰度/回滚说明、`scripts/ci-linux.sh`；**Docker 暂不实现**（`Dockerfile` 保留但不维护/不验收，见 [07 U7](07-decisions.md) 与 [13 §4](13-m5-deployment.md)） |
 
 > 关键：**M1 结束时就跑 10K/1K 压测**，用真实数字校准 8K/2K 双口径（方案 B 已裁决），不要等到最后。

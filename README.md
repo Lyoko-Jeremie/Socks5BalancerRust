@@ -167,10 +167,10 @@ curl -X POST -H "Content-Type: application/json" \
 - **上游全是 DOWN**：检查上游地址/认证；`curl /api/v1/upstreams` 看 `failures`，`check_upstream` 可立即重探。
 - **控制面安全**：默认只监听回环且**无鉴权**，不要暴露到公网。
 - **想只做转发不解析协议**：`traditionTcpRelay: true`。
-- **内存比预期高 / 10K 连接超 100MB**：确认 `bufferSize=2048` 且需要严格口径时设
-  `connectionTracking.detail=false`；程序默认已启用 mimalloc 低 RSS 策略
-  （`MIMALLOC_PURGE_DELAY=0` + `MIMALLOC_ARENA_EAGER_COMMIT=0`，可用同名环境变量覆盖）。
-  Linux 实测 10K 空闲连接峰值 **≈93 MB**（默认策略 114.7 MB）；Windows 上这两个选项对工作集几乎无影响，
+- **内存比预期高 / 10K 连接超 100MB**：默认配置下 Linux 实测 10K 空闲连接峰值 **≈97 MB**
+  （mimalloc 低 RSS 策略已内置，无需设置环境变量）；需要更低时设 `bufferSize=2048` 与
+  `connectionTracking.detail=false`（可到 ~91–93 MB）。可用 `MIMALLOC_PURGE_DELAY` /
+  `MIMALLOC_ARENA_EAGER_COMMIT` 覆盖默认策略。Windows 上这两个选项对工作集几乎无影响，
   详见 [docs/12](docs/12-m4-performance.md)。
 
 ## 更多文档

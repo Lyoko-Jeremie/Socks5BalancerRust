@@ -13,7 +13,7 @@
 
 | 目标 | 口径 | 状态（2026-10-26） |
 |---|---|---|
-| 运行时内存 ≤100MB | 10,000 空闲连接进程 RSS | **Linux 实测**：默认策略 110–116 MB（超标）；`connectionTracking.detail=false` + mimalloc 低 RSS 策略后 **92.98 MB（达标）**；Windows 1000 连接推算 103.6 MB（仅参考） |
+| 运行时内存 ≤100MB | 10,000 空闲连接进程 RSS | **Linux 实测**：改动前 110–116 MB（超标）；当前默认（mimalloc 低 RSS 策略 + 明细开启）**97.25 MB（达标）**；`connectionTracking.detail=false` 可再降到 ~91 MB；Windows 1000 连接推算 103–108 MB（仅参考） |
 | C10K | 10,000 并发空闲长连接 | ✅ **Linux 实测 10000/10000 成功**（峰值 RSS 114.72 MB，CPU 1.12 s/60 s） |
 | 1000 新连接/秒 | 持续建连速率 ≥1000/s | ⚠️ 未验证：`examples/flood` 的 rate 模式串行，实测仅 469/s（工具限制，见 §3.2） |
 | 2–4 核 / 100MB | 多线程 runtime（线程数可配） | ⏳ 未实测（需 `taskset` 限核复跑） |
@@ -104,19 +104,24 @@ Windows 侧 `bufferSize=2048` 的 10K 估算仍在 **103–108 MB**，100MB 硬�
 
 | 配置 | 空闲 RSS | 峰值 RSS | 每连接 | 判定（≤100 MB） |
 |---|---|---|---|---|
-| 2048 + `detail=true`（默认） | 19.96 MB | **116.38 MB** | 10,110 B | ❌ |
-| 2048 + `detail=false` | 20.06 MB | **110.44 MB** | 9,477 B | ❌ |
-| **2048 + `detail=false` + mimalloc 低 RSS 策略** | **12.87 MB** | **92.98 MB** | **8,400 B** | ✅ **达标** |
+| 2048 + `detail=true` + mimalloc 默认策略（改动前） | 19.96 MB | **116.38 MB** | 10,110 B | ❌ |
+| 2048 + `detail=false` + mimalloc 默认策略 | 20.06 MB | **110.44 MB** | 9,477 B | ❌ |
+| 2048 + `detail=false` + mimalloc 策略（**环境变量**） | 12.87 MB | **92.98 MB** | 8,400 B | ✅ |
+| **2048 + `detail=true` + mimalloc 策略（当前代码默认，`.init_array` 初始化段）** | **13.11 MB** | **97.25 MB** | **8,823 B** | ✅ **默认配置即达标** |
 | 8192 + `detail=false`（性能基线口径） | 20.05 MB | 224.46 MB | 21,434 B | —（基线口径） |
 
-「mimalloc 低 RSS 策略」= `MIMALLOC_PURGE_DELAY=0` + `MIMALLOC_ARENA_EAGER_COMMIT=0`；
-**当前版本已把它设为程序默认行为**（`src/main.rs::apply_mimalloc_low_rss_profile`，可用同名环境变量覆盖），
-systemd 单元同时显式设置（双保险，见 [13 §3](13-m5-deployment.md)）。
+**mimalloc 低 RSS 策略** = `MIMALLOC_PURGE_DELAY=0` + `MIMALLOC_ARENA_EAGER_COMMIT=0`。
+当前版本通过 **C 运行时初始化段在 `main` 之前**设置（Linux `.init_array` / Windows `.CRT$XCU`，
+见 `src/main.rs`），**默认生效、无需任何环境变量**：
 
-- 关闭连接明细（`connectionTracking.detail=false`）省 **≈6 MB**（10K × 633 B），
-  其中 100–150 B 是明细条目、其余是分片表扩容；
-- mimalloc 策略再省 **≈17.5 MB**（峰值）并把空闲基线从 20 MB 压到 12.9 MB；
-- 连接释放后 RSS 回落较慢（mimalloc 延迟归还），10s 后仍在下降；做长稳/反复建连测试时需注意。
+- 为什么不能放在 `main` 里：mimalloc 在首次分配时初始化、arena 在创建时读取
+  `arena_eager_commit`；实测 `main` 里 `mi_option_set` 读回确实是 0，但 10K 峰值仍是 **110.4 MB**
+  （对已创建的 arena 无效）。改到初始化段后同口径降到 **97.25 MB**。
+- 运维仍可用同名环境变量覆盖（mimalloc 初始化时读取，设置更早，`detail=false` 时可到 92.98 MB）；
+  systemd 单元里也显式写了这两个变量（双保险，见 [13 §3](13-m5-deployment.md)）。
+- 关闭连接明细（`connectionTracking.detail=false`）可在默认策略基础上再省 ≈6 MB（历史对照
+  116.38→110.44）；调优后的 `detail=false` 未单独复测，估计 ~91 MB。
+- 连接释放后 RSS 回落较慢（mimalloc 延迟归还），长稳/反复建连测试时应看"稳态峰值"。
 
 ---
 
@@ -131,8 +136,8 @@ systemd 单元同时显式设置（双保险，见 [13 §3](13-m5-deployment.md)
 | Windows | 2048 | 4,096 B | 8,958 B | ≈4.9 KB |
 | Windows | 4096 | 8,192 B | 13,439 B | ≈5.2 KB |
 | Windows | 8192 | 16,384 B | 21,074 B | ≈4.7 KB |
-| **Linux** | 2048 | 4,096 B | 9,477 B（detail=false） | **≈5.3 KB** |
-| **Linux** | 2048 | 4,096 B | 8,400 B（+mimalloc 策略） | **≈4.2 KB** |
+| **Linux** | 2048 | 4,096 B | 8,823 B（`detail=true` + mimalloc 策略，当前默认） | **≈4.6 KB** |
+| **Linux** | 2048 | 4,096 B | 8,400 B（`detail=false` + 环境变量策略） | **≈4.2 KB** |
 | **Linux** | 8192 | 16,384 B | 21,434 B | **≈4.9 KB** |
 
 **关键修正**：早前文档估计"Linux 固定开销 1.2–2 KB、10K≈69 MB"**不成立**。Linux 实测固定开销
@@ -152,7 +157,7 @@ relay split/包装、连接监测条目、socket/内核对象映射、分配器�
 | 验收项 | 达标线 | 实测 | 状态 |
 |---|---|---|---|
 | 10K 空闲连接 | 10000 并发 | 10000 成功（Linux） | ✅ |
-| 10K 空闲 RSS（2K 口径） | ≤100 MB（硬指标）/ ≤80 MB（严格线） | **92.98 MB**（调优后）/ 110–116 MB（默认） | ✅ 硬指标 / ❌ 严格线 |
+| 10K 空闲 RSS（2K 口径） | ≤100 MB（硬指标）/ ≤80 MB（严格线） | **97.25 MB**（默认配置：`detail=true` + mimalloc 策略）/ 116.4 MB（改动前） | ✅ 硬指标 / ❌ 严格线 |
 | 10K 空闲 RSS（8K 口径） | ≈197 MB | 224.46 MB | ⚠️ 基线口径，超 14% |
 | 1K/s 成功率 ≥99.9% | ≥99.9% | 工具仅 469/s | ⏳ 未验证（改 flood） |
 | 1K/s p99 ≤500 ms | ≤500 ms | 协议口径 p99 0.786 ms | 参考达标 |
@@ -162,16 +167,16 @@ relay split/包装、连接监测条目、socket/内核对象映射、分配器�
 | 2 核限制 | 以上在 2 核下成立 | 未做 | ⏳ |
 | 与 C++ 字节级对比 | — | 未做 | ⏳ |
 
-一句话：**C10K 与 SOCKS5 吞吐已实测达标；100MB 需 mimalloc 低 RSS 策略（已设为默认）才能达标；
-1K/s、24h、2 核、吞吐、字节级对比仍未验证。**
+一句话：**C10K、100MB（2K 口径）与 SOCKS5 吞吐已实测达标**（默认配置 10K 峰值 97.25 MB、
+1000 QPS p99 0.786 ms）；1K/s、24h、2 核、吞吐、字节级对比仍未验证。
 
 ---
 
 ## 6. 已知限制 / 未完成项
 
 1. **1K/s 建连未验证**：`examples/flood` rate 模式串行（实测 469/s），需改为并发建连 + 令牌桶后重测。
-2. **100MB 的严格 ≤80MB 线未达**（92.98 MB）：如需更低，只能继续压固定开销（分片表/任务开销）或
-   接受 06 §9.2 的"硬指标 ≤100MB"口径。
+2. **100MB 的严格 ≤80MB 线未达**（默认配置 97.25 MB）：如需更低，只能继续压固定开销
+   （分片表/任务开销）或接受 06 §9.2 的"硬指标 ≤100MB"口径。
 3. **Windows 100MB 不达标**（103–108 MB）：M4 的 100MB 口径以 Linux 为准；Windows 仅作参考。
 4. **24h 长稳未做**：`scripts/soak-linux.sh` 已就绪；本次只做了 60s 保持（RSS 平稳、无增长迹象）。
 5. **2 核与吞吐未测**：需 `taskset -c 0,1` 复跑与自建 SOCKS5 吞吐工具。

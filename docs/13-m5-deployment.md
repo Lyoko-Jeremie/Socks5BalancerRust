@@ -70,8 +70,9 @@ journalctl -u socks5balancer -f
 单元要点：
 - `LimitNOFILE=131072`：C10K 场景必需（默认 1024 会在几百连接时报 `EMFILE`）；
 - `Environment=MIMALLOC_PURGE_DELAY=0` / `MIMALLOC_ARENA_EAGER_COMMIT=0`：mimalloc 低 RSS 策略，
-  10K 连接 100MB 口径的关键（实测 110.4 → **93.0 MB**，见 [12 §3.4](12-m4-performance.md)）。
-  程序启动时也内置了同样的默认值（未设环境变量时生效），单元里显式写出便于统一覆盖；
+  10K 连接 100MB 口径的关键（实测 116.4 → **97.25 MB**，见 [12 §3.4](12-m4-performance.md)）。
+  程序已通过 C 运行时初始化段在 `main` 前内置同样的默认值（无需环境变量即生效）；单元里显式写出
+  便于统一覆盖，也可作为运维的单一调整点；
 - `Restart=on-failure`：崩溃自动拉起（健康检查异常**不会**触发重启，仅摘除上游）；
 - `ProtectSystem=strict` + `ReadOnlyPaths=/etc/socks5balancer`：配置只读；
 - `TimeoutStopSec=20s`：与程序内 12s 优雅收尾匹配。
@@ -179,10 +180,13 @@ fs.file-max = 1000000
 `listen` 使用 `SO_REUSEPORT`（Linux）便于多进程/多核扩展；Windows 上不设置 `SO_REUSEADDR`
 （避免端口劫持，见 [03](03-protocol.md) 端口陷阱）。
 
-**分配器层（10K 连接 100MB 口径的关键）**：程序默认已启用 mimalloc 低 RSS 策略
+**分配器层（10K 连接 100MB 口径的关键）**：程序通过 C 运行时初始化段（Linux `.init_array` /
+Windows `.CRT$XCU`）**在 `main` 之前**默认启用 mimalloc 低 RSS 策略
 （`MIMALLOC_PURGE_DELAY=0`、`MIMALLOC_ARENA_EAGER_COMMIT=0`，见 `src/main.rs` 与
-[12 §3.4](12-m4-performance.md)）；systemd 单元里也显式设置，便于统一覆盖。若自行用二进制/脚本启动，
-建议同样导出这两个变量（Linux 实测峰值 110.4 → 93.0 MB；Windows 上该选项影响很小）。
+[12 §3.4](12-m4-performance.md)），因此**不需要任何环境变量即可生效**。
+systemd 单元里也显式设置这两个变量（初始化更早、且便于运维统一覆盖）。
+若自行用二进制/脚本启动，Linux 实测默认策略峰值 116.4 → **97.25 MB**；Windows 上该选项影响很小。
+注意：把它们放在 `main` 里调用是无效的（mimalloc 的 arena 已初始化），务必用环境变量或初始化段。
 
 ---
 
@@ -195,7 +199,7 @@ fs.file-max = 1000000
 | 上游健康 | `GET /api/v1/upstreams` | `available=false` 持续 >2 周期告警 |
 | 全上游不可用 | `stats.rejected` 增长 + `health.available=0` | 立即告警（服务已不可用） |
 | 上游切换/降级 | 日志 `标记 DOWN` / `readiness 探测失败` / `liveness 恢复` | 汇总告警 |
-| 内存 | `/proc/<pid>/status` `VmRSS` | 按 [12](12-m4-performance.md) 口径设阈值：`bufferSize=2048` + 默认 mimalloc 策略下 10K 连接 ≈93 MB（Linux 实测），阈值建议 110 MB；`bufferSize=8192` 基线口径 10K ≈224 MB |
+| 内存 | `/proc/<pid>/status` `VmRSS` | 按 [12](12-m4-performance.md) 口径设阈值：`bufferSize=2048` + 默认 mimalloc 策略下 10K 连接 ≈97 MB（Linux 实测），阈值建议 110 MB；`bufferSize=8192` 基线口径 10K ≈224 MB |
 
 日志为 tracing 文本格式（`RUST_LOG` / `logLevel` 控制），包含 `upstream=`、`peer=`、`rep=` 等字段。
 
@@ -220,7 +224,7 @@ fs.file-max = 1000000
 - [ ] `ulimit -n` ≥ 连接数上限 + 余量；`LimitNOFILE` 已设
 - [ ] `/healthz` 200；`/api/v1/upstreams` 无密码
 - [ ] 杀掉一个上游 → 客户端快速失败 → 重启上游 → 自动恢复（`m1-health.ps1` 同流程）
-- [ ] 内存：`VmRSS` 在预算内（**Linux 实测**：2K 档 10K 连接峰值 ≈93 MB；Windows 推算 ≈104 MB，仅参考，见 [12](12-m4-performance.md)）
+- [ ] 内存：`VmRSS` 在预算内（**Linux 实测**：2K 档 10K 连接峰值 ≈97 MB；Windows 推算 ≈104 MB，仅参考，见 [12](12-m4-performance.md)）
 
 ---
 
