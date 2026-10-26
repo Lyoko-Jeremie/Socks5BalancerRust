@@ -27,11 +27,11 @@
 | 0 | **README.md**（本文） | 索引、结论摘要、缺陷 Top 榜、阅读指引 | — |
 | 1 | [01-overview.md](01-overview.md) | 项目定位、功能清单、总体架构、组件职责、连接生命周期主流程、三种工作模式、所有权模型、架构评价 | ~570 行 |
 | 2 | [02-relay-core.md](02-relay-core.md) | **高性能转发架构（数据面）**：accept 层、会话/缓冲策略、relay 循环语义、握手阶段屏障、上游建连路径、每包开销、瓶颈排序、Rust 热路径设计约束、等价性验收清单 | ~575 行 |
-| 3 | [03-protocol.md](03-protocol.md) | **协议处理**：两条互斥产品线（`FirstPackAnalyzer` vs `ProxyHandshakeAuth`）、首包嗅探与回放、SOCKS5/4/4a/HTTP 状态机、上游 SOCKS5 客户端握手、认证、异常与生命周期风险、字节级时序图、65 项验收清单、39 条缺陷索引 | ~2,480 行 |
+| 3 | [03-protocol.md](03-protocol.md) | **协议处理**：两条互斥产品线（`FirstPackAnalyzer` vs `ProxyHandshakeAuth`）、首包嗅探与回放、SOCKS5/4/4a/HTTP 状态机、上游 SOCKS5 客户端握手、认证、异常与生命周期风险、字节级时序图、74 项验收清单、39 条缺陷索引 | ~2,480 行 |
 | 4 | [04-control-monitor.md](04-control-monitor.md) | **运行控制与监控**：14 个定时器体系、健康状态机、上游选择算法、统计聚合、连接追踪、延迟采样、状态/控制 HTTP 全端点表、静态服务、日志、优雅关闭、24 条缺陷 | ~1,620 行 |
 | 5 | [05-build-config-deploy.md](05-build-config-deploy.md) | **构建、配置、部署与资源开销**：CMake 开关矩阵、配置字段字典（含死字段）、Docker/CI/前端、**每连接内存实测（22,039 B）**、1,000 conn/s 关键路径开销分解 | ~1,040 行 |
 | 6 | [06-rust-port-assessment.md](06-rust-port-assessment.md) | **硬指标可行性评估与 Rust 架构映射**：指标口径、内存/CPU 预算模型、crate 选型、模块划分、数据面约束、验收压测方案、里程碑、风险登记表 | ~345 行 |
-| 7 | [07-decisions.md](07-decisions.md) | **架构决策记录（ADR）**：8 条已决策 + 配置草案 + 旧字段兼容映射 + 指标重算 + 裁决记录（U1=方案 B、U2=不复用前端已裁决；U4–U6 待确认）。**与其他文档冲突时以此为准** | ~380 行 |
+| 7 | [07-decisions.md](07-decisions.md) | **架构决策记录（ADR）**：8 条已决策 + 配置草案 + 旧字段兼容映射 + 指标重算 + 裁决记录（U1=方案 B、U2=不复用前端、U3=可配、U4=target 可选、U5=不热重载、U6=保留 SOCKS4）。**与其他文档冲突时以此为准** | ~380 行 |
 | 8 | [08-m0-milestone.md](08-m0-milestone.md) | **M0 里程碑报告**：骨架实现范围、验收结果、实测 RSS/连接数、踩坑与修正、已知限制、如何运行、M1 计划 | ~240 行 |
 | 9 | [09-m1-milestone.md](09-m1-milestone.md) | **M1 里程碑报告**：SOCKS5 0x00/0x02、上游握手、5 条选路规则、健康检查（fail-fast + 退避 + 数据面降级）、TLS readiness、验收结果 | ~200 行 |
 | 10 | [10-m2-milestone.md](10-m2-milestone.md) | **M2 里程碑报告**：首包嗅探、SOCKS4/4a、HTTP CONNECT / absolute-form、early data 回放、origin-form 改写、验收结果 | ~180 行 |
@@ -42,7 +42,7 @@
 阅读顺序建议：**01 → 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09 → 10 → 11 → 12 → 13**。
 只想快速决策：读本文 §3/§4/§5；准备动手写代码：读 **07（决策）+ 02 §8 + 06 §7**。
 
-> **当前进度（2026-10-26）**：**M0 ✅；M1（M1.1–M1.5）✅；M2 ✅；M3 ✅；M4 内存基线 ✅；M5 交付物 ✅（待 Linux 实测回填）**。已实现：SOCKS5 入站 0x00/0x02（RFC1929、CONNECT、错误码回传）、上游 SOCKS5 握手（含上游认证）、5 条选路规则、fail-fast 健康检查（DOWN 指数退避 + 数据面降级 + 快速重探）、TLS + HTTP readiness 探测、混合端口（SOCKS5 / SOCKS4-4a / HTTP CONNECT / HTTP forward）、精简控制面（4 端点、运行期启停/改规则/立即探测、无鉴权仅回环、响应不含密码）。端到端验收：协议 10/10、健康检查 6/6、TLS readiness 9/9、混合协议 9/9、控制面 19/19；单元测试 **90** 个全绿；**内存实测：`bufferSize=2048` 下 10K 空闲连接推算 ≈ 98.5 MB（Windows 口径，临界达标；Linux 预计 ~69 MB）**。交付物：Dockerfile、systemd 单元、生产配置、`.github/workflows/ci.yml`（Linux/Windows 双平台 CI）、Linux C10K 压测脚本。**下一步：Linux C10K/1K 实测、24h 长稳、用实测回填 12 号文档**。详见 [13-m5-deployment.md](13-m5-deployment.md)。
+> **当前进度（2026-10-26）**：**M0 ✅；M1（M1.1–M1.5）✅；M2 ✅；M3 ✅；M4 内存基线 ✅；M5 交付物 ✅（待 Linux 实测回填）**。已实现：SOCKS5 入站 0x00/0x02（RFC1929、CONNECT、错误码回传）、**SOCKS4 USERID 与 HTTP Basic 入站认证**、上游 SOCKS5 握手（含上游认证）、5 条选路规则 + **每客户端 hint 粘性**、**retryTimes 数据面失败切换**、fail-fast 健康检查（DOWN 指数退避 + 数据面降级 + 快速重探 + **sleepTime 空闲暂停 + additionCheckPeriod 全池加速 + 探测 RTT**）、TLS + HTTP readiness 探测（**expectStatus 空=不校验**）、混合端口（SOCKS5 / SOCKS4-4a / HTTP CONNECT / HTTP forward）、**DNS TTL 刷新（dnsTtl）**、**Linux per-core listener（SO_REUSEPORT）**、精简控制面（4 端点、运行期启停/改规则/立即探测、无鉴权仅回环、响应不含密码）。端到端验收：协议 10/10、健康检查 6/6、TLS readiness 9/9、混合协议 9/9、控制面 19/19；单元测试 **90** 个全绿；**内存实测：`bufferSize=2048` 下 10K 空闲连接推算 ≈ 98.5 MB（Windows 口径；Linux 预计 ~69 MB）**。交付物：Dockerfile（含 `.dockerignore`）、systemd 单元、生产配置、`.github/workflows/ci.yml`（Linux/Windows 双平台 CI + 编码检查）、`fuzz/`（SOCKS5/HTTP/SOCKS4 解析）、Linux C10K/1K 压测与 24h 长稳脚本。**下一步：Linux C10K/1K 实测、24h 长稳、用实测回填 12 号文档**。详见 [13-m5-deployment.md](13-m5-deployment.md)。
 
 > **2026-10-26 修订**：用户已就 7 项关键取舍作出决策（控制面精简不鉴权、健康检查 fail-fast 不重试且异常后端降频、线程数可配置、SOCKS5 仅 0x00/0x02、双向 8K 预分配、TLS 探测对齐 C++、优先成熟库），已固化为 [07-decisions.md](07-decisions.md)，并同步修订 01/02/04/05/06 的"Rust 建议"部分。C++ 现状分析部分不变。
 
