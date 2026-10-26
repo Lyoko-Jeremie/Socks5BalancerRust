@@ -141,6 +141,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/m2-smoke.ps1
 ## 7. 下一步
 
 1. **M3：精简控制面** ✅*（2026-10-26 完成，见 [11-m3-milestone.md](11-m3-milestone.md)）*
-2. **C10K / 1K 建连压测**（Linux 优先）：连接数上限、RSS、握手 CPU、`bufferSize` 对比。
-3. **M4：性能调优与 24h 长稳**（含 HTTP keep-alive 逐请求改写评估）。
-4. **Linux CI**：双平台构建/单测/冒烟脚本（bash 版）。
+2. **C10K / 1K 建连压测**（Linux 优先）：连接数上限、RSS、握手 CPU、`bufferSize` 对比（工具已提供：`flood_socks5`、`loadtest-linux.sh`）。
+3. **M4：性能调优与 24h 长稳**（keep-alive 逐请求改写已登记"不做"，见 §5）。
+4. **Linux CI** ✅*（2026-10-26 提供 `.github/workflows/ci.yml`，Windows/Linux 双平台；待 GitHub 首跑回填）*
