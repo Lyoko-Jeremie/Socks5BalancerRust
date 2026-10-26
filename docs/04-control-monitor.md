@@ -1401,7 +1401,7 @@ snap_swap.store(Arc::new(snap));    // 控制面读到的永远是完整快照
 | 方法 | 路径 | 作用 | 返回 | 备注 |
 |---|---|---|---|---|
 | `GET` | `/api/v1/status` | 进程 / 总量 / 后端 / 监听 / 健康摘要 / 延迟摘要 | 一个 JSON（≤64 KB 上限） | 读 `Arc<Snapshot>`，零锁 |
-| `GET` | `/api/v1/upstreams` | 后端逐条详情（host/port/name/state/RTT/conns/enabled） | JSON 数组 | 固定数组，索引=配置顺序 |
+| `GET` | `/api/v1/upstreams` | 后端逐条详情（host/port/name/state/RTT/conns/enabled） | JSON 数组 | 固定数组，索引=解析成功上游的顺序（通常=配置顺序） |
 | `POST` | `/api/v1/control` | 控制命令（JSON body） | `{"ok":true}` 或错误 | **唯一的写端点** |
 | `GET` | `/healthz` | 存活探针（容器 / K8s） | `200 ok` 纯文本 | 不读业务状态 |
 

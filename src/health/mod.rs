@@ -397,10 +397,13 @@ impl HealthRegistry {
                 }
                 let upstream = Upstream {
                     name: reg.entries[idx].name.clone(),
+                    host: reg.entries[idx].addr.ip().to_string(),
+                    port: reg.entries[idx].addr.port(),
                     addr: reg.entries[idx].addr,
                     auth_user: reg.entries[idx].auth_user.clone(),
                     auth_pwd: reg.entries[idx].auth_pwd.clone(),
                     health_index: idx,
+                    enabled: true,
                 };
                 let ok = {
                     let _permit = reg.probe_permits.acquire().await;
@@ -495,10 +498,13 @@ mod tests {
     fn upstream(name: &str, port: u16) -> Upstream {
         Upstream {
             name: name.to_string(),
+            host: "127.0.0.1".to_string(),
+            port,
             addr: SocketAddr::from(([127, 0, 0, 1], port)),
             auth_user: None,
             auth_pwd: None,
             health_index: 0,
+            enabled: true,
         }
     }
 
@@ -586,10 +592,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let up = Upstream {
             name: "probe-target".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
             addr,
             auth_user: None,
             auth_pwd: None,
             health_index: 0,
+            enabled: true,
         };
         let reg = HealthRegistry::new(&[up], cfg());
         let cancel = CancellationToken::new();

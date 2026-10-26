@@ -14,7 +14,7 @@
 |---|---|---|
 | `GET /healthz` 存活探针 | ✅ | 200 `ok`（不读业务状态） |
 | `GET /api/v1/status` 状态摘要 | ✅ | JSON：schema/version/uptime/workers/bufferSize/maxConnections/listen/selectRule/stats/health |
-| `GET /api/v1/upstreams` 上游详情 | ✅ | JSON 数组；index=配置顺序；**不含密码/用户名/认证字段** |
+| `GET /api/v1/upstreams` 上游详情 | ✅ | JSON 数组；index=解析成功上游的顺序（通常等于配置顺序）；初始 `disable` 的上游也在列表中且可用 `enable_upstream` 启用；**不含密码/用户名/认证字段** |
 | `POST /api/v1/control` 唯一写端点 | ✅ | 精简命令集（见 §4.2），审计日志 |
 | 无鉴权、无 CORS、默认回环 | ✅ | 默认 `127.0.0.1:5110`；非回环仅告警；响应无 `Access-Control-*` |
 | 响应大小上限 | ✅ | `stateMaxResponseBytes`（默认 65536；超限回 500） |

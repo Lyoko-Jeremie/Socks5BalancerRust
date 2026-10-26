@@ -1,10 +1,11 @@
 //! 上游池与选择策略。
 //!
 //! - 解析在启动期完成一次（域名 → `SocketAddr`），热路径不做 DNS；
+//! - 初始 `disable: true` 的上游**保留在池中**（`enabled=false`），控制面可见并可启用；
 //! - 选择策略对齐 C++ 版 5 条规则（`loop` / `random` / `one_by_one` /
 //!   `change_by_time` / `force_only_one`），状态用轻量 `Mutex` 保护
 //!   （每连接只选一次，不在转发热路径上）；
-//! - `is_available` 回调为 M1.4 的健康状态接入点；M1.3 阶段恒为可用。
+//! - `is_available` 回调为 M1.4 的健康状态接入点。
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -20,12 +21,18 @@ use crate::config::UpstreamConfig;
 #[derive(Debug, Clone)]
 pub struct Upstream {
     pub name: String,
+    /// 配置中的原始 host（控制面展示用；`addr` 是解析后的地址）。
+    pub host: String,
+    /// 配置端口。
+    pub port: u16,
     pub addr: SocketAddr,
     /// 上游 SOCKS5 认证（M1 起真正使用；None 表示无认证）。
     pub auth_user: Option<String>,
     pub auth_pwd: Option<String>,
-    /// 在健康注册表中的下标（与启用上游的解析顺序一致）。
+    /// 在健康注册表中的下标（与"解析成功上游"的顺序一致）。
     pub health_index: usize,
+    /// 配置是否启用；作为人工启停的初始值（控制面可再改）。
+    pub enabled: bool,
 }
 
 /// 上游选择规则（与 C++ `upstreamSelectRule` 同名）。
@@ -113,7 +120,8 @@ pub struct UpstreamSelector {
 
 impl UpstreamSelector {
     pub fn new(upstreams: Vec<Upstream>, rule: SelectRule, change_interval: Duration) -> Self {
-        let n = upstreams.len();
+        // 人工启停掩码的初始值来自配置（`disable: true` 的上游初始不可选，但可被控制面启用）。
+        let enabled: Vec<bool> = upstreams.iter().map(|u| u.enabled).collect();
         Self {
             upstreams,
             rule: AtomicU8::new(rule.as_u8()),
@@ -122,7 +130,7 @@ impl UpstreamSelector {
                 cursor: 0,
                 current: 0,
                 last_change: Instant::now(),
-                enabled: vec![true; n],
+                enabled,
             }),
         }
     }
@@ -269,18 +277,30 @@ pub async fn resolve_all(cfgs: &[UpstreamConfig]) -> (Vec<Upstream>, Vec<String>
     let mut ok = Vec::new();
     let mut failed = Vec::new();
 
-    for c in cfgs.iter().filter(|c| c.enabled) {
+    // 注意：这里**不过滤** disabled 上游——它们保留在池中（`enabled=false`），
+    // 以便控制面 `/api/v1/upstreams` 能看到并 `enable_upstream` 启用。
+    for c in cfgs.iter() {
         match resolve_one(&c.host, c.port).await {
             Ok(addr) => {
                 // 健康注册表基于"解析成功"的列表，下标即 ok.len()
                 let health_index = ok.len();
-                info!(upstream = %c.name, host = %c.host, port = c.port, addr = %addr, "上游解析成功");
+                info!(
+                    upstream = %c.name,
+                    host = %c.host,
+                    port = c.port,
+                    addr = %addr,
+                    enabled = c.enabled,
+                    "上游解析成功"
+                );
                 ok.push(Upstream {
                     name: c.name.clone(),
+                    host: c.host.clone(),
+                    port: c.port,
                     addr,
                     auth_user: c.auth_user.clone(),
                     auth_pwd: c.auth_pwd.clone(),
                     health_index,
+                    enabled: c.enabled,
                 });
             }
             Err(e) => {
@@ -322,10 +342,13 @@ mod tests {
     fn u(name: &str, port: u16) -> Upstream {
         Upstream {
             name: name.to_string(),
+            host: "127.0.0.1".to_string(),
+            port,
             addr: SocketAddr::from(([127, 0, 0, 1], port)),
             auth_user: None,
             auth_pwd: None,
             health_index: 0,
+            enabled: true,
         }
     }
 
@@ -442,5 +465,22 @@ mod tests {
         assert_ne!(first.name, "a");
         // 全部排除 → 无可用上游
         assert!(s.next_excluding(&all_available, &[0, 1, 2]).is_none());
+    }
+
+    #[test]
+    fn 初始禁用的上游可被控制面启用() {
+        let mut a = u("a", 1);
+        let b = u("b", 2);
+        a.enabled = false;
+        let s = UpstreamSelector::new(vec![a, b], SelectRule::Loop, Duration::from_secs(60));
+        // 初始 disabled：不可选，但仍保留在池中（下标 0 可见）
+        assert!(!s.manual_enabled(0));
+        assert_eq!(s.next(&all_available).unwrap().name, "b");
+        // 控制面启用后可被选中
+        assert!(s.set_manual_enabled(0, true));
+        let names: Vec<&str> = (0..3)
+            .map(|_| s.next(&all_available).unwrap().name.as_str())
+            .collect();
+        assert!(names.contains(&"a"), "启用后应可选中: {names:?}");
     }
 }

@@ -285,7 +285,8 @@ fn ctx_workers(ctx: &Arc<AppCtx>) -> usize {
     }
 }
 
-/// `/api/v1/upstreams`：JSON 数组，索引=配置顺序，**不含认证信息**。
+/// `/api/v1/upstreams`：JSON 数组，索引=**解析成功上游的顺序**（通常等于配置顺序；
+/// 解析失败的条目不进入池），**不含认证信息**。
 fn upstreams_json(ctx: &Arc<AppCtx>) -> Value {
     let health = ctx.health.snapshot();
     let list: Vec<Value> = ctx
@@ -295,13 +296,12 @@ fn upstreams_json(ctx: &Arc<AppCtx>) -> Value {
         .enumerate()
         .map(|(i, u)| {
             let h = health.get(i);
-            let addr = u.addr.to_string();
             json!({
                 "index": i,
                 "name": u.name,
-                "host": u.addr.ip().to_string(),
-                "port": u.addr.port(),
-                "addr": addr,
+                "host": u.host,
+                "port": u.port,
+                "addr": u.addr.to_string(),
                 "enabled": ctx.selector.manual_enabled(i),
                 "available": h.map(|h| h.available).unwrap_or(false),
                 "liveness": h.map(|h| h.liveness).unwrap_or(false),
@@ -352,7 +352,8 @@ mod tests {
             "stateServerPort": 0,
             "upstream": [
                 { "name": "a", "host": "127.0.0.1", "port": 6100, "authUser": "alice", "authPwd": "secret" },
-                { "name": "b", "host": "127.0.0.1", "port": 6101 }
+                { "name": "b", "host": "127.0.0.1", "port": 6101 },
+                { "name": "c", "host": "127.0.0.1", "port": 6102, "disable": true }
             ]
         }"#;
         let cfg = Arc::new(config::load_str(text).expect("配置合法"));
@@ -362,10 +363,13 @@ mod tests {
             .enumerate()
             .map(|(i, u)| Upstream {
                 name: u.name.clone(),
+                host: u.host.clone(),
+                port: u.port,
                 addr: format!("{}:{}", u.host, u.port).parse().unwrap(),
                 auth_user: u.auth_user.clone(),
                 auth_pwd: u.auth_pwd.clone(),
                 health_index: i,
+                enabled: u.enabled,
             })
             .collect();
         let selector = Arc::new(UpstreamSelector::new(
@@ -384,7 +388,7 @@ mod tests {
         let v = status_json(&ctx);
         assert_eq!(v["schema"], "v1");
         assert!(v["stats"]["accepted"].is_u64());
-        assert_eq!(v["health"]["total"], 2);
+        assert_eq!(v["health"]["total"], 3);
         assert_eq!(v["listen"][0], "127.0.0.1:5500");
     }
 
@@ -394,10 +398,13 @@ mod tests {
         let v = upstreams_json(&ctx);
         let text = v.to_string();
         assert!(v.is_array());
-        assert_eq!(v.as_array().unwrap().len(), 2);
+        assert_eq!(v.as_array().unwrap().len(), 3);
         assert!(!text.contains("secret"), "响应不得包含密码: {text}");
         assert!(!text.contains("authUser"), "响应不得包含认证字段: {text}");
         assert!(!text.contains("alice"), "响应不得包含用户名: {text}");
+        // 初始禁用的上游也出现在列表里，且可被控制面启用
+        assert_eq!(v[2]["name"], "c");
+        assert_eq!(v[2]["enabled"], false);
     }
 
     #[test]
@@ -419,6 +426,11 @@ mod tests {
         let (ok, _) = execute(&ctx, "enable_upstream", &json!({"name": "a"}));
         assert!(ok);
         assert!(ctx.selector.manual_enabled(0));
+        // 初始 disabled 的上游可被启用
+        assert!(!ctx.selector.manual_enabled(2));
+        let (ok, _) = execute(&ctx, "enable_upstream", &json!({"name": "c"}));
+        assert!(ok);
+        assert!(ctx.selector.manual_enabled(2));
         let (ok, _) = execute(&ctx, "enable_upstream", &json!({"index": 9}));
         assert!(!ok);
         let (ok, _) = execute(&ctx, "disable_upstream", &json!({"name": "nope"}));
