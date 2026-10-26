@@ -1,0 +1,7 @@
+# cargo-fuzz 产物（不入库）
+/target
+/corpus
+/artifacts
+/coverage
+# 依赖版本由主 crate 的 Cargo.lock 与 fuzz 自身的解析结果决定，本地生成即可
+/Cargo.lock

@@ -1,0 +1,38 @@
+[package]
+name = "fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# cargo-fuzz 会在构建时注入 sanitizer/coverage 编译参数
+[package.metadata]
+cargo-fuzz = true
+
+# fuzz 是独立 workspace：不并入主 crate，也不会被 `cargo build` 连带构建
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# 通过 path 依赖主 crate 的 lib target（Cargo.toml 里 `[lib] name = "socks5_balancer_rust"`），
+# 这样 fuzz 跑的是 src/ 里的真实解析代码，而不是复制的一份逻辑。
+socks5_balancer_rust = { path = "..", package = "Socks5BalancerRust" }
+# 协议 negotiate/read_head 是 async 的，用 current-thread runtime + duplex 驱动
+tokio = { version = "1", features = ["rt", "io-util"] }
+
+[[bin]]
+name = "socks5_negotiate"
+path = "fuzz_targets/socks5_negotiate.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "http_head"
+path = "fuzz_targets/http_head.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "socks4_request"
+path = "fuzz_targets/socks4_request.rs"
+test = false
+doc = false
