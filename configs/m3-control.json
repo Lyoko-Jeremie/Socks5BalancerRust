@@ -1,0 +1,21 @@
+{
+  "listenHost": "127.0.0.1",
+  "listenPort": 5600,
+  "stateServerHost": "127.0.0.1",
+  "stateServerPort": 5601,
+  "traditionTcpRelay": false,
+  "bufferSize": 4096,
+  "connectTimeout": 2000,
+  "firstPacketTimeout": 5000,
+  "handshakeTimeout": 5000,
+  "logLevel": "debug",
+  "upstream": [
+    {
+      "name": "mockAuth",
+      "host": "127.0.0.1",
+      "port": 6200,
+      "authUser": "alice",
+      "authPwd": "secret"
+    }
+  ]
+}

@@ -13,6 +13,7 @@
 
 mod app;
 mod config;
+mod control;
 mod handshake;
 mod health;
 mod logging;
@@ -195,6 +196,18 @@ async fn run(cfg: config::Config, workers: usize) -> Result<(), Box<dyn std::err
     }
 
     let stats_task = spawn_stats_logger(Arc::clone(&stats), Arc::clone(&health), cancel.clone());
+
+    // 控制面（M3，ADR-001）：无鉴权、默认回环；绑定失败只告警，不影响主服务。
+    if let Some(state_bind) = cfg.state_server.clone() {
+        let ctx = Arc::clone(&ctx);
+        let max_response = cfg.state_max_response_bytes;
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            control::serve(ctx, state_bind, max_response, cancel).await;
+        });
+    } else {
+        info!("控制面未启用（stateServerPort=0）");
+    }
 
     let signal = wait_signal().await;
     info!(signal, "收到退出信号，开始优雅关闭");

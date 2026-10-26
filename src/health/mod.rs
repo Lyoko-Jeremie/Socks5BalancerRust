@@ -51,6 +51,8 @@ struct Entry {
     tls_backoff_ms: AtomicU64,
     /// readiness 连续失败次数。
     tls_failures: AtomicU64,
+    /// 探测提前唤醒（控制面 `check_upstream`）。
+    probe_notify: tokio::sync::Notify,
 }
 
 /// 健康快照（控制面/日志用；M3 会序列化为 JSON）。
@@ -98,6 +100,7 @@ impl HealthRegistry {
                 tls_next_probe_ms: AtomicU64::new(0),
                 tls_backoff_ms: AtomicU64::new(initial_backoff.max(1)),
                 tls_failures: AtomicU64::new(0),
+                probe_notify: tokio::sync::Notify::new(),
             })
             .collect();
         let permits = cfg
@@ -160,6 +163,20 @@ impl HealthRegistry {
                 }
             })
             .collect()
+    }
+
+    /// 立即安排一次探测（M3 控制面 `check_upstream`）：只探测一次、不重试。
+    ///
+    /// 通过 `Notify` 唤醒正在等待下次探测的探测任务；返回 false 表示下标越界。
+    pub fn probe_now(&self, idx: usize) -> bool {
+        let Some(entry) = self.entries.get(idx) else {
+            return false;
+        };
+        let now = self.now_ms();
+        entry.tcp_next_probe_ms.store(now, Ordering::Release);
+        entry.tls_next_probe_ms.store(now, Ordering::Release);
+        entry.probe_notify.notify_one();
+        true
     }
 
     fn now_ms(&self) -> u64 {
@@ -441,6 +458,8 @@ async fn wait_until(
         tokio::select! {
             _ = cancel.cancelled() => return false,
             _ = tokio::time::sleep(wait) => {}
+            // 控制面 `check_upstream`：提前唤醒，立即探测一次
+            _ = entry.probe_notify.notified() => {}
         }
     }
 }

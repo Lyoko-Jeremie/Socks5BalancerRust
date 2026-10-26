@@ -1,5 +1,6 @@
 {
   "listenHost": "127.0.0.1",
+  "stateServerPort": 0,
   "listenPort": 5500,
   "traditionTcpRelay": false,
   "bufferSize": 4096,

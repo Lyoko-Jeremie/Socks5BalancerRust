@@ -42,7 +42,7 @@ rustls = "0.23"
 tokio-rustls = "0.26"
 rustls-platform-verifier = "0.7.1"
 rustls-pki-types = "1.15.1"
-hyper = { version = "1.12.0", features = ["client", "http1"] }
+hyper = { version = "1.12.0", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 http-body-util = "0.1.5"
 rustls-pemfile = "2.2.0"

@@ -4,6 +4,7 @@
 //! M3 起会在这里挂控制面快照等（见 docs/06 §6 模块划分）。
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
 
@@ -19,6 +20,8 @@ pub struct AppCtx {
     pub selector: Arc<UpstreamSelector>,
     pub health: Arc<HealthRegistry>,
     pub stats: Arc<Stats>,
+    /// 进程启动时刻（控制面 `uptimeSeconds` 用）。
+    pub started: Instant,
     /// 全局取消令牌：收到退出信号时取消，accept 循环、relay 与探测任务都会响应。
     pub cancel: CancellationToken,
 }
@@ -36,6 +39,7 @@ impl AppCtx {
             selector,
             health,
             stats,
+            started: Instant::now(),
             cancel,
         })
     }

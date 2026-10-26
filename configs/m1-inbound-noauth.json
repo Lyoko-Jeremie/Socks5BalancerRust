@@ -1,5 +1,6 @@
 {
   "listenHost": "127.0.0.1",
+  "stateServerPort": 0,
   "listenPort": 5100,
   "multiListen": [
     { "host": "127.0.0.1", "port": 6610 }

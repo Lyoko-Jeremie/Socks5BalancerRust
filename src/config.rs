@@ -52,6 +52,20 @@ fn err(msg: impl Into<String>) -> ConfigError {
     ConfigError::Invalid(msg.into())
 }
 
+/// 判断监听 host 是否为回环地址（用于控制面安全提示）。
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host
+        .trim_matches(|c| c == '[' || c == ']')
+        .parse::<std::net::IpAddr>()
+    {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
+}
+
 fn default_listen_host() -> String {
     "127.0.0.1".to_string()
 }
@@ -439,6 +453,10 @@ pub struct Config {
     pub health: HealthConfig,
     pub tradition_tcp_relay: bool,
     pub disable_socks4: bool,
+    /// 控制面监听地址（M3，ADR-001）；None 表示禁用。
+    pub state_server: Option<ListenTarget>,
+    /// 控制面单次响应字节上限（默认 65536）。
+    pub state_max_response_bytes: usize,
     /// 解析过程中发现的"被忽略/降级"的配置项说明，启动时以 warning 打印。
     pub notes: Vec<String>,
 }
@@ -677,6 +695,35 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
     let socket_recv_buffer = raw.socket_recv_buffer.unwrap_or(0);
     let socket_send_buffer = raw.socket_send_buffer.unwrap_or(0);
 
+    // ===== 控制面（M3，ADR-001：4 端点、无鉴权、默认仅回环）=====
+    // 默认端口与 C++ 版一致（5110）；显式配置 0 表示禁用。
+    let state_port = raw.state_server_port.unwrap_or(5110);
+    let state_server = if state_port > 0 {
+        Some(ListenTarget {
+            host: raw
+                .state_server_host
+                .clone()
+                .filter(|h| !h.trim().is_empty())
+                .unwrap_or_else(|| "127.0.0.1".to_string()),
+            port: state_port,
+        })
+    } else {
+        None
+    };
+    if let Some(state) = &state_server
+        && !is_loopback_host(&state.host)
+    {
+        notes.push(format!(
+            "控制面无鉴权且监听非回环地址 {}：存在被未授权访问的风险（ADR-001）",
+            state
+        ));
+    }
+    let state_max_response_bytes = raw
+        .state_max_response_bytes
+        .filter(|v| *v > 0)
+        .unwrap_or(65_536)
+        .min(1024 * 1024);
+
     Ok(Config {
         listen,
         upstreams,
@@ -701,6 +748,8 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
         socket_send_buffer,
         tradition_tcp_relay: raw.tradition_tcp_relay,
         disable_socks4: raw.disable_socks4,
+        state_server,
+        state_max_response_bytes,
         notes,
     })
 }

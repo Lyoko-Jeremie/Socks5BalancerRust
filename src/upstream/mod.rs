@@ -9,6 +9,7 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
@@ -63,6 +64,28 @@ impl SelectRule {
             Self::ForceOnlyOne => "force_only_one",
         }
     }
+
+    /// 稳定编码（供控制面运行期改规则时用原子变量存储）。
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            Self::Loop => 0,
+            Self::Random => 1,
+            Self::OneByOne => 2,
+            Self::ChangeByTime => 3,
+            Self::ForceOnlyOne => 4,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Loop),
+            1 => Some(Self::Random),
+            2 => Some(Self::OneByOne),
+            3 => Some(Self::ChangeByTime),
+            4 => Some(Self::ForceOnlyOne),
+            _ => None,
+        }
+    }
 }
 
 /// 选择器内部状态（只在选择时短暂加锁）。
@@ -74,27 +97,32 @@ struct SelectState {
     current: usize,
     /// change_by_time 上次切换时间。
     last_change: Instant,
+    /// 人工启停（M3 控制面 `enable_upstream` / `disable_upstream`）；索引与上游一致。
+    enabled: Vec<bool>,
 }
 
 /// 上游选择器。
 #[derive(Debug)]
 pub struct UpstreamSelector {
     upstreams: Vec<Upstream>,
-    rule: SelectRule,
+    /// 当前规则（M3 起可运行期修改）。
+    rule: AtomicU8,
     change_interval: Duration,
     state: Mutex<SelectState>,
 }
 
 impl UpstreamSelector {
     pub fn new(upstreams: Vec<Upstream>, rule: SelectRule, change_interval: Duration) -> Self {
+        let n = upstreams.len();
         Self {
             upstreams,
-            rule,
+            rule: AtomicU8::new(rule.as_u8()),
             change_interval,
             state: Mutex::new(SelectState {
                 cursor: 0,
                 current: 0,
                 last_change: Instant::now(),
+                enabled: vec![true; n],
             }),
         }
     }
@@ -108,26 +136,60 @@ impl UpstreamSelector {
     }
 
     pub fn rule(&self) -> SelectRule {
-        self.rule
+        SelectRule::from_u8(self.rule.load(Ordering::Relaxed)).unwrap_or(SelectRule::Random)
+    }
+
+    /// 运行期修改选路规则（M3 控制面 `set_rule`）。
+    pub fn set_rule(&self, rule: SelectRule) {
+        self.rule.store(rule.as_u8(), Ordering::Relaxed);
+    }
+
+    /// 上游是否被人工启用（M3 控制面）。
+    pub fn manual_enabled(&self, idx: usize) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.enabled.get(idx).copied().unwrap_or(false)
+    }
+
+    /// 人工启用/禁用一个上游；返回 false 表示下标越界。
+    pub fn set_manual_enabled(&self, idx: usize, enabled: bool) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match state.enabled.get_mut(idx) {
+            Some(slot) => {
+                *slot = enabled;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 上游列表（控制面 `/api/v1/upstreams` 用；响应不得包含密码）。
+    pub fn upstreams(&self) -> &[Upstream] {
+        &self.upstreams
     }
 
     /// 按规则选择一个可用上游；全部不可用返回 `None`（调用方应快速拒绝）。
     ///
-    /// `is_available` 当前恒为 true（M1.4 接入健康状态）。
+    /// 可用 = 人工启用 && `is_available`（健康状态）。
     pub fn next(&self, is_available: &dyn Fn(usize) -> bool) -> Option<&Upstream> {
         if self.is_empty() {
             return None;
         }
         let n = self.upstreams.len();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // 可用判定：人工启停 + 健康状态
+        let is_ok = |st: &SelectState, i: usize| -> bool {
+            st.enabled.get(i).copied().unwrap_or(false) && is_available(i)
+        };
+        let rule =
+            SelectRule::from_u8(self.rule.load(Ordering::Relaxed)).unwrap_or(SelectRule::Random);
 
-        let idx = match self.rule {
+        let idx = match rule {
             SelectRule::Loop => {
                 let start = state.cursor % n;
                 let mut chosen = None;
                 for k in 0..n {
                     let i = (start + k) % n;
-                    if is_available(i) {
+                    if is_ok(&state, i) {
                         chosen = Some(i);
                         break;
                     }
@@ -137,33 +199,34 @@ impl UpstreamSelector {
                 i
             }
             SelectRule::Random => {
-                let available: Vec<usize> = (0..n).filter(|i| is_available(*i)).collect();
+                let available: Vec<usize> = (0..n).filter(|i| is_ok(&state, *i)).collect();
                 if available.is_empty() {
                     return None;
                 }
                 available[fastrand::usize(..available.len())]
             }
             SelectRule::OneByOne => {
-                if is_available(state.current) {
+                if is_ok(&state, state.current) {
                     state.current
                 } else {
                     // 顺延到"当前之后"的第一个可用上游（绕回）
                     let i = (0..n)
                         .map(|k| (state.current + 1 + k) % n)
-                        .find(|i| is_available(*i))?;
+                        .find(|i| is_ok(&state, *i))?;
                     state.current = i;
                     i
                 }
             }
             SelectRule::ChangeByTime => {
-                if is_available(state.current) && state.last_change.elapsed() < self.change_interval
+                if is_ok(&state, state.current)
+                    && state.last_change.elapsed() < self.change_interval
                 {
                     state.current
                 } else {
                     // 到期（或当前不可用）：切到"当前之后"的第一个可用上游
                     let i = (0..n)
                         .map(|k| (state.current + 1 + k) % n)
-                        .find(|i| is_available(*i))?;
+                        .find(|i| is_ok(&state, *i))?;
                     state.current = i;
                     state.last_change = Instant::now();
                     i
@@ -171,7 +234,7 @@ impl UpstreamSelector {
             }
             SelectRule::ForceOnlyOne => {
                 let i = state.current.min(n - 1);
-                if is_available(i) {
+                if is_ok(&state, i) {
                     state.current = i;
                     i
                 } else {
