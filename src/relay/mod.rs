@@ -97,7 +97,8 @@ async fn handle_tradition(
     _guard: ActiveGuard,
 ) {
     // ADR-002 #3：建连失败立即切下一个可用上游（最多 retryTimes+1 次）。
-    let Some((upstream_cfg, upstream)) = connect_upstream_with_retry(&ctx, peer).await else {
+    let Some((upstream_cfg, upstream)) = connect_upstream_with_retry(&ctx, peer, local).await
+    else {
         return;
     };
     trace!(%peer, %local, upstream = %upstream_cfg.name, addr = %upstream_cfg.addr(), "开始透传");
@@ -317,7 +318,10 @@ async fn establish(
     let mut up_name = String::new();
 
     for _ in 0..max_attempts {
-        let Some(upstream_cfg) = ctx.pick_upstream_for_client(peer.ip(), &tried).cloned() else {
+        let Some(upstream_cfg) = ctx
+            .pick_upstream_for_client(peer.ip(), local, &tried)
+            .cloned()
+        else {
             break;
         };
         tried.push(upstream_cfg.health_index);
@@ -479,11 +483,15 @@ async fn drain_and_close(mut stream: TcpStream) {
 async fn connect_upstream_with_retry(
     ctx: &Arc<AppCtx>,
     peer: SocketAddr,
+    local: SocketAddr,
 ) -> Option<(Upstream, TcpStream)> {
     let max_attempts = ctx.cfg.retry_times.saturating_add(1).max(1);
     let mut tried: Vec<usize> = Vec::with_capacity(max_attempts);
     for _ in 0..max_attempts {
-        let Some(cfg) = ctx.pick_upstream_for_client(peer.ip(), &tried).cloned() else {
+        let Some(cfg) = ctx
+            .pick_upstream_for_client(peer.ip(), local, &tried)
+            .cloned()
+        else {
             break;
         };
         tried.push(cfg.health_index);

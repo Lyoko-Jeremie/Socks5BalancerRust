@@ -115,10 +115,18 @@ struct SelectState {
     enabled: Vec<bool>,
     /// 每客户端粘性 hint（客户端 IP → 上次成功的上游下标）；只对粘性型规则生效。
     hints: std::collections::HashMap<IpAddr, usize>,
+    /// 全局强制上游（控制面 `set_rule scope=global`；只对粘性型规则生效）。
+    global_override: Option<usize>,
+    /// 每客户端强制上游（控制面 `set_rule scope=client target=<ip>`）。
+    client_overrides: std::collections::HashMap<IpAddr, usize>,
+    /// 每监听地址强制上游（控制面 `set_rule scope=listen target=<ip:port>`）。
+    listen_overrides: std::collections::HashMap<SocketAddr, usize>,
 }
 
-/// per-client hint 表容量上限（防止被大量客户端 IP 撑爆内存）。
+/// per-client hint / 覆盖表容量上限（防止被大量客户端 IP 撑爆内存）。
 const MAX_HINTS: usize = 4096;
+/// per-listen 覆盖表容量上限（正常部署监听数量很少，这里仅防御性限制）。
+const MAX_LISTEN_OVERRIDES: usize = 256;
 
 /// 上游选择器。
 #[derive(Debug)]
@@ -144,6 +152,9 @@ impl UpstreamSelector {
                 last_change: Instant::now(),
                 enabled,
                 hints: std::collections::HashMap::new(),
+                global_override: None,
+                client_overrides: std::collections::HashMap::new(),
+                listen_overrides: std::collections::HashMap::new(),
             }),
         }
     }
@@ -307,6 +318,129 @@ impl UpstreamSelector {
             }
         }
         self.next(is_available)
+    }
+
+    /// 带客户端/监听维度的选路：先按维度强制覆盖，再按 hint/规则。
+    ///
+    /// 覆盖优先级：client > listen > global；与 C++ `forceNowUseServer` 一致，
+    /// 只对粘性型规则（`one_by_one` / `change_by_time`）生效；强制目标不可用时回落到常规选路。
+    pub fn next_scoped(
+        &self,
+        client: IpAddr,
+        local: SocketAddr,
+        is_available: &dyn Fn(usize) -> bool,
+    ) -> Option<&Upstream> {
+        if matches!(self.rule(), SelectRule::OneByOne | SelectRule::ChangeByTime) {
+            let forced = {
+                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                state
+                    .client_overrides
+                    .get(&client)
+                    .or_else(|| state.listen_overrides.get(&local))
+                    .or(state.global_override.as_ref())
+                    .copied()
+                    .filter(|idx| state.enabled.get(*idx).copied().unwrap_or(false))
+            };
+            if let Some(idx) = forced
+                && is_available(idx)
+            {
+                return self.upstreams.get(idx);
+            }
+        }
+        self.next_for_client(client, is_available)
+    }
+
+    /// 设置/清除维度强制覆盖（控制面 `set_rule` 的 `scope`/`target`/`index`）。
+    ///
+    /// - `scope`：`global` / `client` / `listen`；
+    /// - `target`：client 为本机看到的客户端 IP，listen 为监听地址 `ip:port`（global 忽略）；
+    /// - `index`：`Some(i)` 设置强制，`None` 清除；
+    /// - 返回人类可读说明；参数非法/下标越界返回 `Err`。
+    pub fn set_scope_override(
+        &self,
+        scope: &str,
+        target: Option<&str>,
+        index: Option<usize>,
+    ) -> Result<String, String> {
+        if let Some(i) = index
+            && i >= self.upstreams.len()
+        {
+            return Err(format!(
+                "index 越界: {i}（共 {} 个上游）",
+                self.upstreams.len()
+            ));
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match scope {
+            "global" => match index {
+                Some(i) => {
+                    state.global_override = Some(i);
+                    Ok(format!("已设置全局强制上游 {i}"))
+                }
+                None => {
+                    let was = state.global_override.take().is_some();
+                    Ok(if was {
+                        "已清除全局强制上游".to_string()
+                    } else {
+                        "全局没有强制上游".to_string()
+                    })
+                }
+            },
+            "client" => {
+                let raw =
+                    target.ok_or_else(|| "scope=client 需要 target=<客户端IP>".to_string())?;
+                let ip: IpAddr = raw
+                    .parse()
+                    .map_err(|_| format!("target 不是合法 IP: {raw:?}"))?;
+                match index {
+                    Some(i) => {
+                        if state.client_overrides.len() >= MAX_HINTS
+                            && !state.client_overrides.contains_key(&ip)
+                        {
+                            state.client_overrides.clear();
+                        }
+                        state.client_overrides.insert(ip, i);
+                        Ok(format!("已设置客户端 {ip} 强制上游 {i}"))
+                    }
+                    None => {
+                        let was = state.client_overrides.remove(&ip).is_some();
+                        Ok(if was {
+                            format!("已清除客户端 {ip} 的强制上游")
+                        } else {
+                            format!("客户端 {ip} 没有强制上游")
+                        })
+                    }
+                }
+            }
+            "listen" => {
+                let raw = target.ok_or_else(|| "scope=listen 需要 target=<ip:port>".to_string())?;
+                let addr: SocketAddr = raw
+                    .parse()
+                    .map_err(|_| format!("target 不是合法 ip:port: {raw:?}"))?;
+                match index {
+                    Some(i) => {
+                        if state.listen_overrides.len() >= MAX_LISTEN_OVERRIDES
+                            && !state.listen_overrides.contains_key(&addr)
+                        {
+                            state.listen_overrides.clear();
+                        }
+                        state.listen_overrides.insert(addr, i);
+                        Ok(format!("已设置监听 {addr} 强制上游 {i}"))
+                    }
+                    None => {
+                        let was = state.listen_overrides.remove(&addr).is_some();
+                        Ok(if was {
+                            format!("已清除监听 {addr} 的强制上游")
+                        } else {
+                            format!("监听 {addr} 没有强制上游")
+                        })
+                    }
+                }
+            }
+            other => Err(format!(
+                "未知 scope: {other:?}（支持 global/client/listen）"
+            )),
+        }
     }
 
     /// 记录某客户端成功使用的上游（供下次 `next_for_client` 粘性选择）。
@@ -611,5 +745,93 @@ mod tests {
         *u.addr.lock().unwrap() = new;
         assert_eq!(u.addr(), new, "DNS 刷新写入应被读取方看到");
         assert_ne!(old, new);
+    }
+
+    #[test]
+    fn 维度覆盖按客户端与监听生效() {
+        let s = selector(SelectRule::OneByOne, Duration::from_secs(60));
+        let client: IpAddr = "10.0.0.7".parse().unwrap();
+        let other: IpAddr = "10.0.0.8".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        // client 覆盖优先
+        s.set_scope_override("client", Some("10.0.0.7"), Some(1))
+            .unwrap();
+        assert_eq!(
+            s.next_scoped(client, local, &all_available).unwrap().name,
+            "b"
+        );
+        // 未命中的客户端走常规规则
+        assert_eq!(
+            s.next_scoped(other, local, &all_available).unwrap().name,
+            "a"
+        );
+        // listen 覆盖对该监听的所有客户端生效
+        s.set_scope_override("listen", Some("127.0.0.1:5000"), Some(2))
+            .unwrap();
+        assert_eq!(
+            s.next_scoped(other, local, &all_available).unwrap().name,
+            "c"
+        );
+        // 清除 listen 覆盖后回落
+        s.set_scope_override("listen", Some("127.0.0.1:5000"), None)
+            .unwrap();
+        assert_eq!(
+            s.next_scoped(other, local, &all_available).unwrap().name,
+            "a"
+        );
+    }
+
+    #[test]
+    fn 维度覆盖不可用时回落() {
+        let s = selector(SelectRule::ChangeByTime, Duration::from_secs(60));
+        let client: IpAddr = "10.0.0.7".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        s.set_scope_override("client", Some("10.0.0.7"), Some(1))
+            .unwrap();
+        // 强制上游 b 不可用 → 回落到可用上游
+        let only_a = |i: usize| i == 0;
+        assert_eq!(s.next_scoped(client, local, &only_a).unwrap().name, "a");
+    }
+
+    #[test]
+    fn 非粘性规则忽略维度覆盖() {
+        let s = selector(SelectRule::Loop, Duration::from_secs(60));
+        let client: IpAddr = "10.0.0.7".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        s.set_scope_override("client", Some("10.0.0.7"), Some(2))
+            .unwrap();
+        // Loop 规则无视覆盖，按轮询从 a 开始
+        assert_eq!(
+            s.next_scoped(client, local, &all_available).unwrap().name,
+            "a"
+        );
+    }
+
+    #[test]
+    fn 维度覆盖参数校验与全局覆盖() {
+        let s = selector(SelectRule::OneByOne, Duration::from_secs(60));
+        assert!(s.set_scope_override("client", None, Some(0)).is_err());
+        assert!(
+            s.set_scope_override("client", Some("not-an-ip"), Some(0))
+                .is_err()
+        );
+        assert!(
+            s.set_scope_override("listen", Some("127.0.0.1"), Some(0))
+                .is_err()
+        );
+        assert!(
+            s.set_scope_override("bogus", Some("10.0.0.1"), Some(0))
+                .is_err()
+        );
+        assert!(s.set_scope_override("global", None, Some(99)).is_err());
+        assert!(s.set_scope_override("global", None, Some(1)).is_ok());
+        let client: IpAddr = "10.0.0.1".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        assert_eq!(
+            s.next_scoped(client, local, &all_available).unwrap().name,
+            "b"
+        );
+        assert!(s.set_scope_override("global", None, None).is_ok());
     }
 }

@@ -1407,13 +1407,13 @@ snap_swap.store(Arc::new(snap));    // 控制面读到的永远是完整快照
 
 控制命令（`POST /api/v1/control`，body 形如 `{"cmd":"...","args":{...}}`）：
 
-> **实现状态（2026-10-26）**：已实现 `set_rule`（仅 `rule`，`scope`/`target` 预留未实现）、
+> **实现状态（2026-10-26）**：已实现 `set_rule`（`rule` + `scope`/`target`/`index` 维度覆盖）、
 > `enable_upstream` / `disable_upstream`、`check_upstream`；`close_conn` / `close_all`
 > （无连接表）与 `reload_config`（U5 不做）**未实现**，返回 `{"ok":false,"detail":"不支持的命令…"}`。
 
 | `cmd` | 参数 | 作用 |
 |---|---|---|
-| `set_rule` | `rule`（`scope`/`target` 预留） | 改选路规则 |
+| `set_rule` | `rule`，或 `scope`(global/client/listen) + `target`(ip 或 ip:port) + `index`（`clear=true` 清除） | 改选路规则 / 设置维度强制上游（粘性规则生效，强制目标不可用时回落） |
 | `enable_upstream` / `disable_upstream` | `index` 或 `name` | 启用 / 禁用后端（人工） |
 | `check_upstream` | `index`（可选） | 立即探测（**一次，不重试**） |
 | `close_conn` | `id` 或 `client` | 关闭单条 / 某客户端连接（**未实现**） |

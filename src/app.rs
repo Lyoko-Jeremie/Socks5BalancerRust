@@ -55,15 +55,18 @@ impl AppCtx {
             .next_excluding(&|idx| self.health.is_available(idx), excluded)
     }
 
-    /// 按客户端 hint 选择上游（首次尝试）；`excluded` 非空时按排除规则重试。
+    /// 按客户端/监听维度选择上游（首次尝试）；`excluded` 非空时按排除规则重试。
+    ///
+    /// 维度覆盖（`set_rule scope=client/listen`）与客户端 hint 都在这里生效。
     pub fn pick_upstream_for_client(
         &self,
         client: std::net::IpAddr,
+        local: std::net::SocketAddr,
         excluded: &[usize],
     ) -> Option<&crate::upstream::Upstream> {
         if excluded.is_empty() {
             self.selector
-                .next_for_client(client, &|idx| self.health.is_available(idx))
+                .next_scoped(client, local, &|idx| self.health.is_available(idx))
         } else {
             self.pick_upstream_excluding(excluded)
         }

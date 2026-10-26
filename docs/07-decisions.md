@@ -47,12 +47,12 @@ C++ 版控制面是 `StateMonitorServer`（1146 行）+ `EmbedWebServer`（394 �
 
 | `cmd` | 参数 | 作用 |
 |---|---|---|
-| `set_rule` | `rule`, `scope`(global/client/listen), `target`(ip 或 ip:port) | 改选路规则 |
+| `set_rule` | `rule`，或 `scope`(global/client/listen) + `target`(ip 或 ip:port) + `index`（`clear=true` 清除） | 改选路规则 / 设置维度强制上游（粘性规则生效；C++ `forceNowUseServer` 语义的 Rust 版：强制目标不可用时回落） |
 | `enable_upstream` / `disable_upstream` | `index` 或 `name` | 启用/禁用后端（人工） |
 | `check_upstream` | `index`（可选） | 立即探测（一次，不重试） |
-| `close_conn` | `id` 或 `client` | 关闭单条/某客户端连接 |
-| `close_all` | — | 关闭全部连接 |
-| `reload_config` | — | 可选：热重载（若实现，见 §4 备注） |
+| `close_conn` | `id` 或 `client` | 关闭单条/某客户端连接（**当前未实现**，无连接表） |
+| `close_all` | — | 关闭全部连接（**当前未实现**） |
+| `reload_config` | — | 热重载（U5：**不做**） |
 
 3. **不实现**：鉴权、TLS、CORS（不设置 CORS 头）、`/clientInfo` 全量明细、`/authInfo`、`/delayInfo` 原始序列、静态文件服务（原 `EmbedWebServer` 整体不移植）。
 4. **不返回敏感信息**：响应中**绝不**出现客户端密码、base64 认证串、上游密码。这条与"不鉴权"无关——即使只绑回环也不返回凭据。

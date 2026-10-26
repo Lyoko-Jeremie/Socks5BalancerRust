@@ -152,10 +152,11 @@ async fn control(
 
 /// 执行控制命令；返回 `(是否成功, 说明)`。
 ///
-/// 支持的命令（精简集，ADR-001）：
+/// 支持的命令（精简集，ADR-001 + 维度扩展）：
 /// - `check_upstream`：立即探测一次（`args.index` 可选，缺省=全部）；
 /// - `enable_upstream` / `disable_upstream`：人工启停（`args.index` 或 `args.name`）；
-/// - `set_rule`：切换选路规则（`args.rule`）。
+/// - `set_rule`：切换选路规则（`args.rule`），或设置维度强制上游
+///   （`args.scope` = global/client/listen、`args.target`、`args.index`；`clear=true` 清除）。
 fn execute(ctx: &Arc<AppCtx>, cmd: &str, args: &Value) -> (bool, String) {
     match cmd {
         "check_upstream" => {
@@ -209,13 +210,51 @@ fn execute(ctx: &Arc<AppCtx>, cmd: &str, args: &Value) -> (bool, String) {
             }
         }
         "set_rule" => {
-            let rule = args.get("rule").and_then(Value::as_str).unwrap_or("");
-            match SelectRule::parse(rule) {
-                Some(rule) => {
-                    ctx.selector.set_rule(rule);
-                    (true, format!("选路规则已切换为 {}", rule.as_str()))
+            let mut messages: Vec<String> = Vec::new();
+            // 1) 全局规则（可选）
+            if let Some(rule_raw) = args.get("rule").and_then(Value::as_str) {
+                match SelectRule::parse(rule_raw) {
+                    Some(rule) => {
+                        ctx.selector.set_rule(rule);
+                        messages.push(format!("选路规则已切换为 {}", rule.as_str()));
+                    }
+                    None => return (false, format!("未知规则: {rule_raw}")),
                 }
-                None => (false, format!("未知规则: {rule}")),
+            }
+            // 2) 维度强制覆盖（可选）：scope + target + index；clear=true 表示清除
+            if let Some(scope) = args.get("scope").and_then(Value::as_str) {
+                let clear = args.get("clear").and_then(Value::as_bool).unwrap_or(false);
+                let target = args.get("target").and_then(Value::as_str);
+                let index = if clear {
+                    None
+                } else {
+                    match args.get("index").and_then(Value::as_u64) {
+                        Some(v) => Some(v as usize),
+                        None => {
+                            return (
+                                false,
+                                "设置维度覆盖需要 args.index（清除请用 clear=true）".to_string(),
+                            );
+                        }
+                    }
+                };
+                match ctx.selector.set_scope_override(scope, target, index) {
+                    Ok(msg) => messages.push(msg),
+                    Err(e) => return (false, e),
+                }
+            } else if args.get("index").is_some() {
+                return (
+                    false,
+                    "设置维度覆盖需要 args.scope（global/client/listen）".to_string(),
+                );
+            }
+            if messages.is_empty() {
+                (
+                    false,
+                    "set_rule 需要 args.rule，或 scope+target+index（clear=true 清除）".to_string(),
+                )
+            } else {
+                (true, messages.join("；"))
             }
         }
         _ => (
@@ -437,6 +476,48 @@ mod tests {
         assert_eq!(ctx.selector.rule(), SelectRule::Loop);
         let (ok, _) = execute(&ctx, "set_rule", &json!({"rule": "nope"}));
         assert!(!ok);
+    }
+
+    #[test]
+    fn set_rule_维度覆盖命令() {
+        let ctx = test_ctx();
+        // 切到粘性规则，覆盖才生效
+        let (ok, _) = execute(&ctx, "set_rule", &json!({"rule": "one_by_one"}));
+        assert!(ok);
+        // client 维度
+        let (ok, detail) = execute(
+            &ctx,
+            "set_rule",
+            &json!({"scope": "client", "target": "10.0.0.9", "index": 1}),
+        );
+        assert!(ok, "{detail}");
+        // listen 维度
+        let (ok, detail) = execute(
+            &ctx,
+            "set_rule",
+            &json!({"scope": "listen", "target": "127.0.0.1:5500", "index": 0}),
+        );
+        assert!(ok, "{detail}");
+        // 清除 client 覆盖
+        let (ok, detail) = execute(
+            &ctx,
+            "set_rule",
+            &json!({"scope": "client", "target": "10.0.0.9", "clear": true}),
+        );
+        assert!(ok, "{detail}");
+        // 参数校验
+        let (ok, _) = execute(&ctx, "set_rule", &json!({"scope": "client", "index": 1}));
+        assert!(!ok, "client 维度缺 target 应失败");
+        let (ok, _) = execute(
+            &ctx,
+            "set_rule",
+            &json!({"scope": "bogus", "target": "1.2.3.4", "index": 0}),
+        );
+        assert!(!ok, "未知 scope 应失败");
+        let (ok, _) = execute(&ctx, "set_rule", &json!({"index": 1}));
+        assert!(!ok, "只有 index 缺 scope 应失败");
+        let (ok, _) = execute(&ctx, "set_rule", &json!({}));
+        assert!(!ok, "空参数应失败");
     }
 
     #[test]

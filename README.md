@@ -83,6 +83,14 @@ curl http://127.0.0.1:5110/api/v1/status
 curl -X POST -H "Content-Type: application/json" \
   -d '{"cmd":"set_rule","args":{"rule":"loop"}}' http://127.0.0.1:5110/api/v1/control
 
+# 对某客户端强制使用上游 1（粘性规则下生效；把 clear 设为 true 可清除）
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"cmd":"set_rule","args":{"scope":"client","target":"10.0.0.5","index":1}}' http://127.0.0.1:5110/api/v1/control
+
+# 对某个监听地址强制使用上游 0（scope 也可为 global）
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"cmd":"set_rule","args":{"scope":"listen","target":"127.0.0.1:5000","index":0}}' http://127.0.0.1:5110/api/v1/control
+
 # 人工禁用/启用某个上游（index 或 name）
 curl -X POST -H "Content-Type: application/json" \
   -d '{"cmd":"disable_upstream","args":{"index":0}}' http://127.0.0.1:5110/api/v1/control
