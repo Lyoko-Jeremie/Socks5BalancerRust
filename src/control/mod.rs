@@ -318,6 +318,7 @@ fn upstreams_json(ctx: &Arc<AppCtx>) -> Value {
                 "failures": h.map(|h| h.failures).unwrap_or(0),
                 "tlsFailures": h.map(|h| h.tls_failures).unwrap_or(0),
                 "backoffMs": h.map(|h| h.backoff_ms).unwrap_or(0),
+                "rttMs": h.map(|h| h.rtt_ms).unwrap_or(0),
             })
         })
         .collect();

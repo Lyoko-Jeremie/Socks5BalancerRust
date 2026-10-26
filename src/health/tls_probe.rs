@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use http_body_util::BodyExt;
 use http_body_util::Empty;
 use hyper::Request;
 use hyper::body::Bytes;
@@ -21,6 +22,15 @@ use tokio_socks::tcp::Socks5Stream;
 
 use crate::config::TlsProbeConfig;
 use crate::upstream::Upstream;
+
+/// 一次 readiness 探测的结果（ADR-006 #1：读完整响应并记录 RTT）。
+#[derive(Debug, Clone, Copy)]
+pub struct ProbeOutcome {
+    /// HTTP 响应状态码。
+    pub status: u16,
+    /// 从发出请求到读完响应体的往返耗时。
+    pub rtt: std::time::Duration,
+}
 
 /// 探测失败原因（便于日志分类）。
 #[derive(Debug, thiserror::Error)]
@@ -37,8 +47,8 @@ pub enum ProbeError {
     InvalidTarget(String),
 }
 
-/// 通过上游建立到探测目标的隧道，完成 TLS + HTTP GET，返回 HTTP 状态码。
-pub async fn probe(upstream: &Upstream, cfg: &TlsProbeConfig) -> Result<u16, ProbeError> {
+/// 通过上游建立到探测目标的隧道，完成 TLS + HTTP GET，返回状态码与 RTT。
+pub async fn probe(upstream: &Upstream, cfg: &TlsProbeConfig) -> Result<ProbeOutcome, ProbeError> {
     // 1) 上游 SOCKS5 隧道（域名交给上游解析）
     let target = tokio_socks::TargetAddr::Domain(cfg.host.clone().into(), cfg.port);
     let stream = match upstream_creds(upstream) {
@@ -79,14 +89,23 @@ pub async fn probe(upstream: &Upstream, cfg: &TlsProbeConfig) -> Result<u16, Pro
         .body(Empty::<Bytes>::new())
         .map_err(|e| ProbeError::Http(format!("构造请求失败: {e}")))?;
 
+    let started = std::time::Instant::now();
     let response = sender
         .send_request(request)
         .await
         .map_err(|e| ProbeError::Http(format!("发送请求失败: {e}")))?;
     let status = response.status().as_u16();
-    // 不读 body：readiness 只关心能否拿到响应头
+    // ADR-006 #1：读完整响应体（只关心"能否完成一次 HTTP 往返"，内容本身不校验）。
+    // 整个 probe 由调用方的 `timeout(tls.timeout, ...)` 兜底，异常大/慢响应会超时失败。
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| ProbeError::Http(format!("读取响应体失败: {e}")))?;
+    let _ = body.to_bytes();
+    let rtt = started.elapsed();
     conn_task.abort();
-    Ok(status)
+    Ok(ProbeOutcome { status, rtt })
 }
 
 /// 构建 TLS 客户端配置：默认系统根证书；`caFile` 指定时使用自定义 PEM 信任根。
@@ -132,13 +151,10 @@ fn host_header(host: &str, port: u16) -> String {
     }
 }
 
-/// 状态码判定：`expect_status` 为空时接受 2xx/3xx；否则精确匹配列表。
+/// 状态码判定：`expect_status` 为空时**不校验状态码**（只要完成一次 HTTP 往返即通过，
+/// 对齐 C++ `ConnectTestHttps` 与 ADR-006 #5）；否则精确匹配列表。
 pub fn status_acceptable(status: u16, expect_status: &[u16]) -> bool {
-    if expect_status.is_empty() {
-        (200..400).contains(&status)
-    } else {
-        expect_status.contains(&status)
-    }
+    expect_status.is_empty() || expect_status.contains(&status)
 }
 
 #[cfg(test)]
@@ -146,14 +162,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 状态码默认接受_2xx_3xx() {
-        assert!(status_acceptable(200, &[]));
-        assert!(status_acceptable(204, &[]));
-        assert!(status_acceptable(301, &[]));
-        assert!(status_acceptable(399, &[]));
-        assert!(!status_acceptable(199, &[]));
-        assert!(!status_acceptable(400, &[]));
-        assert!(!status_acceptable(502, &[]));
+    fn 状态码默认为不校验() {
+        // 空 expectStatus = 不校验：4xx/5xx 也说明 HTTP 往返成功
+        for status in [200, 204, 301, 399, 404, 500, 503] {
+            assert!(
+                status_acceptable(status, &[]),
+                "status={status} 在空 expectStatus 下应通过"
+            );
+        }
     }
 
     #[test]

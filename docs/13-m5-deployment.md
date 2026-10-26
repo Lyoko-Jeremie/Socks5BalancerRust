@@ -102,7 +102,8 @@ Rust 版**直接兼容** C++ `config.json` 的主要字段（camelCase），包�
 | 错误应答 | 上游失败后下游常无错误码 | 失败回具体 REP / 5B / 502 | 客户端行为更可预期 |
 | 健康检查 | 连续失败计数 + 防抖 | **fail-fast**（一次失败即 DOWN）+ 指数退避 | 故障切换更快，但探测抖动更敏感（可调 `healthCheck.tcp.period`） |
 | 全上游 DOWN | 继续尝试（黑洞） | 立即回 REP 0x01 | 客户端快速失败 |
-| TLS 探测 | `ConnectTestHttps` 默认 `www.google.com:443` | `healthCheck.target` **必配**（不配则只做 TCP） | 迁移时需显式配置 target |
+| TLS 探测 | `ConnectTestHttps` 默认 `www.google.com:443` | `healthCheck.target` **必配**（不配则只做 TCP）；`expectStatus` 为空时**不校验状态码**（对齐 C++，只看能否完成 HTTP 往返） | 迁移时需显式配置 target |
+| `disableConnectTest` | 跳过全部健康检查，只看人工禁用 | **相同语义**：不探测、数据面失败也不降级 | 一致 |
 | 控制面 | 十余端点 + 内置前端 | **4 端点**，无前端 | 原有 `/op?xxx`、`/clientInfo` 等调用需改写 |
 | 控制面鉴权 | 无 | 无（同），但响应剔除密码 + 默认回环 | 同 C++ |
 | `slowImpl` | 存在（兼容不标准上游） | **未实现** | 若上游非常规，先验证 |

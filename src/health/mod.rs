@@ -51,6 +51,8 @@ struct Entry {
     tls_backoff_ms: AtomicU64,
     /// readiness 连续失败次数。
     tls_failures: AtomicU64,
+    /// 最近一次探测的 RTT（毫秒；0 = 尚未测到）。
+    last_rtt_ms: AtomicU64,
     /// 探测提前唤醒（控制面 `check_upstream`）。
     probe_notify: tokio::sync::Notify,
 }
@@ -70,6 +72,8 @@ pub struct HealthSnapshot {
     pub tls_failures: u64,
     /// TCP 当前退避。
     pub backoff_ms: u64,
+    /// 最近一次探测的 RTT（毫秒；0 = 尚未测到）。
+    pub rtt_ms: u64,
 }
 
 /// 上游健康注册表。
@@ -100,6 +104,7 @@ impl HealthRegistry {
                 tls_next_probe_ms: AtomicU64::new(0),
                 tls_backoff_ms: AtomicU64::new(initial_backoff.max(1)),
                 tls_failures: AtomicU64::new(0),
+                last_rtt_ms: AtomicU64::new(0),
                 probe_notify: tokio::sync::Notify::new(),
             })
             .collect();
@@ -165,6 +170,7 @@ impl HealthRegistry {
                     failures: e.tcp_failures.load(Ordering::Relaxed),
                     tls_failures: e.tls_failures.load(Ordering::Relaxed),
                     backoff_ms: e.tcp_backoff_ms.load(Ordering::Relaxed),
+                    rtt_ms: e.last_rtt_ms.load(Ordering::Relaxed),
                 }
             })
             .collect()
@@ -227,14 +233,17 @@ impl HealthRegistry {
         }
     }
 
-    /// 记录一次 TCP liveness 探测结果。
-    fn record_tcp(&self, idx: usize, ok: bool) {
+    /// 记录一次 TCP liveness 探测结果（`rtt_ms` 为连接耗时）。
+    fn record_tcp(&self, idx: usize, ok: bool, rtt_ms: u64) {
         let Some(entry) = self.entries.get(idx) else {
             return;
         };
         if ok {
             let was_available = self.is_available(idx);
             entry.liveness.store(true, Ordering::Release);
+            if rtt_ms > 0 {
+                entry.last_rtt_ms.store(rtt_ms, Ordering::Relaxed);
+            }
             // 未启用 readiness 探测时，readiness 不适用，视为通过
             if self.cfg.tls.is_none() {
                 entry.readiness.store(true, Ordering::Release);
@@ -291,14 +300,17 @@ impl HealthRegistry {
         }
     }
 
-    /// 记录一次 readiness（TLS + HTTP）探测结果。
-    fn record_readiness(&self, idx: usize, ok: bool) {
+    /// 记录一次 readiness（TLS + HTTP）探测结果（`rtt_ms` 为 HTTP 往返耗时）。
+    fn record_readiness(&self, idx: usize, ok: bool, rtt_ms: u64) {
         let Some(entry) = self.entries.get(idx) else {
             return;
         };
         if ok {
             let was_available = self.is_available(idx);
             entry.readiness.store(true, Ordering::Release);
+            if rtt_ms > 0 {
+                entry.last_rtt_ms.store(rtt_ms, Ordering::Relaxed);
+            }
             entry.tls_failures.store(0, Ordering::Relaxed);
             entry.tls_backoff_ms.store(
                 self.cfg.backoff_initial.as_millis() as u64,
@@ -386,11 +398,17 @@ impl HealthRegistry {
                     return;
                 }
                 let addr = reg.entries[idx].addr;
+                let started = Instant::now();
                 let ok = matches!(
                     tokio::time::timeout(reg.cfg.timeout, TcpStream::connect(addr)).await,
                     Ok(Ok(_))
                 );
-                reg.record_tcp(idx, ok);
+                let rtt_ms = if ok {
+                    started.elapsed().as_millis() as u64
+                } else {
+                    0
+                };
+                reg.record_tcp(idx, ok, rtt_ms);
             }
         });
     }
@@ -411,7 +429,7 @@ impl HealthRegistry {
                 }
                 if !reg.entries[idx].liveness.load(Ordering::Relaxed) {
                     // TCP 都不通，无需做 readiness 探测
-                    reg.record_readiness(idx, false);
+                    reg.record_readiness(idx, false, 0);
                     continue;
                 }
                 let upstream = Upstream {
@@ -424,7 +442,7 @@ impl HealthRegistry {
                     health_index: idx,
                     enabled: true,
                 };
-                let ok = {
+                let (ok, rtt_ms) = {
                     let _permit = reg.probe_permits.acquire().await;
                     match tokio::time::timeout(
                         tls_cfg.timeout,
@@ -432,12 +450,13 @@ impl HealthRegistry {
                     )
                     .await
                     {
-                        Ok(Ok(status)) => {
-                            tls_probe::status_acceptable(status, &tls_cfg.expect_status)
-                        }
+                        Ok(Ok(outcome)) => (
+                            tls_probe::status_acceptable(outcome.status, &tls_cfg.expect_status),
+                            outcome.rtt.as_millis() as u64,
+                        ),
                         Ok(Err(e)) => {
                             debug!(upstream = %upstream.name, error = %e, "readiness 探测失败");
-                            false
+                            (false, 0)
                         }
                         Err(_) => {
                             debug!(
@@ -445,11 +464,11 @@ impl HealthRegistry {
                                 timeout_ms = tls_cfg.timeout.as_millis() as u64,
                                 "readiness 探测超时"
                             );
-                            false
+                            (false, 0)
                         }
                     }
                 };
-                reg.record_readiness(idx, ok);
+                reg.record_readiness(idx, ok, rtt_ms);
             }
         });
     }
@@ -550,9 +569,18 @@ mod tests {
     }
 
     #[test]
+    fn 探测结果记录_rtt() {
+        let reg = HealthRegistry::new(&[upstream("a", 1)], cfg());
+        reg.record_tcp(0, true, 12);
+        assert_eq!(reg.snapshot()[0].rtt_ms, 12);
+        reg.record_readiness(0, true, 34);
+        assert_eq!(reg.snapshot()[0].rtt_ms, 34);
+    }
+
+    #[test]
     fn fail_fast_一次失败立即_down() {
         let reg = HealthRegistry::new(&[upstream("a", 1)], cfg());
-        reg.record_tcp(0, false);
+        reg.record_tcp(0, false, 0);
         assert!(!reg.is_available(0));
         assert_eq!(reg.available_count(), 0);
         assert_eq!(reg.snapshot()[0].failures, 1);
@@ -562,23 +590,23 @@ mod tests {
     #[test]
     fn 失败后指数退避并封顶() {
         let reg = HealthRegistry::new(&[upstream("a", 1)], cfg());
-        reg.record_tcp(0, false);
+        reg.record_tcp(0, false, 0);
         assert_eq!(reg.snapshot()[0].backoff_ms, 200);
-        reg.record_tcp(0, false);
+        reg.record_tcp(0, false, 0);
         assert_eq!(reg.snapshot()[0].backoff_ms, 400);
-        reg.record_tcp(0, false);
+        reg.record_tcp(0, false, 0);
         assert_eq!(reg.snapshot()[0].backoff_ms, 500);
-        reg.record_tcp(0, false);
+        reg.record_tcp(0, false, 0);
         assert_eq!(reg.snapshot()[0].backoff_ms, 500);
     }
 
     #[test]
     fn tcp_探测成功恢复并重置退避() {
         let reg = HealthRegistry::new(&[upstream("a", 1)], cfg());
-        reg.record_tcp(0, false);
-        reg.record_tcp(0, false);
+        reg.record_tcp(0, false, 0);
+        reg.record_tcp(0, false, 0);
         assert!(!reg.is_available(0));
-        reg.record_tcp(0, true);
+        reg.record_tcp(0, true, 0);
         assert!(reg.is_available(0));
         assert_eq!(reg.snapshot()[0].failures, 0);
         assert_eq!(reg.snapshot()[0].backoff_ms, 100);
@@ -587,14 +615,14 @@ mod tests {
     #[test]
     fn readiness_失败导致不可用_liveness_仍为真() {
         let reg = HealthRegistry::new(&[upstream("a", 1)], cfg());
-        reg.record_readiness(0, false);
+        reg.record_readiness(0, false, 0);
         let s = reg.snapshot().into_iter().next().unwrap();
         assert!(!s.available);
         assert!(s.liveness);
         assert!(!s.readiness);
         assert_eq!(s.tls_failures, 1);
         // readiness 恢复 → 整体恢复
-        reg.record_readiness(0, true);
+        reg.record_readiness(0, true, 0);
         assert!(reg.is_available(0));
         assert_eq!(reg.snapshot()[0].tls_failures, 0);
     }
