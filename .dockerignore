@@ -1,0 +1,41 @@
+# Docker 构建上下文裁剪
+#
+# Dockerfile 只显式 COPY Cargo.toml、Cargo.lock、src/、examples/，
+# 其余内容都会白白进入 docker build 上下文（本仓库 target/ 曾达 5.8GB）。
+# 这里把构建无关的大目录全部排除，保持上下文只有几十 MB。
+
+# Rust 构建产物与增量缓存（最大的体积来源）
+target
+target/
+**/target/
+
+# Git 元数据与本地分析/编辑器产物
+.git
+.git/
+.gitignore
+.gitattributes
+.analysis/
+.idea/
+.vscode/
+*.log
+
+# 文档与仓库治理文件（不参与镜像构建）
+docs/
+.github/
+AGENTS.md
+
+# 独立 workspace：fuzz 有自己的 Cargo.lock，不参与镜像
+fuzz/
+
+# 本地开发配置与部署资产（镜像内配置由挂载提供）
+config.json
+configs/
+deploy/
+
+# 压测/冒烟脚本（仅运维使用）
+scripts/
+
+# 系统垃圾文件（Windows / macOS / Linux）
+Thumbs.db
+desktop.ini
+.DS_Store
