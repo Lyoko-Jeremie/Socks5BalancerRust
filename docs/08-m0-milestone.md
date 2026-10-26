@@ -158,7 +158,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/m0-smoke.ps1 -Connec
 1. **仅纯 TCP 透传**：不做首包识别、不支持 HTTP 代理、不需要 SOCKS5 协商（下游 SOCKS5 字节会原样转给上游 SOCKS5 代理，因此"下游 SOCKS5 → 上游 SOCKS5"已可用）。
 2. **无健康检查、无选路规则**：仅 round-robin，启动时解析一次上游地址；上游宕机后连接会失败（有 connect 超时）。
 3. **无控制面/无统计接口**：仅本地日志（30s 一次摘要）。
-4. **未在 Linux 上运行验证**：代码已用 `cfg` 分隔平台差异（REUSEADDR/REUSEPORT），但本机仅有 Windows 环境；Linux CI 需在 M1 补齐。
+4. **未在 Linux 上运行验证**：代码已用 `cfg` 分隔平台差异（REUSEADDR/REUSEPORT），但本机仅有 Windows 环境；已提供 `.github/workflows/ci.yml`（Linux/Windows 双平台），Linux 实测仍需在 GitHub Actions 或真机执行后回填。
 5. **未验证信号优雅关闭**：Windows 下 `Ctrl-C` 需交互式控制台；当前以"取消令牌 + 单元测试"覆盖取消路径，信号路径留给 Linux CI。
 6. **`SO_RCVBUF/SO_SNDBUF` 只设置在 listener 上**：Linux 会被 accepted socket 继承，Windows 不会；M1 在 accepted 连接上再设置一次（需要 raw socket 访问，计划引入 socket2 的 `SockRef` 并验证平台支持）。
 
@@ -200,7 +200,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/m0-smoke.ps1 -Connec
 3. **选路规则**：`loop`/`random`/`one_by_one`/`change_by_time`/`force_only_one` + hint 粘性（无锁结构）。
 4. **健康检查**（ADR-002）：TCP 探活 + fail-fast、DOWN 指数退避、数据面失败即时降级、目标与时间可配；`hickory-resolver` 做 TTL 解析。
 5. **控制面最小集**（M3 提前做骨架）：`/healthz` + `/api/v1/status`。
-6. **Linux CI**：双平台构建、单元测试、冒烟脚本（bash 版）。
+6. **Linux CI**：已提供 `.github/workflows/ci.yml`（双平台构建、单元测试、Linux 冒烟脚本 bash 版）。
 
 ---
 

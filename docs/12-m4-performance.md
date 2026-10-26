@@ -121,4 +121,4 @@ BUFFER_SIZE=8192 ./scripts/loadtest-linux.sh      # 8K 性能口径
 1. 在 Linux 上跑 `loadtest-linux.sh`，用实测值回填本文 §3/§4（并把 ADR-005 的固定开销改为平台相关）。
 2. M4 剩余：24h 长稳、`bufferSize` 自适应（按 `maxConnections` 选 2K/4K/8K）评估。
 3. M5：Dockerfile/systemd/迁移说明。
-4. Linux CI：`cargo test` + 冒烟脚本（bash 版）。
+4. Linux CI：已提供 `.github/workflows/ci.yml`（Linux/Windows 双平台，含 `cargo test` 与 `scripts/ci-linux.sh` 冒烟），首次运行结果待回填。

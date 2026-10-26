@@ -2,8 +2,8 @@
 
 > 日期：2026-10-26
 > 对应计划：[06-rust-port-assessment.md](06-rust-port-assessment.md) §10 的 **M5**
-> 交付物：`Dockerfile`、`deploy/socks5balancer.service`、`deploy/config.example.json`、
-> `scripts/ci-linux.sh`、`scripts/loadtest-linux.sh`
+> 交付物：`Dockerfile`、`.dockerignore`、`deploy/socks5balancer.service`、`deploy/config.example.json`、
+> `scripts/ci-linux.sh`、`scripts/loadtest-linux.sh`、`.github/workflows/ci.yml`、`fuzz/`
 > 决策依据：[07-decisions.md](07-decisions.md)（ADR-001 控制面、ADR-003 线程、ADR-005 内存）
 
 ---
@@ -18,6 +18,9 @@
 | `scripts/ci-linux.sh` | Linux CI：fmt/clippy/test/release + 控制面冒烟 |
 | `scripts/loadtest-linux.sh` | Linux C10K / 1K/s 压测（见 [12](12-m4-performance.md)） |
 | `scripts/m4-memory.ps1` | Windows 内存基线实测 |
+| `.github/workflows/ci.yml` | GitHub Actions CI：Windows/Linux 双平台 `fmt`/`clippy`/`test`，Linux 追加 release 构建与冒烟，另含独立编码检查 job |
+| `.dockerignore` | 裁剪 Docker 构建上下文（排除 `target/`、`.git/`、`docs/` 等） |
+| `fuzz/` | cargo-fuzz 目标（SOCKS5 / HTTP / SOCKS4 解析）；需 nightly，CI 不运行（见 `fuzz/README.md`） |
 
 ---
 
@@ -195,3 +198,4 @@ fs.file-max = 1000000
 1. Linux 上执行 `scripts/ci-linux.sh` 与 `scripts/loadtest-linux.sh`，回填 [12](12-m4-performance.md) 实测值。
 2. 24h 长稳（RSS/fd/内存泄漏/上游切换次数）。
 3. 若需要 `close_all`/热重载，按 07 U5 决策后补控制面命令。
+4. GitHub Actions 首次运行后回填 CI 结果与耗时（`.github/workflows/ci.yml`）。

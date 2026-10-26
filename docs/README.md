@@ -42,7 +42,7 @@
 阅读顺序建议：**01 → 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09 → 10 → 11 → 12 → 13**。
 只想快速决策：读本文 §3/§4/§5；准备动手写代码：读 **07（决策）+ 02 §8 + 06 §7**。
 
-> **当前进度（2026-10-26）**：**M0 ✅；M1（M1.1–M1.5）✅；M2 ✅；M3 ✅；M4 内存基线 ✅；M5 交付物 ✅（待 Linux 实测回填）**。已实现：SOCKS5 入站 0x00/0x02（RFC1929、CONNECT、错误码回传）、上游 SOCKS5 握手（含上游认证）、5 条选路规则、fail-fast 健康检查（DOWN 指数退避 + 数据面降级 + 快速重探）、TLS + HTTP readiness 探测、混合端口（SOCKS5 / SOCKS4-4a / HTTP CONNECT / HTTP forward）、精简控制面（4 端点、运行期启停/改规则/立即探测、无鉴权仅回环、响应不含密码）。端到端验收：协议 10/10、健康检查 6/6、TLS readiness 9/9、混合协议 9/9、控制面 19/19；单元测试 **75** 个全绿；**内存实测：`bufferSize=2048` 下 10K 空闲连接推算 ≈ 98.5 MB（Windows 口径，临界达标；Linux 预计 ~69 MB）**。交付物：Dockerfile、systemd 单元、生产配置、Linux CI 与 C10K 压测脚本。**下一步：Linux C10K/1K 实测、24h 长稳、用实测回填 12 号文档**。详见 [13-m5-deployment.md](13-m5-deployment.md)。
+> **当前进度（2026-10-26）**：**M0 ✅；M1（M1.1–M1.5）✅；M2 ✅；M3 ✅；M4 内存基线 ✅；M5 交付物 ✅（待 Linux 实测回填）**。已实现：SOCKS5 入站 0x00/0x02（RFC1929、CONNECT、错误码回传）、上游 SOCKS5 握手（含上游认证）、5 条选路规则、fail-fast 健康检查（DOWN 指数退避 + 数据面降级 + 快速重探）、TLS + HTTP readiness 探测、混合端口（SOCKS5 / SOCKS4-4a / HTTP CONNECT / HTTP forward）、精简控制面（4 端点、运行期启停/改规则/立即探测、无鉴权仅回环、响应不含密码）。端到端验收：协议 10/10、健康检查 6/6、TLS readiness 9/9、混合协议 9/9、控制面 19/19；单元测试 **75** 个全绿；**内存实测：`bufferSize=2048` 下 10K 空闲连接推算 ≈ 98.5 MB（Windows 口径，临界达标；Linux 预计 ~69 MB）**。交付物：Dockerfile、systemd 单元、生产配置、`.github/workflows/ci.yml`（Linux/Windows 双平台 CI）、Linux C10K 压测脚本。**下一步：Linux C10K/1K 实测、24h 长稳、用实测回填 12 号文档**。详见 [13-m5-deployment.md](13-m5-deployment.md)。
 
 > **2026-10-26 修订**：用户已就 7 项关键取舍作出决策（控制面精简不鉴权、健康检查 fail-fast 不重试且异常后端降频、线程数可配置、SOCKS5 仅 0x00/0x02、双向 8K 预分配、TLS 探测对齐 C++、优先成熟库），已固化为 [07-decisions.md](07-decisions.md)，并同步修订 01/02/04/05/06 的"Rust 建议"部分。C++ 现状分析部分不变。
 
@@ -164,7 +164,7 @@
 
 - 全部源码、配置、文档 **UTF-8（无 BOM）**，换行 LF；
 - 注释用中文，标识符/API 名保留英文；
-- 跨平台：Windows + Linux 必须同时通过 CI；
+- 跨平台：Windows + Linux 必须同时通过 CI（已提供 `.github/workflows/ci.yml`：双平台 `fmt`/`clippy`/`test`，Linux 追加 release 构建与 `scripts/ci-linux.sh` 冒烟，另有独立的 UTF-8 无 BOM / LF 编码检查 job）；
 - 优先使用成熟 crate（见 [06](06-rust-port-assessment.md) §5.2）；
 - 性能敏感函数避免锁与分配，遵循 [02](02-relay-core.md) §8 的约束与 [06](06-rust-port-assessment.md) §7 的 10 条数据面规则。
 
