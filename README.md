@@ -98,6 +98,16 @@ curl -X POST -H "Content-Type: application/json" \
 # 立即探测一次
 curl -X POST -H "Content-Type: application/json" \
   -d '{"cmd":"check_upstream","args":{"index":0}}' http://127.0.0.1:5110/api/v1/control
+
+# 连接监测（默认开启明细）：查看当前连接与三维度摘要
+curl http://127.0.0.1:5110/api/v1/connections
+curl http://127.0.0.1:5110/api/v1/connections/summary
+
+# 中断某客户端 / 某监听 / 全部连接（需明细，默认开启）
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"cmd":"close_conn","args":{"client":"10.0.0.5"}}' http://127.0.0.1:5110/api/v1/control
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"cmd":"close_all"}' http://127.0.0.1:5110/api/v1/control
 ```
 
 ## 关键配置项
@@ -120,12 +130,22 @@ curl -X POST -H "Content-Type: application/json" \
 | `disableSocks4` | `false` | 禁用 SOCKS4/4a 入站 |
 | `disableHttpForward` | `false` | 禁用 HTTP 正向代理（absolute-form）；此时回 `501 + Allow: CONNECT`，CONNECT 不受影响 |
 | `stateServerHost/Port` | `127.0.0.1` / `5110` | 控制面地址；`0` 表示禁用 |
+| `monitorServerHost/Port` | 未配置（复用控制面） | 监控端点独立监听（只读，不含 `/control` 写命令）；不配或 `monitorServerPort=0` 时与控制面共用监听 |
+| `connectionTracking` | 启用且明细开启 | 连接监测：`enabled`/`detail`/`detailLimit`/`clientTopLimit`；`detail=false` 只保留三维度计数（`/connections` 为空） |
 | `healthCheck.tcp` | period 5000 / timeout 2000 | TCP 探活周期与超时（一次失败即 DOWN） |
 | `healthCheck.target` | 未配置 | TLS/HTTP readiness 目标（如 `{"host":"www.example.com","port":443}`），不配则只做 TCP |
 | `sleepTime` | 未配置 | 最近该时长（毫秒）无新连接则暂停常规探测；DOWN 后端仍按退避重探 |
 | `additionCheckPeriod` | 未配置 | 全池不可用时按该周期（毫秒）加速探测 |
 
 > 完整字段：`config.example.json`（开发）与 `deploy/config.example.json`（生产）。
+
+## 连接监测（简要）
+
+- **默认开启每连接明细**（与 C++ 的会话表行为接近）：`GET /api/v1/connections` 支持按 `client` / `listen` / `upstream` 过滤，`cursor` + `limit` 分页；`GET /api/v1/connections/summary` 返回按上游/客户端/监听三维度的连接数。
+- **内存代价**：明细约 100–150 B/连接（10K 连接约 1.5–2 MB）；100MB 口径压测可设 `connectionTracking.detail: false`，只保留三维度计数（约几十 KB），`/connections` 返回空列表。
+- **中断连接**：`close_conn`（按 `id` / `client` / `listen` / `upstream`）与 `close_all` 需要 `detail: true`；只关闭命中的连接，其它连接不受影响。
+- **独立监控监听**：配置 `monitorServerHost` / `monitorServerPort` 后，监控端点使用单独端口（只读，**不提供** `/api/v1/control`）；不配置则挂在控制面监听上。
+- **安全**：监控端点同样**无鉴权**、默认回环；暴露到网络前请自行加访问控制（防火墙/反代鉴权）。
 
 ## 常见问题
 

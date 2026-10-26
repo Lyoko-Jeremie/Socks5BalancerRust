@@ -96,7 +96,8 @@ Rust 版**直接兼容** C++ `config.json` 的主要字段（camelCase），包�
 `listenHost/listenPort/multiListen`、`upstream[]`（name/host/port/disable/authUser/authPwd；`disable: true` 表示禁用该上游）、
 `authClientInfo[]`、`stateServerHost/Port`、`threadNum`、`logLevel`、
 `upstreamSelectRule`、`serverChangeTime`、`traditionTcpRelay`、`disableSocks4`、`disableHttpForward`、
-`bufferSize`、`maxConnections`、`connectTimeout`、`healthCheck.*`、`dnsTtl`、`sleepTime`、`additionCheckPeriod`。
+`bufferSize`、`maxConnections`、`connectTimeout`、`healthCheck.*`、`dnsTtl`、`sleepTime`、`additionCheckPeriod`、
+`connectionTracking.*`（连接监测，默认明细开启）、`monitorServerHost/Port`（监控端点独立监听）。
 
 启动时会打印"配置提示"，列出被忽略或语义变化的字段。
 
@@ -113,8 +114,9 @@ Rust 版**直接兼容** C++ `config.json` 的主要字段（camelCase），包�
 | `disableHttpForward` | 无此开关 | 新增：禁用 HTTP 正向代理（absolute-form 回 `501 + Allow: CONNECT`），CONNECT 不受影响 | 按需开启 |
 | 控制面 `set_rule` | 仅查询串改全局规则 | 支持 `scope`(global/client/listen)+`target`+`index` 维度强制上游，`clear=true` 清除 | 更细粒度 |
 | `sleepTime` / `additionCheckPeriod` | 存在 | 已实现：空闲时暂停常规探测 / 全池不可用时加速探测 | 语义对齐 |
-| 控制面 | 十余端点 + 内置前端 | **4 端点**，无前端 | 原有 `/op?xxx`、`/clientInfo` 等调用需改写 |
+| 控制面 | 十余端点 + 内置前端 | **4 基础端点 + 2 连接监测端点**，无前端 | 原有 `/op?xxx`、`/clientInfo` 等调用需改写 |
 | 控制面鉴权 | 无 | 无（同），但响应剔除密码 + 默认回环 | 同 C++ |
+| 连接监测 | 会话表 + `/clientInfo`/`/listenInfo`/`/authInfo` | `connectionTracking`（默认明细开启）+ `/api/v1/connections`、`/summary`；`close_conn`/`close_all` 按 `id`/client/listen/upstream 中断；监控端点可独立监听（只读） | 等价的按维度查询与中断，参数契约不同 |
 | `slowImpl` | 存在（兼容不标准上游） | **未实现** | 若上游非常规，先验证 |
 | 入站认证 | 仅增强模式支持三协议 | **默认即支持**：SOCKS5 0x02 / SOCKS4 USERID / HTTP Basic（失败回 5C / 407） | 配置 `authClientInfo` 即生效 |
 | 上游 `disable: true` | 该上游不进池 | 保留在池中（`enabled=false`），`/api/v1/upstreams` 可见，可用 `enable_upstream` 启用 | 行为更可控 |

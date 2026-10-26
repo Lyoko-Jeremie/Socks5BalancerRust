@@ -628,8 +628,7 @@ const KNOWN_LISTEN_KEYS: &[&str] = &["host", "port"];
 /// `authClientInfo[]` 的已知字段。
 const KNOWN_AUTH_KEYS: &[&str] = &["user", "pwd"];
 /// `connectionTracking` 节的已知字段。
-const KNOWN_TRACKING_KEYS: &[&str] =
-    &["enabled", "detail", "detailLimit", "clientTopLimit"];
+const KNOWN_TRACKING_KEYS: &[&str] = &["enabled", "detail", "detailLimit", "clientTopLimit"];
 
 /// 记录 `value` 对象中本版本不认识的字段（防止 `enabled`/`threadStackSizeKb` 之类拼写错误被静默忽略）。
 ///
@@ -1152,7 +1151,8 @@ pub fn from_value(value: serde_json::Value) -> Result<Config, ConfigError> {
         conn_tracking.client_top_limit = v.min(10_000);
     }
     if !conn_tracking.enabled {
-        notes.push("connectionTracking.enabled=false：不记录连接监测（/connections 不可用）".into());
+        notes
+            .push("connectionTracking.enabled=false：不记录连接监测（/connections 不可用）".into());
     } else if !conn_tracking.detail {
         notes.push(
             "connectionTracking.detail=false：只保留三维度计数，/connections 明细为空".into(),

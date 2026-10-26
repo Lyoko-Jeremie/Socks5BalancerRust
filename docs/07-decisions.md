@@ -50,8 +50,8 @@ C++ 版控制面是 `StateMonitorServer`（1146 行）+ `EmbedWebServer`（394 �
 | `set_rule` | `rule`，或 `scope`(global/client/listen) + `target`(ip 或 ip:port) + `index`（`clear=true` 清除） | 改选路规则 / 设置维度强制上游（粘性规则生效；C++ `forceNowUseServer` 语义的 Rust 版：强制目标不可用时回落） |
 | `enable_upstream` / `disable_upstream` | `index` 或 `name` | 启用/禁用后端（人工） |
 | `check_upstream` | `index`（可选） | 立即探测（一次，不重试） |
-| `close_conn` | `id` 或 `client` | 关闭单条/某客户端连接（**当前未实现**，无连接表） |
-| `close_all` | — | 关闭全部连接（**当前未实现**） |
+| `close_conn` | `id` / `client` / `listen` / `upstream`（任一） | 中断匹配连接（需 `connectionTracking.detail=true`，默认开启） |
+| `close_all` | — | 中断全部连接（需明细） |
 | `reload_config` | — | 热重载（U5：**不做**） |
 
 3. **不实现**：鉴权、TLS、CORS（不设置 CORS 头）、`/clientInfo` 全量明细、`/authInfo`、`/delayInfo` 原始序列、静态文件服务（原 `EmbedWebServer` 整体不移植）。

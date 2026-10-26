@@ -153,6 +153,6 @@ curl -X POST -H "Content-Type: application/json" -d '{"cmd":"set_rule","args":{"
 
 M3 之后的 M4/M5 与后续补丁已完成，剩余项如下：
 
-- ✅ 已补齐：RTT（`/api/v1/upstreams.rttMs`）、DNS TTL（`dnsTtl`）、per-core listener、hint 粘性、retryTimes 失败切换、SOCKS4/HTTP 入站认证、`sleepTime`/`additionCheckPeriod`、`set_rule` 的 scope/target 维度覆盖（global/client/listen）、CI workflow、fuzz harness、SOCKS5 专项压测客户端。
+- ✅ 已补齐：RTT（`/api/v1/upstreams.rttMs`）、DNS TTL（`dnsTtl`）、per-core listener、hint 粘性、retryTimes 失败切换、SOCKS4/HTTP 入站认证、`sleepTime`/`additionCheckPeriod`、`set_rule` 的 scope/target 维度覆盖（global/client/listen）、**连接监测**（默认明细 + 三维度摘要 + `close_conn`/`close_all` + 独立监控监听）、CI workflow、fuzz harness、SOCKS5 专项压测客户端。
 - ⏳ 待执行（需 Linux 环境）：C10K / 1K/s、24h 长稳、2 核与吞吐验收、与 C++ 的字节级对比。
 - ❌ 不做（已登记）：`close_conn` / `close_all`（无连接表）、`reload_config`（U5）、HTTP keep-alive 逐请求改写、`slowImpl`。

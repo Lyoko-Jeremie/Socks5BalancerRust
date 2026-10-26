@@ -1396,35 +1396,39 @@ snap_swap.store(Arc::new(snap));    // 控制面读到的永远是完整快照
 | `tiny_http`（阻塞） | 极简 | 需 `spawn_blocking`，占用 blocking 线程 | 不推荐 |
 | 手写 minimal HTTP | 最省内存 | 解析/安全边界多，C++ 问题会重演 | **不推荐** |
 
-端点只保留 **4 个**（[07-decisions.md](07-decisions.md) ADR-001）：
+控制面保留 **4 个基础端点 + 2 个连接监测端点**（[07-decisions.md](07-decisions.md) ADR-001）：
 
 | 方法 | 路径 | 作用 | 返回 | 备注 |
 |---|---|---|---|---|
-| `GET` | `/api/v1/status` | 进程 / 总量 / 后端 / 监听 / 健康摘要 | 一个 JSON（≤64 KB 上限） | 实时聚合（无快照缓存） |
+| `GET` | `/api/v1/status` | 进程 / 总量 / 后端 / 监听 / 健康 / 连接摘要 | 一个 JSON（≤64 KB 上限） | 实时聚合（无快照缓存） |
 | `GET` | `/api/v1/upstreams` | 后端逐条详情（host/port/name/enabled/health/RTT） | JSON 数组 | 固定数组，索引=解析成功上游的顺序（通常=配置顺序）；RTT 为最近一次探测耗时，无 conns |
+| `GET` | `/api/v1/connections` | 连接明细（过滤 + 游标分页） | JSON 对象 | 需 `connectionTracking.detail=true`；`client`/`listen`/`upstream`/`cursor`/`limit` |
+| `GET` | `/api/v1/connections/summary` | 按上游/客户端/监听三维度连接数 | JSON 对象 | 明细关闭时仍可用（只计数） |
 | `POST` | `/api/v1/control` | 控制命令（JSON body） | `{"ok":true}` 或错误 | **唯一的写端点** |
 | `GET` | `/healthz` | 存活探针（容器 / K8s） | `200 ok` 纯文本 | 不读业务状态 |
 
 控制命令（`POST /api/v1/control`，body 形如 `{"cmd":"...","args":{...}}`）：
 
 > **实现状态（2026-10-26）**：已实现 `set_rule`（`rule` + `scope`/`target`/`index` 维度覆盖）、
-> `enable_upstream` / `disable_upstream`、`check_upstream`；`close_conn` / `close_all`
-> （无连接表）与 `reload_config`（U5 不做）**未实现**，返回 `{"ok":false,"detail":"不支持的命令…"}`。
+> `enable_upstream` / `disable_upstream`、`check_upstream`、`close_conn` / `close_all`
+> （需 `connectionTracking.detail=true`，默认开启）；`reload_config`（U5 不做）**未实现**，
+> 返回 `{"ok":false,"detail":"不支持的命令…"}`。
 
 | `cmd` | 参数 | 作用 |
 |---|---|---|
 | `set_rule` | `rule`，或 `scope`(global/client/listen) + `target`(ip 或 ip:port) + `index`（`clear=true` 清除） | 改选路规则 / 设置维度强制上游（粘性规则生效，强制目标不可用时回落） |
 | `enable_upstream` / `disable_upstream` | `index` 或 `name` | 启用 / 禁用后端（人工） |
 | `check_upstream` | `index`（可选） | 立即探测（**一次，不重试**） |
-| `close_conn` | `id` 或 `client` | 关闭单条 / 某客户端连接（**未实现**） |
-| `close_all` | — | 关闭全部连接（**未实现**） |
-| `reload_config` | — | 热重载（U5：M0–M4 不做） |
+| `close_conn` | `id` / `client` / `listen` / `upstream`（任一；`all=true` 等价 close_all） | 中断匹配连接（需明细；取消该连接的子令牌，立即生效） |
+| `close_all` | — | 中断全部连接（需明细） |
+| `reload_config` | — | 热重载（U5：**不做**） |
 
 **安全默认（[07-decisions.md](07-decisions.md) ADR-001）**：
 
 - **不鉴权、不设 CORS 头、不实现 TLS**。默认仅回环：沿用 `stateServerHost`（缺省 `127.0.0.1`）/ `stateServerPort`；绑定非回环地址时启动日志与文档**强警告**（不拒绝启动，风险接受）。
 - **响应绝不返回**客户端密码、base64 认证串、上游密码——与"不鉴权"无关，即使只绑回环也不返回。
-- 只服务上述 4 个端点：**不移植** `EmbedWebServer` 静态文件、`GET /` 全量 JSON、`/clientInfo`、`/listenInfo`、`/authInfo`、`/delayInfo` 原始序列、`/op`；**不承诺**与原 `/op?xxx` 兼容。
+- 只服务上述端点：**不移植** `EmbedWebServer` 静态文件、`GET /` 全量 JSON、`/clientInfo`、`/listenInfo`、`/authInfo`、`/delayInfo` 原始序列、`/op`；**不承诺**与原 `/op?xxx` 兼容。
+- 监控面可独立监听（`monitorServerHost` / `monitorServerPort`），独立监听**只提供只读端点**（含连接明细/摘要），不提供 `POST /api/v1/control`；未配置时监控端点挂在控制面监听上。
 - HTTP/1.1 only；请求体 ≤64 KB，状态响应上限 `stateMaxResponseBytes`（默认 65536）；每个控制命令记 1 条 `info` 审计日志（来源 IP + cmd + 参数 + 结果）。
 - JSON 用 `serde` 输出真 `bool` / 数字并带 `"schema":"v1"`（替代 C++ `property_tree` 的全字符串化）。
 

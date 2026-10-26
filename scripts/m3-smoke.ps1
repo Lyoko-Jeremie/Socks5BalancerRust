@@ -1,4 +1,4 @@
-﻿# M3 精简控制面验收（Windows PowerShell 5.1+）
+# M3 精简控制面验收（Windows PowerShell 5.1+）
 #
 # 覆盖（ADR-001：4 端点、无鉴权、默认回环、响应不含密码）：
 #   1) GET /healthz → 200 ok
@@ -9,7 +9,7 @@
 #   6) POST control disable_upstream → ok，且此后客户端失败（无可用上游）
 #   7) POST control enable_upstream → ok，客户端恢复
 #   8) POST control set_rule(loop) → ok，status.selectRule 变为 loop
-#   9) 未知命令（close_all）→ ok=false（M3 精简集未实现）
+#   9) 未知命令（no_such_cmd）→ ok=false；close_all/close_conn（连接监测）→ ok=true
 #  10) GET /nope → 404
 #  11) 无 CORS 响应头
 #
@@ -177,11 +177,30 @@ try {
     try { $j2 = $st2.Body | ConvertFrom-Json } catch { }
     Check "status.selectRule 已切换为 loop" ($j2 -and $j2.selectRule -eq "loop") ("selectRule=$($j2.selectRule)")
 
+    # 连接监测：明细/摘要端点 + close_all（默认开启明细）
+    $conns = Invoke-Ctl "GET" "/api/v1/connections"
+    $connsJson = $null
+    try { $connsJson = $conns.Body | ConvertFrom-Json } catch { }
+    Check "/api/v1/connections 返回 enabled/detail" ($conns.Status -eq 200 -and $connsJson.enabled -eq $true -and $connsJson.detail -eq $true) ("body=$($conns.Body)")
+    $sum = Invoke-Ctl "GET" "/api/v1/connections/summary"
+    $sumJson = $null
+    try { $sumJson = $sum.Body | ConvertFrom-Json } catch { }
+    Check "/api/v1/connections/summary 含三维度字段" ($sum.Status -eq 200 -and $null -ne $sumJson.total -and $null -ne $sumJson.byUpstream -and $null -ne $sumJson.byListen -and $null -ne $sumJson.byClient) ("body=$($sum.Body)")
+    $ca = Invoke-Ctl "POST" "/api/v1/control" '{"cmd":"close_all"}'
+    $caJson = $null
+    try { $caJson = $ca.Body | ConvertFrom-Json } catch { }
+    Check "close_all ok" ($ca.Status -eq 200 -and $caJson.ok -eq $true) ("body=$($ca.Body)")
+
     Write-Host "== [4/5] 错误路径与安全默认 =="
-    $bad = Invoke-Ctl "POST" "/api/v1/control" '{"cmd":"close_all"}'
+    $bad = Invoke-Ctl "POST" "/api/v1/control" '{"cmd":"no_such_cmd"}'
     $badJson = $null
     try { $badJson = $bad.Body | ConvertFrom-Json } catch { }
     Check "未知命令返回 ok=false" ($bad.Status -eq 200 -and $badJson.ok -eq $false) ("body=$($bad.Body)")
+
+    $bad2 = Invoke-Ctl "POST" "/api/v1/control" '{"cmd":"close_conn"}'
+    $bad2Json = $null
+    try { $bad2Json = $bad2.Body | ConvertFrom-Json } catch { }
+    Check "close_conn 缺参数返回 ok=false" ($bad2Json.ok -eq $false) ("body=$($bad2.Body)")
 
     $nf = Invoke-Ctl "GET" "/nope"
     Check "未知路径返回 404" ($nf.Status -eq 404) ("status=$($nf.Status)")
